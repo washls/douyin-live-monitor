@@ -1,0 +1,9 @@
+{
+    "sendkey": "",
+    "push_uid": "",
+    "push_url": "",
+    "check_interval": 30,
+    "notify_on_stream_end": true,
+    "retry_times": 3,
+    "retry_delay": 5
+}

@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# Runtime state
+.monitor_state.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (contains user secrets, each user creates their own)
+# config.json is committed as config.example.json instead
+config.json
