@@ -33,7 +33,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/YOUR_USERNAME/douyin-live-monitor.git
+git clone https://github.com/washls/douyin-live-monitor.git
 cd douyin-live-monitor
 
 # 安装依赖
@@ -186,7 +186,7 @@ WantedBy=multi-user.target
 
 <details>
 <summary><b>打包好的 exe 在哪里？</b></summary>
-在 <a href="https://github.com/YOUR_USERNAME/douyin-live-monitor/releases">Releases</a> 页面下载最新版本。
+在 <a href="https://github.com/washls/douyin-live-monitor/releases">Releases</a> 页面下载最新版本。
 </details>
 
 ## ⚠️ 免责声明
