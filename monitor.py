@@ -48,9 +48,20 @@ STATE_FILE = BASE_DIR / ".monitor_state.json"
 
 
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure logging to both console and file."""
-    logger = logging.getLogger("douyin_monitor")
-    logger.setLevel(level)
+    """Configure logging to both console and file.
+
+    Configures the root logger so that all child loggers
+    (douyin_client, notifier, etc.) inherit handlers automatically.
+    This avoids any dependency on import order.
+
+    Idempotent: if handlers are already configured, returns immediately
+    to avoid duplicate log entries on module reload.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return logging.getLogger("douyin_monitor")
+
+    root.setLevel(level)
 
     # Console handler - wrap stdout for Windows GBK compatibility
     try:
@@ -76,17 +87,10 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         )
     )
 
-    logger.addHandler(console)
-    logger.addHandler(file_handler)
+    root.addHandler(console)
+    root.addHandler(file_handler)
 
-    # Also configure sub-module loggers
-    for name in ["douyin_client", "notifier"]:
-        sub_logger = logging.getLogger(name)
-        sub_logger.setLevel(level)
-        sub_logger.addHandler(console)
-        sub_logger.addHandler(file_handler)
-
-    return logger
+    return logging.getLogger("douyin_monitor")
 
 
 logger = setup_logging()
@@ -132,6 +136,9 @@ class MonitorState:
         title = info.get("title", "")
 
         if is_live:
+            # Snapshot old room_id BEFORE updating, so we can detect new streams
+            old_room_id = self.stream_room_id
+
             if nickname:
                 self.streamer_nickname = nickname
             if room_id:
@@ -140,11 +147,9 @@ class MonitorState:
                 self.stream_title = title
 
             if self.status == self.LIVE:
-                # Still live, same room
-                # But reset if stream info changed (new room = new stream)
-                if room_id and room_id != self.stream_room_id:
+                # Still live — but reset if stream changed (new room = new stream)
+                if room_id and old_room_id and room_id != old_room_id:
                     logger.info("检测到新直播间 (可能是新一轮直播)")
-                    self.stream_room_id = room_id
                     self.notification_sent = False
                     self.repeat_notify_count = 0
                     self.last_repeat_notify_time = 0.0
@@ -174,19 +179,28 @@ class MonitorState:
                 return "no_change"
 
             # Transition: LIVE -> OFFLINE
-            duration = ""
-            if self.last_live_start:
-                secs = int(time.time() - self.last_live_start)
-                hours, remainder = divmod(secs, 3600)
-                mins, secs = divmod(remainder, 60)
-                duration = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
-
+            duration = self._format_duration()
             logger.info(
                 f"状态变更: LIVE -> OFFLINE (直播时长: {duration})"
             )
             self.status = self.OFFLINE
             self.last_status_change = time.time()
             return "went_offline"
+
+    def _format_duration(self) -> str:
+        """Format the current live duration as a human-readable string."""
+        if not self.last_live_start:
+            return ""
+        secs = int(time.time() - self.last_live_start)
+        hours, remainder = divmod(secs, 3600)
+        mins, secs = divmod(remainder, 60)
+        parts = []
+        if hours:
+            parts.append(f"{hours}小时")
+        if mins:
+            parts.append(f"{mins}分钟")
+        parts.append(f"{secs}秒")
+        return "".join(parts)
 
     def should_notify_first_live(self) -> bool:
         """Check if we should send the FIRST live notification.
@@ -262,7 +276,34 @@ def _default_config() -> Dict[str, Any]:
         "notify_on_stream_end": True,
         "retry_times": 3,
         "retry_delay": 5,
+        "repeat_notify_interval": 600,
+        "max_repeat_notifications": 3,
+        "startup_notify": False,
     }
+
+
+def _pause_if_frozen() -> None:
+    """Pause before exit when running as a frozen PyInstaller exe.
+
+    This keeps the console window open so the user can read any error
+    messages before the window disappears.
+    """
+    if getattr(sys, 'frozen', False):
+        try:
+            input("按 Enter 键退出...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def _create_notifier(config: Dict[str, Any]) -> ServerChanNotifier:
+    """Create a ServerChanNotifier from a configuration dict."""
+    return ServerChanNotifier(
+        sendkey=config.get("sendkey", ""),
+        uid=config.get("push_uid"),
+        push_url=config.get("push_url"),
+        retry_times=config.get("retry_times", 3),
+        retry_delay=config.get("retry_delay", 5),
+    )
 
 
 def is_serverchan_configured(config: Dict[str, Any]) -> bool:
@@ -473,7 +514,6 @@ class DouyinLiveMonitor:
         self.target_url = target_url or config.get("target_url", "")
         self.check_interval = config.get("check_interval", 30)
         self.notify_on_end = config.get("notify_on_stream_end", True)
-        self.debug = debug
 
         if not self.target_url:
             logger.error("未设置目标主播链接")
@@ -481,15 +521,15 @@ class DouyinLiveMonitor:
 
         # Initialize components
         self.client = DouyinClient(debug=debug)
-        self.notifier = ServerChanNotifier(
-            sendkey=config.get("sendkey", ""),
-            uid=config.get("push_uid"),
-            push_url=config.get("push_url"),
-            retry_times=config.get("retry_times", 3),
-            retry_delay=config.get("retry_delay", 5),
-        )
+        self.notifier = _create_notifier(config)
 
         self.state = MonitorState()
+        self.state.repeat_notify_interval = config.get(
+            "repeat_notify_interval", 600
+        )
+        self.state.max_repeat_notifications = config.get(
+            "max_repeat_notifications", 3
+        )
         self.running = True
 
     def _resolve_sec_uid(self) -> Optional[str]:
@@ -497,7 +537,7 @@ class DouyinLiveMonitor:
         try:
             logger.info(f"正在解析目标用户: {self.target_url}")
             final_url = self.client.resolve_short_link(self.target_url)
-            sec_uid = self.client._extract_sec_uid(final_url)
+            sec_uid = self.client.extract_sec_uid(final_url)
 
             if sec_uid:
                 logger.info(f"用户 ID: {sec_uid}")
@@ -552,19 +592,7 @@ class DouyinLiveMonitor:
             f"{nickname}, 房间: {room_id}"
         )
 
-        # Calculate how long they've been live
-        duration_str = ""
-        if self.state.last_live_start:
-            secs = int(time.time() - self.state.last_live_start)
-            h, r = divmod(secs, 3600)
-            m, s = divmod(r, 60)
-            parts = []
-            if h:
-                parts.append(f"{h}小时")
-            if m:
-                parts.append(f"{m}分钟")
-            parts.append(f"{s}秒")
-            duration_str = "".join(parts)
+        duration_str = self.state._format_duration()
 
         success = self.notifier.send_repeat_live_notification(
             nickname=nickname,
@@ -586,18 +614,7 @@ class DouyinLiveMonitor:
             return
 
         nickname = self.state.streamer_nickname
-        duration = ""
-        if self.state.last_live_start:
-            secs = int(time.time() - self.state.last_live_start)
-            h, r = divmod(secs, 3600)
-            m, s = divmod(r, 60)
-            parts = []
-            if h:
-                parts.append(f"{h}小时")
-            if m:
-                parts.append(f"{m}分钟")
-            parts.append(f"{s}秒")
-            duration = "".join(parts)
+        duration = self.state._format_duration()
 
         logger.info(f"[OFFLINE] 直播结束: {nickname}")
 
@@ -663,6 +680,8 @@ class DouyinLiveMonitor:
         max_consecutive_errors = 10
 
         while self.running:
+            next_check = time.time() + self.check_interval
+
             try:
                 check_count += 1
                 logger.debug(
@@ -701,12 +720,14 @@ class DouyinLiveMonitor:
                     )
                     break
 
-            # Wait before next check
+            # Wait until the next scheduled check (compensates for check duration)
             if self.running:
-                try:
-                    time.sleep(self.check_interval)
-                except KeyboardInterrupt:
-                    break
+                sleep_time = next_check - time.time()
+                if sleep_time > 0:
+                    try:
+                        time.sleep(sleep_time)
+                    except KeyboardInterrupt:
+                        break
 
         logger.info("监听器已停止")
 
@@ -791,22 +812,11 @@ def main():
                 "或在 config.json 中手动填入推送 URL。\n"
                 "获取方式: 访问 https://sc3.ft07.com 微信扫码登录"
             )
-            # When running as frozen exe, pause so user can see the error
-            if getattr(sys, 'frozen', False):
-                try:
-                    input("按 Enter 键退出...")
-                except (EOFError, KeyboardInterrupt):
-                    pass
+            _pause_if_frozen()
             sys.exit(1)
 
         # Test Server酱³ connection (no target URL needed)
-        notifier = ServerChanNotifier(
-            sendkey=config.get("sendkey", ""),
-            uid=config.get("push_uid"),
-            push_url=config.get("push_url"),
-            retry_times=config.get("retry_times", 3),
-            retry_delay=config.get("retry_delay", 5),
-        )
+        notifier = _create_notifier(config)
 
         logger.info("测试 Server酱³ 连接...")
         if notifier.verify_connection():
@@ -818,8 +828,8 @@ def main():
     # Prompt for target URL (interactive)
     target_url = prompt_target_url()
 
-    # Create monitor (pass debug flag if set)
-    monitor = DouyinLiveMonitor(config, target_url=target_url, debug=getattr(args, 'debug', False))
+    # Create monitor
+    monitor = DouyinLiveMonitor(config, target_url=target_url, debug=args.debug)
 
     # Handle signals for graceful shutdown
     def signal_handler(sig, frame):
@@ -827,7 +837,10 @@ def main():
         monitor.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Note: SIGTERM is not supported on Windows — the handler is installed
+    # only on POSIX platforms where it actually works.
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         if args.once:
@@ -864,28 +877,24 @@ def main():
         logger.info("用户中断")
     except Exception as e:
         logger.error(f"程序异常: {e}", exc_info=True)
-        # When running as frozen exe, pause so user can see the error
-        if getattr(sys, 'frozen', False):
-            print()
-            try:
-                input("按 Enter 键退出...")
-            except (EOFError, KeyboardInterrupt):
-                pass
+        _pause_if_frozen()
         sys.exit(1)
 
     # Normal exit - pause for frozen exe so user can see output
-    if getattr(sys, 'frozen', False):
-        try:
-            input("按 Enter 键退出...")
-        except (EOFError, KeyboardInterrupt):
-            pass
+    _pause_if_frozen()
 
 
 if __name__ == "__main__":
-    # Fix Windows GBK console encoding
+    # Fix Windows GBK console encoding — replace stdout with a UTF-8 wrapper.
+    # setup_logging() also wraps stdout for its console handler, so this
+    # ensures any direct print() calls also use UTF-8.
     if sys.platform == 'win32':
         try:
-            sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+            old_stdout = sys.stdout
+            sys.stdout = open(
+                sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1
+            )
+            old_stdout.close()
         except (AttributeError, OSError):
             pass
     main()

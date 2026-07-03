@@ -5,5 +5,7 @@
     "check_interval": 30,
     "notify_on_stream_end": true,
     "retry_times": 3,
-    "retry_delay": 5
+    "retry_delay": 5,
+    "repeat_notify_interval": 600,
+    "max_repeat_notifications": 3
 }

@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -95,6 +94,7 @@ class DouyinClient:
         self._cached_user_info: Dict[str, Any] = {}
         self._cookies_initialized = False
         self._ies_share_url: str = ""
+        self._profile_html_cache: Dict[str, str] = {}
         self.debug = debug
 
         if self.debug:
@@ -178,11 +178,13 @@ class DouyinClient:
             if "ttwid" in self.session.cookies:
                 logger.info("Cookie 初始化完成 (已获取 ttwid)")
             else:
-                logger.warning("Cookie 初始化完成 (未获取到 ttwid)")
+                logger.warning(
+                    "Cookie 初始化完成 (未获取到 ttwid) — API 检测可能失效"
+                )
 
             self._cookies_initialized = True
         except Exception as e:
-            logger.warning(f"Cookie 初始化失败: {e}，将直接尝试请求")
+            logger.warning(f"Cookie 初始化失败: {e}，API 检测可能失效")
             self._cookies_initialized = True  # Don't keep retrying
 
     def resolve_short_link(self, short_url: str) -> str:
@@ -207,7 +209,7 @@ class DouyinClient:
             logger.info(f"解析结果: {final_url[:150]}...")
 
             # Extract sec_uid from the URL
-            self._extract_sec_uid(final_url)
+            self.extract_sec_uid(final_url)
 
             # Detect if this is a live stream share link
             if "webcast.amemv.com" in final_url or "webcast" in final_url:
@@ -233,8 +235,12 @@ class DouyinClient:
             logger.error(f"短链接解析失败: {e}")
             raise
 
-    def _extract_sec_uid(self, url: str) -> str:
-        """Extract sec_uid from a Douyin profile URL or page content."""
+    def extract_sec_uid(self, url: str) -> str:
+        """Extract sec_uid from a Douyin profile URL.
+
+        Parses the URL path and query parameters for user identifiers
+        like sec_uid and sec_user_id.
+        """
         if not self._cached_sec_uid:
             # Try to extract from URL pattern: /user/{sec_uid}
             match = re.search(r'/user/([A-Za-z0-9_-]+)', url)
@@ -299,10 +305,19 @@ class DouyinClient:
             url = f"https://www.douyin.com/user/{sec_uid}"
             logger.info(f"[HTML检测] 访问用户主页: {url}")
 
-            resp = self.session.get(url, timeout=15, allow_redirects=True)
-            resp.raise_for_status()
-            html = resp.text
-            final_url = resp.url
+            # Reuse cached profile HTML if another method already fetched it
+            if url in self._profile_html_cache:
+                logger.debug("[HTML检测] 使用缓存的用户主页 HTML")
+                html = self._profile_html_cache[url]
+                final_url = url
+            else:
+                resp = self.session.get(url, timeout=15, allow_redirects=True)
+                resp.raise_for_status()
+                html = resp.text
+                final_url = resp.url
+                # Don't cache captcha/error pages — they'd poison future checks
+                if "verify" not in final_url.lower() and "captcha" not in final_url.lower() and len(html) >= 5000:
+                    self._profile_html_cache[url] = html
 
             logger.debug(f"[HTML检测] 最终URL: {final_url}")
             logger.debug(f"[HTML检测] 页面大小: {len(html)} bytes")
@@ -793,7 +808,7 @@ class DouyinClient:
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"[API检测] 响应解析失败: {e}")
         except Exception as e:
-            logger.warning(f"[API检测] 未知异常: {e}")
+            logger.warning(f"[API检测] 未知异常: {e}", exc_info=True)
 
         return result
 
@@ -990,10 +1005,9 @@ class DouyinClient:
                         user_info = data.get("data", {}) or data.get("user", {})
                         if isinstance(user_info, dict):
                             result["nickname"] = user_info.get("nickname", "")
-                            result["is_live"] = bool(
-                                user_info.get("live_status", 0)
-                                or user_info.get("status", 0) == 2
-                            )
+                            live_status = int(user_info.get("live_status", 0) or 0)
+                            status = int(user_info.get("status", 0) or 0)
+                            result["is_live"] = live_status != 0 or status == 2
 
                             room = user_info.get("room", {}) or user_info.get("live_room", {})
                             if isinstance(room, dict):
@@ -1053,7 +1067,7 @@ class DouyinClient:
 
     def check_live_by_room_page(self, room_id: str) -> Dict[str, Any]:
         """
-        Method 3: Check by accessing the live room page directly.
+        Method 8: Check by accessing the live room page directly.
 
         Args:
             room_id: The room ID (web_rid)
@@ -1065,6 +1079,7 @@ class DouyinClient:
             "is_live": False,
             "room_id": room_id,
             "title": "",
+            "nickname": "",
             "method": "room_page",
         }
 
@@ -1250,16 +1265,24 @@ class DouyinClient:
             url = f"https://www.douyin.com/user/{sec_uid}"
             logger.info(f"[Profile直播链接检测] 访问: {url}")
 
-            resp = self.session.get(
-                url,
-                timeout=15,
-                allow_redirects=True,
-                headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
-            )
-            resp.raise_for_status()
-            html = resp.text
+            # Reuse cached profile HTML if another method already fetched it
+            if url in self._profile_html_cache:
+                logger.debug("[Profile直播链接检测] 使用缓存的用户主页 HTML")
+                html = self._profile_html_cache[url]
+            else:
+                resp = self.session.get(
+                    url,
+                    timeout=15,
+                    allow_redirects=True,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    },
+                )
+                resp.raise_for_status()
+                html = resp.text
+                # Don't cache captcha/error pages
+                if "verify" not in resp.url.lower() and "captcha" not in resp.url.lower() and len(html) >= 5000:
+                    self._profile_html_cache[url] = html
 
             # Look for live room URL patterns in the HTML
             # Pattern 1: live.douyin.com/{room_id} links
@@ -1394,12 +1417,17 @@ class DouyinClient:
                 method: str (which detection method succeeded)
                 timestamp: float
         """
+        # Reset per-call state to prevent stale data leaking between
+        # calls for different users.
+        self._cached_room_id = ""
+        self._ies_share_url = ""
+
         self._ensure_cookies()
 
         # Resolve sec_uid from URL if needed
         if target_url and not sec_uid:
             final_url = self.resolve_short_link(target_url)
-            sec_uid = self._extract_sec_uid(final_url)
+            sec_uid = self.extract_sec_uid(final_url)
 
         # If the short link resolved to a live stream URL, we already have room_id
         if self._cached_room_id and not sec_uid:
@@ -1442,8 +1470,8 @@ class DouyinClient:
                 logger.info(
                     f"IES API返回: is_live={ies_is_live}, nickname={nickname}"
                 )
-            except Exception:
-                pass
+            except requests.RequestException as e:
+                logger.warning(f"IES API 验证请求失败: {e}")
 
             # If IES API has a decisive answer, trust it.
             # A non-empty nickname means the API call succeeded (vs. network error).
@@ -1451,7 +1479,14 @@ class DouyinClient:
             if nickname and not ies_is_live:
                 is_live = False
                 logger.info("IES API确认未开播，覆盖webcast URL的直播假设")
+            elif nickname and ies_is_live:
+                is_live = True
             else:
+                # API unreachable — webcast share link suggests live,
+                # but log a warning since this may be a false positive
+                logger.warning(
+                    "IES API 不可用，无法验证直播状态；基于分享链接假设正在直播"
+                )
                 is_live = True
 
             result = {
@@ -1614,8 +1649,13 @@ class DouyinClient:
 
         try:
             url = f"https://www.douyin.com/user/{sec_uid}"
-            resp = self.session.get(url, timeout=15)
-            html = resp.text
+            # Reuse cached profile HTML if available
+            if url in self._profile_html_cache:
+                html = self._profile_html_cache[url]
+            else:
+                resp = self.session.get(url, timeout=15)
+                html = resp.text
+                self._profile_html_cache[url] = html
 
             info = {"sec_uid": sec_uid}
 

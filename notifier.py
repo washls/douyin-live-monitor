@@ -5,10 +5,10 @@ Sends push notifications to mobile devices via Server酱³ API.
 API docs: https://doc2.ft07.com/zh/serverchan3
 """
 
-import json
 import logging
+import re
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 
 import requests
 
@@ -63,10 +63,10 @@ class ServerChanNotifier:
                 uid=self.uid, sendkey=self.sendkey
             )
 
-        logger.info(f"Server酱³ 通知器已初始化 (UID: {self.uid})")
+        logger.debug(f"Server酱³ 通知器已初始化")
 
     @staticmethod
-    def _parse_push_url(url: str) -> dict:
+    def _parse_push_url(url: str) -> Dict[str, str]:
         """
         Parse a full Server酱³ push URL to extract UID and SendKey.
 
@@ -74,18 +74,19 @@ class ServerChanNotifier:
 
         Returns:
             dict with 'uid' and 'sendkey' keys.
+
+        Raises:
+            ValueError: if the URL format is not recognized.
         """
-        import re
         # Match: https://<uid>.push.ft07.com/send/<sendkey>.send
+        # UID is typically numeric but may change; accept alphanumeric + hyphens
         match = re.match(
-            r'https?://(\d+)\.push\.ft07\.com/send/(\w+)\.send',
+            r'https?://([\w-]+)\.push\.ft07\.com/send/([\w-]+)\.send',
             url
         )
         if match:
             return {"uid": match.group(1), "sendkey": match.group(2)}
-        # Fallback: try to extract whatever we can
-        logger.warning(f"无法解析推送 URL 格式: {url}")
-        return {"uid": "", "sendkey": ""}
+        raise ValueError(f"无法解析推送 URL 格式: {url}")
 
     def set_api_url(self, url: str) -> None:
         """Override the API URL directly (for custom endpoints)."""
@@ -130,7 +131,6 @@ class ServerChanNotifier:
                     f"title='{title[:50]}'"
                 )
 
-                # Try POST with JSON body first
                 resp = requests.post(
                     self.api_url,
                     json=payload,
@@ -139,21 +139,14 @@ class ServerChanNotifier:
                     },
                     timeout=15,
                 )
-
-                # Fall back to GET if POST fails
-                if resp.status_code >= 400:
-                    logger.debug(
-                        f"POST 失败 ({resp.status_code}), 尝试 GET..."
-                    )
-                    resp = requests.get(
-                        self.api_url,
-                        params=payload,
-                        timeout=15,
-                    )
-
                 resp.raise_for_status()
 
-                result = resp.json()
+                try:
+                    result = resp.json()
+                except (requests.exceptions.JSONDecodeError, ValueError):
+                    logger.error("Server酱³ 返回了非 JSON 响应，不重试")
+                    return False
+
                 code = result.get("code", -1)
 
                 if code == 0:
@@ -174,6 +167,17 @@ class ServerChanNotifier:
                         )
                         return False
 
+            except requests.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else 0
+                if 400 <= status_code < 500:
+                    logger.error(
+                        f"客户端 HTTP 错误 ({status_code})，不重试"
+                    )
+                    return False
+                logger.warning(
+                    f"服务端 HTTP 错误 ({status_code}) "
+                    f"(尝试 {attempt}/{self.retry_times}): {e}"
+                )
             except requests.Timeout:
                 logger.warning(
                     f"通知发送超时 (尝试 {attempt}/{self.retry_times})"

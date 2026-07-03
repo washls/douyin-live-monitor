@@ -8,10 +8,12 @@ Reference: https://github.com/ihmily/DouyinLiveRecorder
 """
 
 import hashlib
-import random
+import secrets
 import string
 import time
 from typing import Tuple
+
+__all__ = ["generate_abogus", "generate_ms_token", "generate_signatures"]
 
 # Douyin custom Base64 alphabet
 _BASE64_ALPHABET = (
@@ -74,7 +76,9 @@ def _generate_19_array(
     timestamp: int,
 ) -> list:
     """Generate the 19-element array used in a_bogus."""
-    cvs = 536919696  # Fixed canvas fingerprint
+    # Fixed canvas fingerprint — a real browser computes this dynamically.
+    # A static value is a known fingerprinting weakness; Douyin may detect it.
+    cvs = 536919696
 
     return [
         64,                          # [0]  fixed
@@ -86,7 +90,7 @@ def _generate_19_array(
         (timestamp >> 8) & 255,      # [6]
         (cvs >> 24) & 255,           # [7]
         77,                          # [8]  'M'
-        0.00390625,                  # [9]  fixed float
+        0.00390625,                  # [9]  fixed float = 1/256 (matches JS canvas scaling)
         8,                           # [10] fixed
         124,                         # [11] '|'
         md5_ua[14],                  # [12]
@@ -128,10 +132,6 @@ def generate_abogus(params: str, user_agent: str) -> str:
     md5_1 = _md5_bytes(params.encode("utf-8"))
     md5_2 = _md5_bytes(md5_1)
 
-    # Double MD5 of empty body
-    body_md5_1 = _md5_bytes(b"")
-    body_md5_2 = _md5_bytes(body_md5_1)
-
     # RC4 encrypt UA (key = [0, 1, 14]), custom-base64, then MD5
     ua_key = bytes([0, 1, 14])
     ua_encrypted = _rc4(ua_key, user_agent.encode("utf-8"))
@@ -141,6 +141,8 @@ def generate_abogus(params: str, user_agent: str) -> str:
     # Generate 19-element array → bytes → RC4 encrypt with key [0xFF]
     arr19 = _generate_19_array(md5_1, md5_2, ua_md5, timestamp)
     arr_bytes = _array_to_bytes(arr19)
+    # Intentionally weak 1-byte RC4 key (matches x-bogus.js obfuscation,
+    # not intended as real encryption)
     rc4_key = bytes([0xFF])
     encrypted = _rc4(rc4_key, arr_bytes)
 
@@ -151,9 +153,13 @@ def generate_abogus(params: str, user_agent: str) -> str:
 
 
 def generate_ms_token() -> str:
-    """Generate a random msToken (128 lowercase alphanumeric chars)."""
+    """Generate a random msToken (128 lowercase alphanumeric chars).
+
+    Uses secrets module for cryptographically secure randomness,
+    making the token less predictable to anti-bot systems.
+    """
     chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(128))
+    return "".join(secrets.choice(chars) for _ in range(128))
 
 
 def generate_signatures(params: str, user_agent: str) -> Tuple[str, str]:
