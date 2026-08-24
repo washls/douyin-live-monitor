@@ -2,9 +2,12 @@
 build/
 dist/
 *.spec
+!douyin-monitor.spec
 
 # Python
 __pycache__/
+.pytest_cache/
+debug_dumps/
 *.py[cod]
 *.egg-info/
 .eggs/
@@ -28,3 +31,7 @@ Thumbs.db
 # Config (contains user secrets, each user creates their own)
 # config.json is committed as config.example.json instead
 config.json
+.env
+.env.*
+*.pem
+*.key

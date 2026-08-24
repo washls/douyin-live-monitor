@@ -2,6 +2,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/version-1.1.1-orange.svg" alt="Version 1.1.1">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
 
@@ -16,9 +17,9 @@
 
 - 🔍 **自动检测** — 监控指定抖音博主是否开播
 - 📲 **实时推送** — 开播/下播时通过 Server酱³ 推送通知到微信
-- 🔄 **多层回退** — 6 种检测方法自动切换，确保可靠性
-- 📝 **完整日志** — 控制台 + 文件双通道日志
-- 🪶 **轻量无依赖** — 无需浏览器，纯 HTTP 请求
+- 🔄 **8 层回退** — 8 种检测方法自动切换，确保可靠性
+- 📝 **精简终端** — 控制台一行状态摘要，完整细节写入日志文件
+- 🪶 **轻量零依赖** — 无需浏览器、无需 Node.js，纯 Python 搞定一切
 - 🎯 **交互式配置** — 首次运行引导式配置，无需手动编辑配置文件
 - 📦 **即开即用** — 提供打包好的 Windows exe
 
@@ -27,7 +28,6 @@
 ### 环境要求
 
 - **Python 3.9+**
-- Node.js *(可选，用于 API 签名生成，没有也能正常运行)*
 
 ### 安装
 
@@ -83,8 +83,10 @@ python monitor.py --config my_config.json
     "push_uid": "",
     "check_interval": 30,
     "notify_on_stream_end": true,
-    "retry_times": 3,
-    "retry_delay": 5
+    "repeat_notify_interval": 600,
+    "max_repeat_notifications": 3,
+    "startup_notify": false,
+    "enable_daily_intimacy_reminder": true
 }
 ```
 
@@ -95,23 +97,29 @@ python monitor.py --config my_config.json
 | `push_uid` | Server酱³ 用户 UID（由 URL 自动解析） | — |
 | `check_interval` | 检测间隔（秒） | 30 |
 | `notify_on_stream_end` | 是否推送下播通知 | true |
-| `retry_times` | 推送失败重试次数 | 3 |
-| `retry_delay` | 重试间隔（秒） | 5 |
+| `repeat_notify_interval` | 持续直播重复提醒间隔（秒） | 600 |
+| `max_repeat_notifications` | 单次直播最多重复提醒次数 | 3 |
+| `startup_notify` | 启动时发送测试通知 | false |
+| `enable_daily_intimacy_reminder` | 23:57–23:59 发送亲密度提醒 | true |
 
 > **获取推送 URL**：访问 [sc3.ft07.com](https://sc3.ft07.com) → 微信扫码登录 → 「发送消息」→ 复制完整推送 URL
 
+> **隐私说明**：`config.json`、`*.log`、`.monitor_state.json`、`debug_dumps/`、`dist/` 和 `build/` 均不会提交到 Git 仓库。请勿公开包含真实推送 URL、SendKey 或运行日志的文件。
+
 ## 🔬 检测原理
 
-程序内置 **6 种检测方法**，按优先级自动回退：
+程序内置 **8 种检测方法**，按优先级自动回退：
 
 | 优先级 | 方法 | 说明 |
 |:---:|------|------|
-| 1 | HTML 页面解析 | 解析用户主页内嵌的 `RENDER_DATA` 数据（**最可靠**） |
-| 2 | IES 分享页解析 | 解析 `iesdouyin.com` 分享页面 |
-| 3 | IES API v2 | 调用抖音用户信息 API v2 |
-| 4 | Douyin API | 调用抖音 `aweme/v1/web/user/profile/other` 接口 |
-| 5 | Webcast 房间检测 | 通过直播广场 WebSocket 接口查询 |
-| 6 | 直播间页面 | 直接访问直播间 URL 检测 |
+| 1 | Douyin API | 调用抖音 `aweme/v1/web/user/profile/other` 接口（最可靠） |
+| 2 | Webcast info_by_user | `live.douyin.com/webcast/room/info_by_user/` |
+| 3 | Profile 直播链接 | 从用户主页提取直播间链接 |
+| 4 | HTML 页面解析 | 解析 RENDER_DATA、__INITIAL_STATE__、__pace_f 等内嵌数据 |
+| 5 | IES API v2 | 调用 `iesdouyin.com/web/api/v2/user/info/` |
+| 6 | Webcast API | `live.douyin.com/webcast/user/info/` |
+| 7 | IES 分享页 | 解析 `iesdouyin.com/share/user/` 页面 |
+| 8 | 直播间页面 | 直接访问直播间 URL 检测 |
 
 ## 📬 通知示例
 
@@ -133,10 +141,12 @@ python monitor.py --config my_config.json
 ```
 douyin-live-monitor/
 ├── monitor.py           # 主程序入口 & 交互式引导
-├── douyin_client.py     # 抖音直播状态检测核心
+├── douyin_client.py     # 抖音直播状态检测核心（8 种方法）
 ├── notifier.py          # Server酱³ 推送通知模块
 ├── abogus.py            # a_bogus / msToken 签名生成 (纯 Python)
-├── x-bogus.js           # 签名生成 (Node.js，可选)
+├── x-bogus.js           # PyInstaller 打包所需签名资源
+├── test_monitor.py      # 回归测试
+├── douyin-monitor.spec  # PyInstaller 打包配置
 ├── config.example.json  # 配置文件示例
 ├── requirements.txt     # Python 依赖
 ├── setup.bat            # Windows 一键安装脚本

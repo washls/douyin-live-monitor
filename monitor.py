@@ -14,9 +14,11 @@ Usage:
 import argparse
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +41,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
+APP_VERSION = "1.1.1"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -47,38 +50,44 @@ STATE_FILE = BASE_DIR / ".monitor_state.json"
 # ===== Logging Setup =====
 
 
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure logging to both console and file.
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Configure dual-output logging.
 
-    Configures the root logger so that all child loggers
-    (douyin_client, notifier, etc.) inherit handlers automatically.
-    This avoids any dependency on import order.
+    - Console: WARNING level by default (only errors / warnings are shown).
+      Use --verbose to raise the console level to DEBUG.
+    - File: always DEBUG — every check, every method detail is saved.
 
-    Idempotent: if handlers are already configured, returns immediately
-    to avoid duplicate log entries on module reload.
+    Idempotent: if handlers are already configured, returns immediately.
     """
     root = logging.getLogger()
     if root.handlers:
         return logging.getLogger("douyin_monitor")
 
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)
 
-    # Console handler - wrap stdout for Windows GBK compatibility
+    # --- console handler ------------------------------------------------
     try:
         console_out = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
     except (AttributeError, OSError):
         console_out = sys.stdout
     console = logging.StreamHandler(console_out)
-    console.setLevel(level)
+    console.setLevel(logging.DEBUG if verbose else logging.WARNING)
     console.setFormatter(
         logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
+            "%(asctime)s  %(message)s",
             datefmt="%H:%M:%S",
         )
     )
 
-    # File handler
-    file_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+    # --- file handler --------------------------------------------------
+    # Keep verbose diagnostics available without allowing monitor.log to grow
+    # indefinitely during long-running monitoring.
+    file_handler = RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=2 * 1024 * 1024,
+        backupCount=2,
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
         logging.Formatter(
@@ -90,10 +99,20 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     root.addHandler(console)
     root.addHandler(file_handler)
 
+    # urllib3 DEBUG output includes full request URLs. Push URLs contain the
+    # SendKey, so third-party connection logs must never be written verbatim.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     return logging.getLogger("douyin_monitor")
 
 
 logger = setup_logging()
+
+
+# ── Tiny helper: print to terminal AND write to log in one call ──
+def _echo(level: int, msg: str) -> None:
+    """Log at *level* (→ file always, → console only if WARNING+)."""
+    logger.log(level, msg)
 
 # ===== State Management =====
 
@@ -125,6 +144,9 @@ class MonitorState:
         self.last_repeat_notify_time: float = 0.0
         self.max_repeat_notifications: int = 3
         self.repeat_notify_interval: int = 600  # 10 minutes in seconds
+        # Daily intimacy reminder tracking
+        self._daily_reminder_minutes_sent: set = set()  # e.g. {57, 58, 59}
+        self._daily_reminder_date: str = ""  # track date to reset on new day
 
     def transition(self, is_live: bool, info: Dict[str, Any]) -> str:
         """
@@ -207,11 +229,12 @@ class MonitorState:
 
         Always sends on first detection; no cooldown.
         """
-        if self.notification_sent:
-            return False
+        return not self.notification_sent
+
+    def mark_first_notification_sent(self) -> None:
+        """Commit the first-live notification only after a successful send."""
         self.notification_sent = True
         self.last_repeat_notify_time = time.time()
-        return True
 
     def should_notify_repeat(self) -> bool:
         """Check if we should send a REPEAT notification while still live.
@@ -219,7 +242,7 @@ class MonitorState:
         Returns True every `repeat_notify_interval` seconds,
         up to `max_repeat_notifications` times.
         """
-        if self.status != self.LIVE:
+        if self.status != self.LIVE or not self.notification_sent:
             return False
         if self.repeat_notify_count >= self.max_repeat_notifications:
             return False
@@ -274,11 +297,10 @@ def _default_config() -> Dict[str, Any]:
         "push_url": "",
         "check_interval": 30,
         "notify_on_stream_end": True,
-        "retry_times": 3,
-        "retry_delay": 5,
         "repeat_notify_interval": 600,
         "max_repeat_notifications": 3,
         "startup_notify": False,
+        "enable_daily_intimacy_reminder": True,
     }
 
 
@@ -301,8 +323,6 @@ def _create_notifier(config: Dict[str, Any]) -> ServerChanNotifier:
         sendkey=config.get("sendkey", ""),
         uid=config.get("push_uid"),
         push_url=config.get("push_url"),
-        retry_times=config.get("retry_times", 3),
-        retry_delay=config.get("retry_delay", 5),
     )
 
 
@@ -432,7 +452,7 @@ def prompt_target_url() -> str:
 
     print()
     print("=" * 50)
-    print("         抖音直播监听器")
+    print("         Douyin Live Monitor  v2.0")
     print("=" * 50)
     print()
 
@@ -489,6 +509,21 @@ def prompt_target_url() -> str:
             print("❌ 链接不能为空，请重新输入")
             continue
 
+        # Clean the input: extract just the URL portion
+        # Users often paste raw share text like:
+        #   "https://v.douyin.com/xxxxx/ 3@1.com :4pm"
+        # where the trailing text is a Douyin copy-paste artifact.
+        # Split on whitespace and find the first http(s) token.
+        tokens = url.split()
+        url = ""
+        for token in tokens:
+            if token.startswith("http://") or token.startswith("https://"):
+                url = token
+                break
+        if not url:
+            # Fallback: take the first token if none starts with http
+            url = tokens[0] if tokens else ""
+
         # Basic URL validation
         if not (url.startswith("http://") or url.startswith("https://")):
             print("❌ 请输入有效的网址 (以 http:// 或 https:// 开头)")
@@ -531,6 +566,7 @@ class DouyinLiveMonitor:
             "max_repeat_notifications", 3
         )
         self.running = True
+        self._stop_event = threading.Event()
 
     def _resolve_sec_uid(self) -> Optional[str]:
         """Resolve the target user's sec_uid."""
@@ -566,6 +602,10 @@ class DouyinLiveMonitor:
         room_id = info.get("room_id", "")
         title = info.get("title", "")
 
+        line = f"🔴 {nickname} 开播! 房间 {room_id}"
+        if title:
+            line += f"  {title[:30]}"
+        print(line)
         logger.info(f"[LIVE] 检测到开播! 博主: {nickname}, 房间: {room_id}")
 
         success = self.notifier.send_live_notification(
@@ -573,6 +613,11 @@ class DouyinLiveMonitor:
             room_id=room_id,
             title=title,
         )
+        if success:
+            self.state.mark_first_notification_sent()
+        elif self.notifier.delivery_unknown:
+            # The POST may have been accepted before the connection failed.
+            self.state.mark_first_notification_sent()
 
         if success:
             logger.info("[OK] 开播通知已发送!")
@@ -608,6 +653,63 @@ class DouyinLiveMonitor:
         else:
             logger.error("[FAIL] 重复推送发送失败!")
 
+    def _check_daily_intimacy_reminder(self, info: Dict[str, Any]) -> None:
+        """Check and send daily intimacy reminder at 23:57, 23:58, 23:59.
+
+        Only sends when the streamer is currently live.
+        Each minute slot is sent at most once per day.
+        """
+        if not self.config.get("enable_daily_intimacy_reminder", True):
+            return
+
+        now = datetime.now()
+        hour = now.hour
+        minute = now.minute
+        today = now.strftime("%Y-%m-%d")
+
+        # Only trigger at 23:57, 23:58, 23:59
+        if hour != 23 or minute not in (57, 58, 59):
+            return
+
+        # Reset sent-set when date has changed
+        if self.state._daily_reminder_date != today:
+            self.state._daily_reminder_minutes_sent.clear()
+            self.state._daily_reminder_date = today
+
+        # Already sent for this minute slot today
+        if minute in self.state._daily_reminder_minutes_sent:
+            return
+
+        # Only send when the streamer is currently live
+        if self.state.status != self.state.LIVE:
+            logger.debug(
+                f"[亲密度提醒] 23:{minute} 但主播不在直播中，跳过"
+            )
+            return
+
+        nickname = info.get("nickname") or self.state.streamer_nickname
+        room_id = info.get("room_id", "")
+        title = info.get("title", "")
+
+        print(f"\n⏰ 每日亲密度提醒 (23:{minute}) - {nickname} 仍在直播!")
+        logger.info(f"[亲密度提醒] 23:{minute} - {nickname} 亲密度即将刷新")
+
+        success = self.notifier.send_daily_intimacy_reminder(
+            nickname=nickname,
+            minute=minute,
+            room_id=room_id,
+            title=title,
+        )
+        if success:
+            self.state._daily_reminder_minutes_sent.add(minute)
+        elif self.notifier.delivery_unknown:
+            self.state._daily_reminder_minutes_sent.add(minute)
+
+        if success:
+            logger.info(f"[OK] 亲密度提醒已发送 (23:{minute})!")
+        else:
+            logger.error(f"[FAIL] 亲密度提醒发送失败 (23:{minute})!")
+
     def _handle_stream_end(self) -> None:
         """Handle when streamer goes offline."""
         if not self.notify_on_end:
@@ -616,6 +718,7 @@ class DouyinLiveMonitor:
         nickname = self.state.streamer_nickname
         duration = self.state._format_duration()
 
+        print(f"⚫ {nickname} 已下播 (时长 {duration})")
         logger.info(f"[OFFLINE] 直播结束: {nickname}")
 
         self.notifier.send_stream_end_notification(
@@ -639,6 +742,9 @@ class DouyinLiveMonitor:
                 self._handle_repeat_notification(result)
         elif transition == "went_offline":
             self._handle_stream_end()
+
+        # Always check daily intimacy reminder (23:57/58/59)
+        self._check_daily_intimacy_reminder(result)
 
         return result
 
@@ -675,6 +781,9 @@ class DouyinLiveMonitor:
 
         logger.info(f"开始监控: {self.state.get_summary()}")
 
+        self._start_stop_listener()
+        print("监控已启动，输入 q 后回车可终止并退出；也可按 Ctrl+C。")
+
         check_count = 0
         consecutive_errors = 0
         max_consecutive_errors = 10
@@ -684,23 +793,26 @@ class DouyinLiveMonitor:
 
             try:
                 check_count += 1
-                logger.debug(
-                    f"--- 第 {check_count} 次检测 "
-                    f"({datetime.now().strftime('%H:%M:%S')}) ---"
-                )
 
                 result = self.check_once()
                 is_live = result.get("is_live", False)
                 method = result.get("method", "unknown")
 
-                logger.info(
-                    f"{self.state.get_summary()} "
-                    f"[方法: {method}] "
-                    f"[第{check_count}次]"
-                )
-
-                if is_live and result.get("title"):
-                    logger.info(f"  直播标题: {result['title']}")
+                # --- compact one-line status to terminal + full log ---
+                nick = self.state.streamer_nickname or "?"
+                now = datetime.now().strftime("%m-%d %H:%M")
+                if is_live:
+                    title = (result.get("title") or "")[:30]
+                    line = f"🔴 {now}  #{check_count}  {nick} 直播中 | {method}"
+                    if title:
+                        line += f" | {title}"
+                    logger.info(line)
+                    print(line)
+                else:
+                    line = f"⚫ {now}  #{check_count}  {nick} 未开播 | {method}"
+                    logger.info(line)
+                    if check_count % 10 == 1:
+                        print(line)
 
                 consecutive_errors = 0  # Reset error counter on success
 
@@ -714,6 +826,7 @@ class DouyinLiveMonitor:
                     f"{max_consecutive_errors}): {e}",
                     exc_info=True,
                 )
+                # Errors always visible on terminal (WARNING+)
                 if consecutive_errors >= max_consecutive_errors:
                     logger.error(
                         f"连续错误达到 {max_consecutive_errors} 次，退出"
@@ -725,7 +838,7 @@ class DouyinLiveMonitor:
                 sleep_time = next_check - time.time()
                 if sleep_time > 0:
                     try:
-                        time.sleep(sleep_time)
+                        self._stop_event.wait(sleep_time)
                     except KeyboardInterrupt:
                         break
 
@@ -734,6 +847,34 @@ class DouyinLiveMonitor:
     def stop(self) -> None:
         """Signal the monitor to stop."""
         self.running = False
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+    def _start_stop_listener(self) -> None:
+        """Listen for a console command that stops continuous monitoring."""
+        stdin = getattr(sys, "stdin", None)
+        if stdin is None or not hasattr(stdin, "isatty") or not stdin.isatty():
+            return
+
+        def listen() -> None:
+            while self.running:
+                try:
+                    command = input().strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                if command in {"q", "quit", "exit", "stop", "退出"}:
+                    print("正在停止监控...")
+                    self.stop()
+                    return
+                if command:
+                    print("未知命令；输入 q 后回车退出。")
+
+        threading.Thread(
+            target=listen,
+            name="monitor-stop-listener",
+            daemon=True,
+        ).start()
 
 
 # ===== CLI Entry Point =====
@@ -750,6 +891,11 @@ def main():
   python monitor.py --config my.json   # 使用自定义配置
   python monitor.py --test             # 测试 Server酱³ 连接
         """,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"douyin-live-monitor v{APP_VERSION}",
     )
     parser.add_argument(
         "--config",
@@ -785,15 +931,15 @@ def main():
 
     args = parser.parse_args()
 
-    # Set log level
+    # Reconfigure console level for --verbose / --quiet
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        for name in ["douyin_monitor", "douyin_client", "notifier"]:
-            logging.getLogger(name).setLevel(logging.DEBUG)
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(logging.DEBUG)
     elif args.quiet:
-        logging.getLogger().setLevel(logging.WARNING)
-        for name in ["douyin_monitor", "douyin_client", "notifier"]:
-            logging.getLogger(name).setLevel(logging.WARNING)
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(logging.ERROR)
 
     # Load config
     config_path = Path(args.config)

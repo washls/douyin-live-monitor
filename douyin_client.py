@@ -24,8 +24,63 @@ from typing import Optional, Dict, Any
 from urllib.parse import unquote, urlparse, parse_qs
 
 import requests
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
+
+# ── Precompiled regex patterns (compiled once at import, not per call) ──
+
+_RE_ROOM_ID_REFLOW = re.compile(r'/reflow/(\d+)')
+_RE_ROOM_ID_LIVE = re.compile(r'live\.douyin\.com/(\d+)')
+_RE_SEC_UID = re.compile(r'/user/([A-Za-z0-9_-]+)')
+_RE_TTWID = re.compile(r'ttwid=([^;]+)')
+
+_RE_RENDER_DATA = re.compile(
+    r'<script[^>]*id="RENDER_DATA"[^>]*>(.*?)</script>', re.DOTALL
+)
+_RE_INITIAL_STATE_SCRIPT = re.compile(
+    r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>', re.DOTALL
+)
+_RE_INITIAL_STATE_BARE = re.compile(
+    r'__INITIAL_STATE__\s*=\s*({.*?});', re.DOTALL
+)
+_RE_PACE_F = re.compile(r'self\.__pace_f\s*=\s*(\[.*?\]);', re.DOTALL)
+
+_RE_NICKNAME = re.compile(r'"nickname"\s*:\s*"([^"]+)"')
+_RE_NICK_NAME = re.compile(r'"nick_name"\s*:\s*"([^"]+)"')
+_RE_UNIQUE_ID = re.compile(r'"unique_id"\s*:\s*"([^"]+)"')
+_RE_LIVE_STATUS = re.compile(r'"live_status"\s*:\s*([1-9]\d*)')
+_RE_STATUS_2 = re.compile(r'"status"\s*:\s*2\b')
+_RE_SEC_UID_IN_HTML = re.compile(r'"sec_uid"\s*:\s*"([^"]+)"')
+_RE_TITLE = re.compile(r'"title"\s*:\s*"([^"]+)"')
+
+_RE_SCRIPT_TAGS = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL)
+_RE_NEXT_DATA = re.compile(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
+_RE_WINDOW_DATA = re.compile(
+    r'<script[^>]*>\s*window\._data\s*=\s*({.*?});\s*</script>', re.DOTALL
+)
+
+_RE_AVATAR = re.compile(
+    r'"avatar_thumb"\s*:\s*\{[^}]*"url_list"\s*:\s*\["([^"]+)"\]'
+)
+
+# Common live-text indicators
+_LIVE_TEXT_INDICATORS = ('直播中', '正在直播', 'live_status":1', 'live_status": 1')
+_LIVE_STATUS_PATTERNS = (
+    (re.compile(r'"status"\s*:\s*2\b'), 'room.status=2'),
+    (re.compile(r'"live_status"\s*:\s*1\b'), 'live_status=1'),
+    (re.compile(r'"is_living"\s*:\s*true'), 'is_living=true'),
+    (re.compile(r'"living"\s*:\s*true'), 'living=true'),
+)
+
+# Max number of profile HTML pages to keep in cache (each ~200 KB).
+# LRU eviction via dict ordering (Python 3.7+).
+_MAX_HTML_CACHE_SIZE = 3
+
+# Connection-pool size for the session.  We hit a single host at a time so
+# 2 connections (one for douyin.com, one for live.douyin.com) is plenty.
+_POOL_CONNECTIONS = 2
+_POOL_MAXSIZE = 2
 
 # Default browser-like headers
 DEFAULT_HEADERS = {
@@ -39,7 +94,9 @@ DEFAULT_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
-    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua": (
+        '"Chromium";v="142", "Google Chrome";v="142", "Not=A?Brand";v="99"'
+    ),
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
@@ -89,11 +146,29 @@ class DouyinClient:
     ):
         self.session = requests.Session()
         self.session.headers.update(headers or DEFAULT_HEADERS)
+        # Disable system proxy — on some Windows machines, stray proxy settings
+        # (e.g. HTTP_PROXY env var, IE proxy config) cause connection refused
+        # errors even when no proxy is actually running.
+        self.session.trust_env = False
+        self.session.proxies = {"http": None, "https": None}
+
+        # Shrink the connection pool — we hit at most 2 hosts concurrently
+        # (douyin.com + live.douyin.com).  Default is 10 per host.
+        adapter = HTTPAdapter(
+            pool_connections=_POOL_CONNECTIONS,
+            pool_maxsize=_POOL_MAXSIZE,
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
         self._cached_sec_uid: Optional[str] = None
         self._cached_room_id: str = ""
         self._cached_user_info: Dict[str, Any] = {}
         self._cookies_initialized = False
         self._ies_share_url: str = ""
+        # Short-link redirects are stable during one monitor run. Caching the
+        # target avoids repeated HEAD requests on every polling round.
+        self._resolved_url_cache: Dict[str, str] = {}
         self._profile_html_cache: Dict[str, str] = {}
         self.debug = debug
 
@@ -130,6 +205,13 @@ class DouyinClient:
         except Exception as e:
             logger.warning(f"[DEBUG] 保存失败: {e}")
 
+    def _cache_profile_html(self, url: str, html: str) -> None:
+        """Cache profile page HTML.  Evicts oldest entry on overflow."""
+        if len(self._profile_html_cache) >= _MAX_HTML_CACHE_SIZE:
+            oldest = next(iter(self._profile_html_cache))
+            del self._profile_html_cache[oldest]
+        self._profile_html_cache[url] = html
+
     def _ensure_cookies(self) -> None:
         """Obtain initial cookies by visiting Douyin and live.douyin.com.
 
@@ -165,9 +247,7 @@ class DouyinClient:
                 resp2.raise_for_status()
                 # Extract ttwid from response if still not set
                 if "ttwid" not in self.session.cookies:
-                    ttwid_match = re.search(
-                        r'ttwid=([^;]+)', resp2.text[:50000]
-                    )
+                    ttwid_match = _RE_TTWID.search(resp2.text[:50000])
                     if ttwid_match:
                         self.session.cookies.set(
                             "ttwid",
@@ -197,6 +277,18 @@ class DouyinClient:
         Returns:
             Full profile URL or live stream URL
         """
+        cached_url = self._resolved_url_cache.get(short_url)
+        if cached_url:
+            self.extract_sec_uid(cached_url)
+            room_match = _RE_ROOM_ID_REFLOW.search(cached_url)
+            if not room_match:
+                room_match = _RE_ROOM_ID_LIVE.search(cached_url)
+            if room_match:
+                self._cached_room_id = room_match.group(1)
+            if "iesdouyin.com/share/user/" in cached_url:
+                self._ies_share_url = cached_url
+            logger.debug("short link redirect reused from cache")
+            return cached_url
         logger.info(f"解析短链接: {short_url}")
 
         try:
@@ -206,6 +298,7 @@ class DouyinClient:
                 allow_redirects=True,
             )
             final_url = resp.url
+            self._resolved_url_cache[short_url] = final_url
             logger.info(f"解析结果: {final_url[:150]}...")
 
             # Extract sec_uid from the URL
@@ -215,13 +308,13 @@ class DouyinClient:
             if "webcast.amemv.com" in final_url or "webcast" in final_url:
                 logger.info("检测到直播分享链接!")
                 # Extract room_id from /reflow/{room_id}
-                room_match = re.search(r'/reflow/(\d+)', final_url)
+                room_match = _RE_ROOM_ID_REFLOW.search(final_url)
                 if room_match:
                     self._cached_room_id = room_match.group(1)
                     logger.info(f"从链接提取直播间ID: {self._cached_room_id}")
                 # Also try other patterns
                 if not self._cached_room_id:
-                    room_match = re.search(r'live\.douyin\.com/(\d+)', final_url)
+                    room_match = _RE_ROOM_ID_LIVE.search(final_url)
                     if room_match:
                         self._cached_room_id = room_match.group(1)
 
@@ -243,7 +336,7 @@ class DouyinClient:
         """
         if not self._cached_sec_uid:
             # Try to extract from URL pattern: /user/{sec_uid}
-            match = re.search(r'/user/([A-Za-z0-9_-]+)', url)
+            match = _RE_SEC_UID.search(url)
             if match:
                 self._cached_sec_uid = match.group(1)
             else:
@@ -303,7 +396,7 @@ class DouyinClient:
 
         try:
             url = f"https://www.douyin.com/user/{sec_uid}"
-            logger.info(f"[HTML检测] 访问用户主页: {url}")
+            logger.debug(f"[HTML检测] 访问用户主页: {url}")
 
             # Reuse cached profile HTML if another method already fetched it
             if url in self._profile_html_cache:
@@ -317,7 +410,7 @@ class DouyinClient:
                 final_url = resp.url
                 # Don't cache captcha/error pages — they'd poison future checks
                 if "verify" not in final_url.lower() and "captcha" not in final_url.lower() and len(html) >= 5000:
-                    self._profile_html_cache[url] = html
+                    self._cache_profile_html(url, html)
 
             logger.debug(f"[HTML检测] 最终URL: {final_url}")
             logger.debug(f"[HTML检测] 页面大小: {len(html)} bytes")
@@ -333,10 +426,7 @@ class DouyinClient:
                 self._dump_debug("html_short_response", html)
 
             # === Approach 1: RENDER_DATA (SSR embedded JSON) ===
-            render_match = re.search(
-                r'<script[^>]*id="RENDER_DATA"[^>]*>(.*?)</script>',
-                html, re.DOTALL
-            )
+            render_match = _RE_RENDER_DATA.search(html)
 
             if render_match:
                 try:
@@ -394,15 +484,9 @@ class DouyinClient:
 
             # === Approach 2: __INITIAL_STATE__ ===
             if not result["nickname"]:
-                state_match = re.search(
-                    r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>',
-                    html, re.DOTALL
-                )
+                state_match = _RE_INITIAL_STATE_SCRIPT.search(html)
                 if not state_match:
-                    state_match = re.search(
-                        r'__INITIAL_STATE__\s*=\s*({.*?});',
-                        html, re.DOTALL
-                    )
+                    state_match = _RE_INITIAL_STATE_BARE.search(html)
                 if state_match:
                     try:
                         state = json.loads(state_match.group(1))
@@ -427,10 +511,7 @@ class DouyinClient:
 
             # === Approach 3: self.__pace_f array (newer Douyin pages) ===
             if not result["nickname"]:
-                pace_match = re.search(
-                    r'self\.__pace_f\s*=\s*(\[.*?\]);',
-                    html, re.DOTALL
-                )
+                pace_match = _RE_PACE_F.search(html)
                 if pace_match:
                     try:
                         pace_data = json.loads(pace_match.group(1))
@@ -450,13 +531,8 @@ class DouyinClient:
 
             # === Approach 4: Generic regex patterns in raw HTML ===
             if not result["nickname"]:
-                nick_patterns = [
-                    r'"nickname"\s*:\s*"([^"]+)"',
-                    r'"nick_name"\s*:\s*"([^"]+)"',
-                    r'"unique_id"\s*:\s*"([^"]+)"',
-                ]
-                for pattern in nick_patterns:
-                    nick_match = re.search(pattern, html)
+                for pattern in (_RE_NICKNAME, _RE_NICK_NAME, _RE_UNIQUE_ID):
+                    nick_match = pattern.search(html)
                     if nick_match:
                         result["nickname"] = nick_match.group(1)
                         logger.debug(f"[HTML检测] 从正则提取昵称: {result['nickname']}")
@@ -464,33 +540,30 @@ class DouyinClient:
 
             # === Check for live status indicators in raw HTML ===
             if not result["is_live"]:
-                live_patterns = [
-                    r'"live_status"\s*:\s*([1-9]\d*)',
-                    r'"status"\s*:\s*2\b',
-                ]
+                live_patterns = (_RE_LIVE_STATUS, _RE_STATUS_2)
                 for pattern in live_patterns:
-                    match = re.search(pattern, html)
+                    match = pattern.search(html)
                     if match:
-                        logger.info(f"[HTML检测] 页面匹配直播标识: {pattern}")
+                        logger.debug(f"[HTML检测] 页面匹配直播标识: {pattern.pattern}")
                         result["is_live"] = True
                         break
 
                 if not result["is_live"]:
-                    for indicator in ['直播中', '正在直播', 'live_status":1', 'live_status": 1']:
+                    for indicator in _LIVE_TEXT_INDICATORS:
                         if indicator in html:
-                            logger.info(f"[HTML检测] 发现直播文本标识: {indicator}")
+                            logger.debug(f"[HTML检测] 发现直播文本标识: {indicator}")
                             result["is_live"] = True
                             break
 
             # === Extract room_id if live ===
             if result["is_live"] and not result["room_id"]:
-                room_match = re.search(r'live\.douyin\.com/(\d+)', html)
+                room_match = _RE_ROOM_ID_LIVE.search(html)
                 if room_match:
                     result["room_id"] = room_match.group(1)
 
             # === Approach 5: Try to extract SEC_USER_ID and other identifiers ===
             if not result["nickname"]:
-                sec_match = re.search(r'"sec_uid"\s*:\s*"([^"]+)"', html)
+                sec_match = _RE_SEC_UID_IN_HTML.search(html)
                 if sec_match:
                     logger.debug(f"[HTML检测] 页面中发现 sec_uid: {sec_match.group(1)}")
 
@@ -504,7 +577,7 @@ class DouyinClient:
                 logger.debug(f"[HTML检测] 页面开头:\n{snippet}")
                 self._dump_debug("html_parse_failed", html)
 
-            logger.info(
+            logger.debug(
                 f"[HTML检测] 结果: is_live={result['is_live']}, "
                 f"nickname={result['nickname']}, "
                 f"room_id={result['room_id']}"
@@ -542,7 +615,7 @@ class DouyinClient:
                 "sec_uid": sec_uid,
             }
 
-            logger.info(f"[IES API] 请求: sec_uid={sec_uid}")
+            logger.debug(f"[IES API] 请求: sec_uid={sec_uid}")
 
             resp = self.session.get(
                 url,
@@ -576,7 +649,7 @@ class DouyinClient:
                                 room_status = room.get("status", 0)
                                 if room_status == 2:
                                     result["is_live"] = True
-                                    logger.info(
+                                    logger.debug(
                                         "[IES API] room.status=2 (直播中)"
                                     )
 
@@ -587,7 +660,7 @@ class DouyinClient:
                                     alt_val = user_info.get(alt_field)
                                     if alt_val and (alt_val is True or str(alt_val) in ("1", "true", "True")):
                                         result["is_live"] = True
-                                        logger.info(
+                                        logger.debug(
                                             f"[IES API] 通过 {alt_field} 字段检测到直播"
                                         )
                                         break
@@ -608,7 +681,7 @@ class DouyinClient:
                                         f"[IES API] room 数据: {user_info['room']}"
                                     )
 
-                            logger.info(
+                            logger.debug(
                                 f"[IES API] nickname={result['nickname']}, "
                                 f"is_live={result['is_live']}, "
                                 f"live_status_raw={live_status}"
@@ -690,7 +763,7 @@ class DouyinClient:
                 )
 
             url = "https://www.douyin.com/aweme/v1/web/user/profile/other/"
-            logger.info(f"[API检测] 请求用户信息 API: sec_uid={sec_uid}")
+            logger.debug(f"[API检测] 请求用户信息 API: sec_uid={sec_uid}")
 
             resp = self.session.get(
                 url,
@@ -717,7 +790,7 @@ class DouyinClient:
                 )
                 # Try with a_bogus if not already tried
                 if not bogus.get("a_bogus"):
-                    logger.info("[API检测] 重试带 a_bogus 签名...")
+                    logger.debug("[API检测] 重试带 a_bogus 签名...")
                     params_str = "&".join(
                         f"{k}={v}" for k, v in params.items()
                     )
@@ -798,7 +871,7 @@ class DouyinClient:
             ):
                 result["has_products"] = True
 
-            logger.info(
+            logger.debug(
                 f"[API检测] 用户: {result['nickname']}, "
                 f"直播状态: {result['is_live']}"
             )
@@ -833,7 +906,7 @@ class DouyinClient:
 
         try:
             url = f"https://www.iesdouyin.com/share/user/{sec_uid}"
-            logger.info(f"[IES分享页] 访问: {url}")
+            logger.debug(f"[IES分享页] 访问: {url}")
 
             resp = self.session.get(
                 url,
@@ -851,15 +924,11 @@ class DouyinClient:
 
             # Try to find SSR embedded data
             # Pattern 1: __INITIAL_STATE__ or similar
-            state_patterns = [
-                r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>',
-                r'__INITIAL_STATE__\s*=\s*({.*?});',
-                r'"userInfo"\s*:\s*(\{.*?\})[,;]',
-                r'"user"\s*:\s*(\{.*?\})[,;]',
-            ]
-
-            for pattern in state_patterns:
-                match = re.search(pattern, html, re.DOTALL)
+            for pattern in (
+                _RE_INITIAL_STATE_SCRIPT,
+                _RE_INITIAL_STATE_BARE,
+            ):
+                match = pattern.search(html)
                 if match:
                     try:
                         data = json.loads(match.group(1))
@@ -887,15 +956,9 @@ class DouyinClient:
 
             # Pattern 2: Look for embedded JSON data
             if not result["nickname"]:
-                json_data_match = re.search(
-                    r'<script[^>]*>\s*window\._data\s*=\s*({.*?});\s*</script>',
-                    html, re.DOTALL
-                )
+                json_data_match = _RE_WINDOW_DATA.search(html)
                 if not json_data_match:
-                    json_data_match = re.search(
-                        r'id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                        html, re.DOTALL
-                    )
+                    json_data_match = _RE_NEXT_DATA.search(html)
                 if json_data_match:
                     try:
                         data = json.loads(json_data_match.group(1))
@@ -914,14 +977,12 @@ class DouyinClient:
 
             # Pattern 3: Generic data in <script> tags
             if not result["nickname"]:
-                script_matches = re.findall(
-                    r'<script[^>]*>(.*?)</script>', html, re.DOTALL
-                )
+                script_matches = _RE_SCRIPT_TAGS.findall(html)
                 for script in script_matches:
                     if 'nickname' in script and 'live_status' in script:
                         try:
-                            nick_match = re.search(r'"nickname"\s*:\s*"([^"]+)"', script)
-                            live_match = re.search(r'"live_status"\s*:\s*(\d+)', script)
+                            nick_match = _RE_NICKNAME.search(script)
+                            live_match = _RE_LIVE_STATUS.search(script)
                             if nick_match:
                                 result["nickname"] = nick_match.group(1)
                             if live_match and int(live_match.group(1)) != 0:
@@ -932,7 +993,7 @@ class DouyinClient:
 
             # Pattern 4: Direct regex for live indicators
             if not result["is_live"]:
-                for indicator in ['直播中', '正在直播', 'live_status":1', 'live_status": 1']:
+                for indicator in _LIVE_TEXT_INDICATORS:
                     if indicator in html:
                         result["is_live"] = True
                         break
@@ -942,7 +1003,7 @@ class DouyinClient:
                 logger.warning("[IES分享页] 未能提取数据")
                 self._dump_debug("ies_share_parse_failed", html)
 
-            logger.info(
+            logger.debug(
                 f"[IES分享页] 结果: is_live={result['is_live']}, "
                 f"nickname={result['nickname']}"
             )
@@ -984,7 +1045,7 @@ class DouyinClient:
                 "device_platform": "web",
             }
 
-            logger.info(f"[Webcast API] 请求: sec_uid={sec_uid}")
+            logger.debug(f"[Webcast API] 请求: sec_uid={sec_uid}")
 
             resp = self.session.get(
                 webcast_url,
@@ -1053,7 +1114,7 @@ class DouyinClient:
                 except Exception:
                     pass
 
-            logger.info(
+            logger.debug(
                 f"[Webcast API] 结果: is_live={result['is_live']}, "
                 f"nickname={result['nickname']}"
             )
@@ -1088,7 +1149,7 @@ class DouyinClient:
 
         try:
             url = f"https://live.douyin.com/{room_id}"
-            logger.info(f"[直播间检测] 访问: {url}")
+            logger.debug(f"[直播间检测] 访问: {url}")
 
             resp = self.session.get(
                 url,
@@ -1100,25 +1161,26 @@ class DouyinClient:
 
             # Check if redirected away (means not live or room doesn't exist)
             if "live.douyin.com" not in resp.url:
-                logger.info("[直播间检测] 被重定向，可能未开播")
+                logger.debug("[直播间检测] 被重定向，可能未开播")
                 return result
 
             # Look for live indicators in the page
-            live_indicators = [
-                r'"status"\s*:\s*2',
-                r'"live_status"\s*:\s*1',
-                r'直播中',
-                r'id="live-room-title"',
-            ]
-
-            for pattern in live_indicators:
-                if re.search(pattern, html):
-                    logger.info(f"[直播间检测] 匹配直播标识: {pattern}")
+            for pattern, _desc in _LIVE_STATUS_PATTERNS:
+                if pattern.search(html):
+                    logger.debug(f"[直播间检测] 匹配直播标识: {pattern.pattern}")
                     result["is_live"] = True
                     break
 
+            # Also check text indicators and DOM ids
+            if not result["is_live"]:
+                for indicator in (*_LIVE_TEXT_INDICATORS, 'id="live-room-title"'):
+                    if indicator in html:
+                        logger.debug(f"[直播间检测] 发现直播标识: {indicator}")
+                        result["is_live"] = True
+                        break
+
             # Extract title
-            title_match = re.search(r'"title"\s*:\s*"([^"]+)"', html)
+            title_match = _RE_TITLE.search(html)
             if title_match:
                 result["title"] = title_match.group(1)
 
@@ -1167,7 +1229,7 @@ class DouyinClient:
                 "browser_online": "true",
             }
 
-            logger.info(f"[Webcast info_by_user] 请求: sec_uid={sec_uid[:20]}...")
+            logger.debug(f"[Webcast info_by_user] 请求: sec_uid={sec_uid[:20]}...")
 
             resp = self.session.get(
                 url,
@@ -1228,7 +1290,7 @@ class DouyinClient:
                     f"[Webcast info_by_user] HTTP {resp.status_code}"
                 )
 
-            logger.info(
+            logger.debug(
                 f"[Webcast info_by_user] 结果: is_live={result['is_live']}, "
                 f"room_id={result['room_id']}"
             )
@@ -1263,7 +1325,7 @@ class DouyinClient:
 
         try:
             url = f"https://www.douyin.com/user/{sec_uid}"
-            logger.info(f"[Profile直播链接检测] 访问: {url}")
+            logger.debug(f"[Profile直播链接检测] 访问: {url}")
 
             # Reuse cached profile HTML if another method already fetched it
             if url in self._profile_html_cache:
@@ -1282,59 +1344,50 @@ class DouyinClient:
                 html = resp.text
                 # Don't cache captcha/error pages
                 if "verify" not in resp.url.lower() and "captcha" not in resp.url.lower() and len(html) >= 5000:
-                    self._profile_html_cache[url] = html
+                    self._cache_profile_html(url, html)
 
             # Look for live room URL patterns in the HTML
-            # Pattern 1: live.douyin.com/{room_id} links
-            live_room_matches = re.findall(
-                r'live\.douyin\.com/(\d+)', html
-            )
+            live_room_matches = _RE_ROOM_ID_LIVE.findall(html)
             # Pattern 2: webcast.amemv.com/reflow/{room_id}
-            webcast_matches = re.findall(
-                r'webcast\.amemv\.com/reflow/(\d+)', html
-            )
+            webcast_matches = _RE_ROOM_ID_REFLOW.findall(html)
 
-            all_room_ids = set(
-                live_room_matches + webcast_matches
-            )
+            all_room_ids = set(live_room_matches + webcast_matches)
 
             if all_room_ids:
                 # Use the first found room_id
                 room_id = list(all_room_ids)[0]
                 result["room_id"] = room_id
-                logger.info(
+                logger.debug(
                     f"[Profile直播链接检测] 发现直播间链接: room_id={room_id}"
                 )
                 # Don't assume live just from link — verify next
 
             # Also look for live status indicators in the profile page
-            live_indicators = [
-                r'"status"\s*:\s*2\b',       # room status = 2 (live)
-                r'"live_status"\s*:\s*1\b',   # live_status = 1
-                r'"is_living"\s*:\s*true',
-                r'"living"\s*:\s*true',
-                r'直播中',
-                r'正在直播',
-            ]
-
-            for pattern in live_indicators:
-                if re.search(pattern, html):
-                    logger.info(
-                        f"[Profile直播链接检测] 匹配直播标识: {pattern}"
+            for pattern, _desc in _LIVE_STATUS_PATTERNS:
+                if pattern.search(html):
+                    logger.debug(
+                        f"[Profile直播链接检测] 匹配直播标识: {pattern.pattern}"
                     )
                     result["is_live"] = True
                     break
 
+            # Also check text-based indicators
+            if not result["is_live"]:
+                for indicator in _LIVE_TEXT_INDICATORS:
+                    if indicator in html:
+                        logger.debug(
+                            f"[Profile直播链接检测] 匹配直播文本: {indicator}"
+                        )
+                        result["is_live"] = True
+                        break
+
             # Extract nickname from page
-            nick_match = re.search(r'"nickname"\s*:\s*"([^"]+)"', html)
+            nick_match = _RE_NICKNAME.search(html)
             if nick_match:
                 result["nickname"] = nick_match.group(1)
 
             # Try to extract room_id and title from RENDER_DATA
-            render_match = re.search(
-                r'<script[^>]*id="RENDER_DATA"[^>]*>(.*?)</script>',
-                html, re.DOTALL,
-            )
+            render_match = _RE_RENDER_DATA.search(html)
             if render_match:
                 try:
                     data_str = unquote(render_match.group(1))
@@ -1375,7 +1428,7 @@ class DouyinClient:
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
-            logger.info(
+            logger.debug(
                 f"[Profile直播链接检测] 结果: is_live={result['is_live']}, "
                 f"room_id={result['room_id']}, nickname={result['nickname']}"
             )
@@ -1421,6 +1474,9 @@ class DouyinClient:
         # calls for different users.
         self._cached_room_id = ""
         self._ies_share_url = ""
+        # Share HTML between strategies in this check only; never reuse a
+        # previous polling round's page and its stale live status.
+        self._profile_html_cache.clear()
 
         self._ensure_cookies()
 
@@ -1467,7 +1523,7 @@ class DouyinClient:
                 ies_info = self.check_live_by_iesdouyin_api(sec_uid)
                 nickname = ies_info.get("nickname", "")
                 ies_is_live = ies_info.get("is_live", False)
-                logger.info(
+                logger.debug(
                     f"IES API返回: is_live={ies_is_live}, nickname={nickname}"
                 )
             except requests.RequestException as e:
@@ -1478,7 +1534,7 @@ class DouyinClient:
             # Fall back to True only when the API couldn't be reached at all.
             if nickname and not ies_is_live:
                 is_live = False
-                logger.info("IES API确认未开播，覆盖webcast URL的直播假设")
+                logger.debug("IES API确认未开播，覆盖webcast URL的直播假设")
             elif nickname and ies_is_live:
                 is_live = True
             else:
@@ -1498,7 +1554,7 @@ class DouyinClient:
                 "methods_tried": ["link_direct"],
                 "timestamp": time.time(),
             }
-            logger.info(
+            logger.debug(
                 f"检测结果(LINK): is_live={is_live}, nickname={nickname}, "
                 f"room_id={self._cached_room_id}"
             )
@@ -1518,80 +1574,80 @@ class DouyinClient:
         total_methods = "8"
 
         # ---- Method 1: Douyin API (most reliable, now with Python a_bogus) ----
-        logger.info(f"--- [1/{total_methods}] Douyin API检测 ---")
+        logger.debug(f"--- [1/{total_methods}] Douyin API检测 ---")
         api_result = self.check_live_by_api(sec_uid)
         methods_tried.append("api")
         if not api_result.get("room_id") and self._cached_room_id:
             api_result["room_id"] = self._cached_room_id
         self._merge_best_result(best_result, api_result)
         if api_result["is_live"]:
-            logger.info("Douyin API确认直播中!")
+            logger.debug("Douyin API确认直播中!")
             api_result["methods_tried"] = methods_tried
             api_result["timestamp"] = time.time()
             return api_result
 
         # ---- Method 2: Webcast info_by_user ----
-        logger.info(f"--- [2/{total_methods}] Webcast info_by_user检测 ---")
+        logger.debug(f"--- [2/{total_methods}] Webcast info_by_user检测 ---")
         wc_info_result = self.check_live_by_webcast_info_by_user(sec_uid)
         methods_tried.append("webcast_info_by_user")
         self._merge_best_result(best_result, wc_info_result)
         if wc_info_result["is_live"]:
-            logger.info("Webcast info_by_user确认直播中!")
+            logger.debug("Webcast info_by_user确认直播中!")
             wc_info_result["methods_tried"] = methods_tried
             wc_info_result["timestamp"] = time.time()
             return wc_info_result
 
         # ---- Method 3: Profile live link extraction ----
-        logger.info(f"--- [3/{total_methods}] Profile直播链接检测 ---")
+        logger.debug(f"--- [3/{total_methods}] Profile直播链接检测 ---")
         profile_link_result = self.check_live_by_profile_live_link(sec_uid)
         methods_tried.append("profile_live_link")
         self._merge_best_result(best_result, profile_link_result)
         if profile_link_result["is_live"]:
-            logger.info("Profile直播链接确认直播中!")
+            logger.debug("Profile直播链接确认直播中!")
             profile_link_result["methods_tried"] = methods_tried
             profile_link_result["timestamp"] = time.time()
             return profile_link_result
 
         # ---- Method 4: HTML page parsing ----
-        logger.info(f"--- [4/{total_methods}] HTML页面检测 ---")
+        logger.debug(f"--- [4/{total_methods}] HTML页面检测 ---")
         html_result = self.check_live_by_html(sec_uid)
         methods_tried.append("html")
         self._merge_best_result(best_result, html_result)
         if html_result["is_live"]:
-            logger.info("HTML检测确认直播中!")
+            logger.debug("HTML检测确认直播中!")
             html_result["methods_tried"] = methods_tried
             html_result["timestamp"] = time.time()
             return html_result
 
         # ---- Method 5: IES API ----
-        logger.info(f"--- [5/{total_methods}] IES API检测 ---")
+        logger.debug(f"--- [5/{total_methods}] IES API检测 ---")
         ies_api_result = self.check_live_by_iesdouyin_api(sec_uid)
         methods_tried.append("ies_api")
         self._merge_best_result(best_result, ies_api_result)
         if ies_api_result["is_live"]:
-            logger.info("IES API确认直播中!")
+            logger.debug("IES API确认直播中!")
             ies_api_result["methods_tried"] = methods_tried
             ies_api_result["timestamp"] = time.time()
             return ies_api_result
 
         # ---- Method 6: Webcast API (original) ----
-        logger.info(f"--- [6/{total_methods}] Webcast API检测 ---")
+        logger.debug(f"--- [6/{total_methods}] Webcast API检测 ---")
         webcast_result = self.check_live_by_webcast_api(sec_uid)
         methods_tried.append("webcast_api")
         self._merge_best_result(best_result, webcast_result)
         if webcast_result["is_live"]:
-            logger.info("Webcast API确认直播中!")
+            logger.debug("Webcast API确认直播中!")
             webcast_result["methods_tried"] = methods_tried
             webcast_result["timestamp"] = time.time()
             return webcast_result
 
         # ---- Method 7: IES share page ----
-        logger.info(f"--- [7/{total_methods}] IES分享页检测 ---")
+        logger.debug(f"--- [7/{total_methods}] IES分享页检测 ---")
         ies_share_result = self.check_live_by_iesdouyin_share_page(sec_uid)
         methods_tried.append("ies_share")
         self._merge_best_result(best_result, ies_share_result)
         if ies_share_result["is_live"]:
-            logger.info("IES分享页确认直播中!")
+            logger.debug("IES分享页确认直播中!")
             ies_share_result["methods_tried"] = methods_tried
             ies_share_result["timestamp"] = time.time()
             return ies_share_result
@@ -1605,20 +1661,20 @@ class DouyinClient:
             or ies_api_result.get("room_id")
             or self._cached_room_id
         )
-        if room_id:
-            logger.info(f"--- [8/{total_methods}] 直播间页面检测 (room_id={room_id}) ---")
+        if room_id and str(room_id) != "0":
+            logger.debug(f"--- [8/{total_methods}] 直播间页面检测 (room_id={room_id}) ---")
             room_result = self.check_live_by_room_page(room_id)
             methods_tried.append("room_page")
             self._merge_best_result(best_result, room_result)
             if room_result["is_live"]:
-                logger.info("直播间页面确认直播中!")
+                logger.debug("直播间页面确认直播中!")
                 room_result["methods_tried"] = methods_tried
                 room_result["timestamp"] = time.time()
                 return room_result
 
         best_result["methods_tried"] = methods_tried
         best_result["timestamp"] = time.time()
-        logger.info(
+        logger.debug(
             f"检测完成: is_live=False, methods_tried={methods_tried}, "
             f"nickname={best_result.get('nickname', 'N/A')}"
         )
@@ -1655,20 +1711,17 @@ class DouyinClient:
             else:
                 resp = self.session.get(url, timeout=15)
                 html = resp.text
-                self._profile_html_cache[url] = html
+                self._cache_profile_html(url, html)
 
             info = {"sec_uid": sec_uid}
 
             # Extract nickname
-            nick_match = re.search(r'"nickname"\s*:\s*"([^"]+)"', html)
+            nick_match = _RE_NICKNAME.search(html)
             if nick_match:
                 info["nickname"] = nick_match.group(1)
 
             # Extract avatar
-            avatar_match = re.search(
-                r'"avatar_thumb"\s*:\s*\{[^}]*"url_list"\s*:\s*\["([^"]+)"\]',
-                html,
-            )
+            avatar_match = _RE_AVATAR.search(html)
             if avatar_match:
                 info["avatar"] = avatar_match.group(1)
 
