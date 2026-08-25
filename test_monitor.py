@@ -13,6 +13,7 @@ from monitor import (
 )
 from notifier import ServerChanNotifier
 from douyin_client import DouyinClient
+from monitor_service import LiveStatusUnknownError
 
 
 class MonitorStateTests(unittest.TestCase):
@@ -139,12 +140,13 @@ class MonitorControlTests(unittest.TestCase):
         live_monitor = object.__new__(DouyinLiveMonitor)
         live_monitor.target_url = "https://www.douyin.com/user/recovering"
         live_monitor.client = Mock()
-        live_monitor.client.check_live.side_effect = [
-            {
+        unknown_result = {
                 "is_live": False,
                 "indeterminate": True,
                 "error": "profile_api_empty_response",
-            },
+            }
+        live_monitor.client.check_live.side_effect = [
+            *[unknown_result for _ in range(12)],
             {
                 "is_live": True,
                 "nickname": "恢复主播",
@@ -164,13 +166,43 @@ class MonitorControlTests(unittest.TestCase):
         live_monitor.config = {"enable_daily_intimacy_reminder": False}
         live_monitor.notify_on_end = True
 
-        with self.assertRaisesRegex(RuntimeError, "profile_api_empty_response"):
-            live_monitor.check_once()
+        for _ in range(12):
+            with self.assertRaisesRegex(RuntimeError, "profile_api_empty_response"):
+                live_monitor.check_once()
 
         live_monitor.check_once()
         live_monitor.check_once()
 
         live_monitor.notifier.send_live_notification.assert_called_once()
+
+    def test_run_keeps_polling_after_many_unknown_results(self):
+        live_monitor = object.__new__(DouyinLiveMonitor)
+        live_monitor.target_url = "https://www.douyin.com/user/recovering"
+        live_monitor.check_interval = 1
+        live_monitor.config = {"startup_notify": False}
+        live_monitor.state = MonitorState()
+        live_monitor.state.streamer_nickname = "恢复主播"
+        live_monitor.notifier = Mock()
+        live_monitor.running = True
+        live_monitor._stop_event = Mock()
+        live_monitor._resolve_sec_uid = Mock(return_value="sec-recovering")
+        live_monitor._start_stop_listener = Mock()
+        call_count = 0
+
+        def check_once():
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 12:
+                raise LiveStatusUnknownError("profile_api_empty_response")
+            live_monitor.running = False
+            return {"is_live": True, "method": "api", "title": ""}
+
+        live_monitor.check_once = check_once
+
+        with patch("monitor.save_monitor_state"):
+            live_monitor.run()
+
+        self.assertEqual(call_count, 13)
 
     def test_windows_console_is_reconfigured_without_being_closed(self):
         stream = Mock()

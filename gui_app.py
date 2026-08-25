@@ -41,6 +41,10 @@ COLORS = {
     "warning": "#9d5d00",
 }
 
+MAX_STREAMER_LOG_LINES = 500
+MAX_PENDING_LOG_EVENTS = 2000
+MAX_LOG_EVENTS_PER_TICK = 200
+
 STATUS_TEXT = {
     "pending": "待启动",
     "unknown": "待检测",
@@ -236,7 +240,10 @@ class MonitorGui:
         self.testing_push = False
         self.selected_streamer_id = ""
         self.runtime_by_id: Dict[str, Dict[str, Any]] = {}
-        self.streamer_logs = StreamerLogStore(max_lines=500)
+        self.streamer_logs = StreamerLogStore(max_lines=MAX_STREAMER_LOG_LINES)
+        self.streamer_log_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+            maxsize=MAX_PENDING_LOG_EVENTS
+        )
         self.streamer_log_handler: StreamerLogHandler | None = None
         self.streamer_log_windows: Dict[str, Dict[str, Any]] = {}
 
@@ -1079,6 +1086,9 @@ class MonitorGui:
         log_window["has_logs"] = bool(lines)
 
     def _append_streamer_log(self, streamer_id: str, message: Any) -> None:
+        was_full = (
+            self.streamer_logs.count(streamer_id) >= self.streamer_logs.max_lines
+        )
         line = self.streamer_logs.append(streamer_id, message)
         log_window = self.streamer_log_windows.get(streamer_id)
         if not log_window:
@@ -1088,14 +1098,33 @@ class MonitorGui:
         if not log_window["has_logs"]:
             text.delete("1.0", tk.END)
             log_window["has_logs"] = True
+        elif was_full:
+            text.delete("1.0", "2.0")
         text.insert(tk.END, line + "\n")
         text.configure(state=tk.DISABLED)
         text.see(tk.END)
 
     def _attach_streamer_log_handler(self) -> None:
         self._detach_streamer_log_handler()
-        self.streamer_log_handler = StreamerLogHandler(self.event_queue.put)
+        self.streamer_log_handler = StreamerLogHandler(
+            self._enqueue_streamer_log_event
+        )
         logging.getLogger().addHandler(self.streamer_log_handler)
+
+    def _enqueue_streamer_log_event(self, event: Dict[str, Any]) -> None:
+        try:
+            self.streamer_log_queue.put_nowait(event)
+            return
+        except queue.Full:
+            pass
+        try:
+            self.streamer_log_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.streamer_log_queue.put_nowait(event)
+        except queue.Full:
+            pass
 
     def _detach_streamer_log_handler(self) -> None:
         if self.streamer_log_handler is None:
@@ -1227,6 +1256,7 @@ class MonitorGui:
             messagebox.showerror("无法开始监控", str(exc), parent=self.root)
             return
         self.streamer_logs.clear()
+        self.streamer_log_queue = queue.Queue(maxsize=MAX_PENDING_LOG_EVENTS)
         for streamer_id in list(self.streamer_log_windows):
             self._render_streamer_log_window(streamer_id)
         self._attach_streamer_log_handler()
@@ -1316,6 +1346,12 @@ class MonitorGui:
                 self._handle_event(event)
         except queue.Empty:
             pass
+        for _ in range(MAX_LOG_EVENTS_PER_TICK):
+            try:
+                event = self.streamer_log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_event(event)
         if self.pending_close:
             if not self.service_thread or not self.service_thread.is_alive():
                 self.root.destroy()

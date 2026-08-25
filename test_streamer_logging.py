@@ -4,6 +4,7 @@ import threading
 from streamer_logging import (
     StreamerLogHandler,
     StreamerLogStore,
+    compact_log_line,
     streamer_log_context,
 )
 
@@ -46,6 +47,7 @@ def test_log_store_is_bounded_and_compacts_multiline_messages():
     store.append("one", "第三行")
 
     assert store.get("one") == ["第二行 继续", "第三行"]
+    assert store.count("one") == 2
     assert store.get("two") == []
 
 
@@ -59,3 +61,17 @@ def test_log_handler_ignores_records_without_streamer_context():
     handler.emit(record)
 
     assert events == []
+
+
+def test_log_lines_redact_credentials_and_request_tokens():
+    line = compact_log_line(
+        "GET https://123.push.ft07.com/send/private-key.send"
+        "?msToken=private-token&a_bogus=private-signature "
+        "Cookie: ttwid=private-cookie"
+    )
+
+    assert "private-key" not in line
+    assert "private-token" not in line
+    assert "private-signature" not in line
+    assert "private-cookie" not in line
+    assert line.count("<redacted>") == 4

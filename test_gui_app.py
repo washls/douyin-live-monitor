@@ -253,7 +253,30 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         )
         assert "实时检测日志" in log_text
 
+        for index in range(gui_app.MAX_STREAMER_LOG_LINES + 2):
+            app._handle_event(
+                {
+                    "type": "log",
+                    "streamer_id": first["id"],
+                    "message": f"overflow-{index}",
+                }
+            )
+        bounded_text = app.streamer_log_windows[first["id"]]["text"].get(
+            "1.0", tk.END
+        )
+        assert app.streamer_logs.count(first["id"]) == gui_app.MAX_STREAMER_LOG_LINES
+        assert "overflow-0\n" not in bounded_text
+        assert f"overflow-{gui_app.MAX_STREAMER_LOG_LINES + 1}" in bounded_text
+
+        app._enqueue_streamer_log_event(
+            {
+                "type": "log",
+                "streamer_id": first["id"],
+                "message": "上一会话残留日志",
+            }
+        )
         app._start_monitoring()
+        assert app.streamer_log_queue.empty()
         assert finished.wait(timeout=1)
         assert app.service_thread is not None
         app.service_thread.join(timeout=1)
@@ -271,3 +294,16 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         )
     finally:
         root.destroy()
+
+
+def test_streamer_log_event_queue_keeps_only_recent_entries():
+    app = object.__new__(MonitorGui)
+    app.streamer_log_queue = gui_app.queue.Queue(maxsize=3)
+
+    for index in range(5):
+        app._enqueue_streamer_log_event({"type": "log", "message": str(index)})
+
+    messages = []
+    while not app.streamer_log_queue.empty():
+        messages.append(app.streamer_log_queue.get_nowait()["message"])
+    assert messages == ["2", "3", "4"]

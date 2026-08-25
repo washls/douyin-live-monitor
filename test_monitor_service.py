@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from monitor_service import MonitorService
+from monitor_service import LiveStatusUnknownError, MonitorService
 from streamer_logging import StreamerLogHandler
 
 
@@ -207,6 +207,37 @@ def test_ten_errors_suspend_only_the_failing_worker():
     assert snapshot["bad"]["suspended"] is True
     assert snapshot["good"]["suspended"] is False
     assert service._has_runnable_workers() is True
+
+
+def test_unknown_live_status_never_suspends_and_can_recover():
+    events = []
+    service = MonitorService(
+        [streamer("recovering")],
+        worker_factory=FakeWorker,
+        on_event=events.append,
+    )
+    service.prepare_all()
+
+    for _ in range(12):
+        service._record_error(
+            "recovering",
+            LiveStatusUnknownError("profile_api_empty_response"),
+        )
+
+    snapshot = service.snapshot()[0]
+    assert snapshot["suspended"] is False
+    assert snapshot["consecutive_errors"] == 0
+    assert snapshot["status"] == "error"
+    assert all(event.get("transient") for event in events if event["type"] == "error")
+
+    service._record_success(
+        "recovering",
+        {"nickname": "恢复主播", "is_live": True, "method": "api"},
+    )
+
+    recovered = service.snapshot()[0]
+    assert recovered["status"] == "live"
+    assert recovered["last_error"] == ""
 
 
 def test_stop_reaches_every_worker():

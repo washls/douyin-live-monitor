@@ -19,6 +19,10 @@ WorkerFactory = Callable[[Mapping[str, Any]], Any]
 EventCallback = Callable[[Dict[str, Any]], None]
 
 
+class LiveStatusUnknownError(RuntimeError):
+    """The current polling round could not determine live or offline state."""
+
+
 class MonitorService:
     """Coordinate multiple independent monitor workers with bounded concurrency."""
 
@@ -181,10 +185,7 @@ class MonitorService:
             runtime = self._runtime[streamer_id]
             names.append(worker.state.streamer_nickname or runtime["label"] or streamer_id)
         first_worker = next(iter(self._workers.values()))
-        first_streamer_id = next(iter(self._workers))
-        run_with_streamer_context(
-            first_streamer_id,
-            first_worker.notifier.send,
+        first_worker.notifier.send(
             title="[START] 抖音直播监听器已启动",
             desp=(
                 f"**监控主播数**: {len(names)}\n"
@@ -350,6 +351,22 @@ class MonitorService:
 
     def _record_error(self, streamer_id: str, exc: Exception) -> None:
         message = str(exc)
+        if isinstance(exc, LiveStatusUnknownError):
+            with self._lock:
+                runtime = self._runtime[streamer_id]
+                runtime["last_error"] = message
+                runtime["status"] = "error"
+                count = runtime["consecutive_errors"]
+            with streamer_log_context(streamer_id):
+                logger.warning("主播 %s 状态暂时无法确认: %s", streamer_id, message)
+            self._emit(
+                "error",
+                streamer_id,
+                error=message,
+                count=count,
+                transient=True,
+            )
+            return
         with self._lock:
             runtime = self._runtime[streamer_id]
             runtime["consecutive_errors"] += 1

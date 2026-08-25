@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from douyin_client import DouyinClient
-from monitor_service import MonitorService
+from monitor_service import LiveStatusUnknownError, MonitorService
 from notifier import ServerChanNotifier
 from streamer_config import (
     add_streamer,
@@ -753,7 +753,7 @@ class DouyinLiveMonitor:
         result = self.client.check_live(target_url=self.target_url)
         if result.get("indeterminate"):
             reason = result.get("error") or "所有检测方法均无法确认状态"
-            raise RuntimeError(f"直播状态暂时无法确认: {reason}")
+            raise LiveStatusUnknownError(f"直播状态暂时无法确认: {reason}")
 
         # Update state
         is_live = result.get("is_live", False)
@@ -845,6 +845,8 @@ class DouyinLiveMonitor:
             except KeyboardInterrupt:
                 logger.info("\n收到中断信号，正在退出...")
                 break
+            except LiveStatusUnknownError as e:
+                logger.warning(f"直播状态暂时无法确认，将继续检测: {e}")
             except Exception as e:
                 consecutive_errors += 1
                 logger.error(

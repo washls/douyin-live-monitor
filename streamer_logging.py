@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -14,10 +15,28 @@ CURRENT_STREAMER_ID: ContextVar[str] = ContextVar(
     "current_streamer_id", default=""
 )
 
+_SERVERCHAN_SECRET_RE = re.compile(
+    r"(?i)(/send/)[^/?#\s]+(?=\.send(?:[/?#\s]|$))"
+)
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:a_bogus|msToken|access_token|authorization)=)[^&#\s]+"
+)
+_HEADER_SECRET_RE = re.compile(
+    r"(?i)\b(cookie|authorization)\s*[:=]\s*[^\r\n]+"
+)
+
+
+def redact_log_secrets(value: Any) -> str:
+    """Redact credentials and anti-bot tokens from a log message."""
+    text = str(value or "")
+    text = _SERVERCHAN_SECRET_RE.sub(r"\1<redacted>", text)
+    text = _QUERY_SECRET_RE.sub(r"\1<redacted>", text)
+    return _HEADER_SECRET_RE.sub(r"\1: <redacted>", text)
+
 
 def compact_log_line(value: Any, limit: int = 400) -> str:
     """Collapse one log entry to a bounded single line."""
-    return " ".join(str(value or "").split())[:limit].rstrip()
+    return " ".join(redact_log_secrets(value).split())[:limit].rstrip()
 
 
 @contextmanager
@@ -81,6 +100,9 @@ class StreamerLogStore:
 
     def get(self, streamer_id: str) -> List[str]:
         return list(self._logs.get(str(streamer_id), ()))
+
+    def count(self, streamer_id: str) -> int:
+        return len(self._logs.get(str(streamer_id), ()))
 
     def clear(self) -> None:
         self._logs.clear()
