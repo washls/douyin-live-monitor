@@ -30,6 +30,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,
+    hide_console='hide-late',
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

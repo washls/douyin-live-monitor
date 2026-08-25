@@ -232,6 +232,10 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.selected_streamer_id == first["id"]
         assert app.streamer_label_var.get() == "界面测试主播"
         assert app.status_tree.item(first["id"], "values")[3] == "等待首次检测"
+        for tree in (app.streamer_tree, app.status_tree):
+            for column in tree["columns"]:
+                assert str(tree.heading(column, "anchor")) == "center"
+                assert str(tree.column(column, "anchor")) == "center"
         assert app.status_tree.bind("<Double-1>")
         assert app.settings_canvas.winfo_exists()
 

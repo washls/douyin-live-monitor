@@ -1,10 +1,14 @@
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import gui_app
 import gui_entry
 import monitor
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def test_unified_entry_uses_gui_without_cli_flags(monkeypatch):
@@ -70,3 +74,10 @@ def test_gui_hides_its_private_frozen_console(monkeypatch):
     gui_entry._hide_frozen_console()
 
     user32.ShowWindow.assert_called_once_with(123, 0)
+
+
+def test_frozen_build_hides_its_console_after_bootloader_startup():
+    spec = (PROJECT_ROOT / "douyin-monitor.spec").read_text(encoding="utf-8")
+
+    assert "console=True" in spec
+    assert "hide_console='hide-late'" in spec

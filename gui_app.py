@@ -496,13 +496,21 @@ class MonitorGui:
             selectmode="browse",
             height=12,
         )
-        self.streamer_tree.heading("status", text="状态")
-        self.streamer_tree.heading("name", text="主播")
+        self.streamer_tree.heading("status", text="状态", anchor=tk.CENTER)
+        self.streamer_tree.heading("name", text="主播", anchor=tk.CENTER)
         self.streamer_tree.column(
-            "status", width=self._px(76), minwidth=self._px(70), stretch=False
+            "status",
+            width=self._px(76),
+            minwidth=self._px(70),
+            stretch=False,
+            anchor=tk.CENTER,
         )
         self.streamer_tree.column(
-            "name", width=self._px(220), minwidth=self._px(120), stretch=True
+            "name",
+            width=self._px(220),
+            minwidth=self._px(120),
+            stretch=True,
+            anchor=tk.CENTER,
         )
         self.streamer_tree.grid(row=1, column=0, sticky="nsew")
         self.streamer_tree.bind("<<TreeviewSelect>>", self._on_streamer_selected)
@@ -583,14 +591,18 @@ class MonitorGui:
             ("last_check", "最后检测"),
             ("detail", "详情"),
         ):
-            self.status_tree.heading(column, text=label)
-        self.status_tree.column("status", width=self._px(82), stretch=False)
+            self.status_tree.heading(column, text=label, anchor=tk.CENTER)
         self.status_tree.column(
-            "name", width=self._px(150), minwidth=self._px(110)
+            "status", width=self._px(82), stretch=False, anchor=tk.CENTER
         )
-        self.status_tree.column("last_check", width=self._px(112), stretch=False)
         self.status_tree.column(
-            "detail", width=self._px(250), minwidth=self._px(140)
+            "name", width=self._px(150), minwidth=self._px(110), anchor=tk.CENTER
+        )
+        self.status_tree.column(
+            "last_check", width=self._px(112), stretch=False, anchor=tk.CENTER
+        )
+        self.status_tree.column(
+            "detail", width=self._px(250), minwidth=self._px(140), anchor=tk.CENTER
         )
         self.status_tree.grid(row=2, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.status_tree.yview)
