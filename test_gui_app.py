@@ -1,10 +1,73 @@
+import ctypes
 import pytest
 import tkinter as tk
 import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import gui_app
 import monitor
 from gui_app import MonitorGui, compact_ui_text, status_text, validate_gui_settings
 from streamer_config import add_streamer, save_config_atomic
+
+
+def test_high_dpi_prefers_per_monitor_v2(monkeypatch):
+    set_context = Mock(return_value=True)
+    user32 = SimpleNamespace(
+        GetThreadDpiAwarenessContext=Mock(return_value=0),
+        GetAwarenessFromDpiAwarenessContext=Mock(return_value=0),
+        SetProcessDpiAwarenessContext=set_context,
+    )
+    monkeypatch.setattr(gui_app.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gui_app.ctypes,
+        "windll",
+        SimpleNamespace(user32=user32),
+        raising=False,
+    )
+
+    assert gui_app.enable_windows_high_dpi() is True
+    assert set_context.call_args.args[0].value == ctypes.c_void_p(-4).value
+
+
+def test_high_dpi_is_enabled_before_tk_window_creation(monkeypatch):
+    calls = []
+
+    class FakeRoot:
+        def withdraw(self):
+            calls.append("withdraw")
+
+        def update_idletasks(self):
+            pass
+
+        def winfo_width(self):
+            return 1080
+
+        def winfo_height(self):
+            return 700
+
+        def winfo_screenwidth(self):
+            return 1920
+
+        def winfo_screenheight(self):
+            return 1080
+
+        def geometry(self, _value):
+            pass
+
+        def deiconify(self):
+            pass
+
+        def mainloop(self):
+            pass
+
+    monkeypatch.setattr(gui_app, "enable_windows_high_dpi", lambda: calls.append("dpi"))
+    monkeypatch.setattr(gui_app.tk, "Tk", lambda: calls.append("tk") or FakeRoot())
+    monkeypatch.setattr(gui_app, "MonitorGui", lambda *_args, **_kwargs: None)
+
+    gui_app.run_gui()
+
+    assert calls[:2] == ["dpi", "tk"]
 
 
 def valid_settings():

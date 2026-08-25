@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import queue
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -45,6 +47,40 @@ STATUS_TEXT = {
     "suspended": "已暂停",
     "stopped": "已停止",
 }
+
+
+def enable_windows_high_dpi() -> bool:
+    """Enable sharp per-monitor rendering before the first Tk window exists."""
+    if sys.platform != "win32":
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        current_context = user32.GetThreadDpiAwarenessContext()
+        if user32.GetAwarenessFromDpiAwarenessContext(current_context) == 2:
+            return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+    try:
+        set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        if set_context(ctypes.c_void_p(-4)):
+            return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+    try:
+        return bool(ctypes.windll.user32.SetProcessDPIAware())
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
 
 
 def status_text(status: str) -> str:
@@ -899,6 +935,7 @@ class MonitorGui:
 
 def run_gui(config_path: Path | None = None, debug: bool = False) -> None:
     """Create and run the desktop application."""
+    enable_windows_high_dpi()
     root = tk.Tk()
     root.withdraw()
     try:
