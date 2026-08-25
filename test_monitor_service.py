@@ -354,6 +354,53 @@ def test_stop_reaches_every_worker():
     assert all(worker.stopped for worker in workers.values())
 
 
+def test_stop_streamer_stops_only_selected_worker_and_preserves_status():
+    entries = [streamer("one", "主播甲"), streamer("two", "主播乙")]
+    workers = {}
+    events = []
+
+    def factory(entry):
+        worker = FakeWorker(entry)
+        workers[entry["id"]] = worker
+        return worker
+
+    service = MonitorService(
+        entries,
+        worker_factory=factory,
+        on_event=events.append,
+    )
+    service.prepare_all()
+    service.running = True
+
+    assert service.stop_streamer("one") is True
+    assert workers["one"].stopped is True
+    assert workers["two"].stopped is False
+    assert service._has_runnable_workers() is True
+
+    service._record_success(
+        "one", {"nickname": "主播甲", "is_live": True, "method": "late-result"}
+    )
+    snapshot = {item["id"]: item for item in service.snapshot()}
+    assert snapshot["one"]["status"] == "stopped"
+    assert snapshot["one"]["stopped_by_user"] is True
+    assert snapshot["one"]["suspended"] is True
+    assert snapshot["two"]["suspended"] is False
+    assert any(
+        event["type"] == "streamer_stopped" and event["streamer_id"] == "one"
+        for event in events
+    )
+
+
+def test_stop_streamer_rejects_unknown_or_already_stopped_worker():
+    service = MonitorService([streamer("one")], worker_factory=FakeWorker)
+    service.prepare_all()
+    service.running = True
+
+    assert service.stop_streamer("missing") is False
+    assert service.stop_streamer("one") is True
+    assert service.stop_streamer("one") is False
+
+
 def test_stop_event_is_emitted_only_once():
     events = []
     service = MonitorService(

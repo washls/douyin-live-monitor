@@ -79,6 +79,7 @@ class MonitorService:
                 "check_count": 0,
                 "consecutive_errors": 0,
                 "suspended": False,
+                "stopped_by_user": False,
             }
 
     def _emit(self, event_type: str, streamer_id: str = "", **data: Any) -> None:
@@ -317,8 +318,16 @@ class MonitorService:
                     break
                 self._submit_due_checks()
                 if not self._has_runnable_workers():
-                    logger.error("所有主播任务都已暂停，监控结束")
-                    failed_all = True
+                    with self._lock:
+                        all_stopped_by_user = all(
+                            self._runtime[streamer_id]["stopped_by_user"]
+                            for streamer_id in self._workers
+                        )
+                    if all_stopped_by_user:
+                        logger.info("所有主播任务均已由用户停止，监控结束")
+                    else:
+                        logger.error("所有主播任务都已暂停，监控结束")
+                        failed_all = True
                     break
                 timeout = self._seconds_until_next_due()
                 self._wake_event.wait(timeout)
@@ -384,6 +393,8 @@ class MonitorService:
         method = str(result.get("method", "unknown"))
         with self._lock:
             runtime = self._runtime[streamer_id]
+            if runtime["stopped_by_user"]:
+                return
             runtime["nickname"] = nickname
             runtime["status"] = "live" if is_live else "offline"
             runtime["method"] = method
@@ -414,6 +425,8 @@ class MonitorService:
         if isinstance(exc, LiveStatusUnknownError):
             with self._lock:
                 runtime = self._runtime[streamer_id]
+                if runtime["stopped_by_user"]:
+                    return
                 runtime["last_error"] = message
                 runtime["status"] = "error"
                 count = runtime["consecutive_errors"]
@@ -429,6 +442,8 @@ class MonitorService:
             return
         with self._lock:
             runtime = self._runtime[streamer_id]
+            if runtime["stopped_by_user"]:
+                return
             runtime["consecutive_errors"] += 1
             count = runtime["consecutive_errors"]
             runtime["last_error"] = message
@@ -480,6 +495,25 @@ class MonitorService:
             run_with_streamer_context(streamer_id, worker.stop)
         if emit_stopped:
             self._emit("stopped")
+
+    def stop_streamer(self, streamer_id: str) -> bool:
+        """Stop one prepared streamer while leaving the other tasks running."""
+        streamer_id = str(streamer_id or "")
+        with self._lock:
+            worker = self._workers.get(streamer_id)
+            runtime = self._runtime.get(streamer_id)
+            if worker is None or runtime is None or runtime["stopped_by_user"]:
+                return False
+            runtime["stopped_by_user"] = True
+            runtime["suspended"] = True
+            runtime["status"] = "stopped"
+            runtime["last_error"] = ""
+        run_with_streamer_context(streamer_id, worker.stop)
+        with streamer_log_context(streamer_id):
+            logger.info("主播 %s 已由用户停止，其他主播继续监控", streamer_id)
+        self._emit("streamer_stopped", streamer_id)
+        self._wake_event.set()
+        return True
 
     def _start_stop_listener(self) -> None:
         stdin = getattr(sys, "stdin", None)

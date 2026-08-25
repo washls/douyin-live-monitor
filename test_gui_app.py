@@ -237,7 +237,35 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
                 assert str(tree.heading(column, "anchor")) == "center"
                 assert str(tree.column(column, "anchor")) == "center"
         assert app.status_tree.bind("<Double-1>")
+        assert app.stop_selected_button.cget("text") == "停止所选主播"
+        assert str(app.stop_selected_button.cget("state")) == tk.DISABLED
         assert app.settings_canvas.winfo_exists()
+
+        stopped_ids = []
+
+        class ActiveService:
+            def stop_streamer(self, streamer_id):
+                stopped_ids.append(streamer_id)
+                return True
+
+        app.service = ActiveService()
+        app.service_thread = SimpleNamespace(is_alive=lambda: True)
+        app.runtime_by_id[first["id"]] = {
+            "id": first["id"],
+            "status": "offline",
+            "suspended": False,
+        }
+        app.status_tree.selection_set(first["id"])
+        app._set_running_ui(True)
+        app._on_status_selection_changed()
+        assert str(app.stop_selected_button.cget("state")) == tk.NORMAL
+        assert app.start_button.cget("text") == "停止全部"
+
+        app._stop_selected_streamer()
+        assert stopped_ids == [first["id"]]
+
+        app.service = None
+        app.service_thread = None
 
         app._show_streamer_log(first["id"])
         app._handle_event(

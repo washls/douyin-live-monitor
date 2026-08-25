@@ -622,9 +622,35 @@ class MonitorGui:
             yscrollcommand=scroll.set, xscrollcommand=horizontal_scroll.set
         )
         self.status_tree.bind("<Double-1>", self._on_status_tree_double_click)
+        self.status_tree.bind(
+            "<<TreeviewSelect>>", self._on_status_selection_changed
+        )
         self.status_tree.tag_configure("live", foreground=COLORS["success"])
         self.status_tree.tag_configure("error", foreground=COLORS["danger"])
         self.status_tree.tag_configure("suspended", foreground=COLORS["warning"])
+
+        status_actions = ttk.Frame(parent, style="Surface.TFrame")
+        status_actions.grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(self._px(12), 0),
+        )
+        status_actions.grid_columnconfigure(0, weight=1)
+        ttk.Label(
+            status_actions,
+            text="选择一个任务，可只停止该主播的本次监控。",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.stop_selected_button = ttk.Button(
+            status_actions,
+            text="停止所选主播",
+            style="Action.TButton",
+            command=self._stop_selected_streamer,
+            state=tk.DISABLED,
+        )
+        self.stop_selected_button.grid(row=0, column=1, sticky="e")
 
     def _build_detail_tab(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -950,6 +976,8 @@ class MonitorGui:
         self.streamer_count_label.configure(text=f"{len(self.entries)} 个")
         if current_id and self.streamer_tree.exists(current_id):
             self.streamer_tree.selection_set(current_id)
+            self.status_tree.selection_set(current_id)
+            self.status_tree.focus(current_id)
         elif self.entries:
             first_id = self.entries[0]["id"]
             self.streamer_tree.selection_set(first_id)
@@ -999,6 +1027,65 @@ class MonitorGui:
         self.status_tree.selection_set(streamer_id)
         self.status_tree.focus(streamer_id)
         self._show_streamer_log(streamer_id)
+
+    def _on_status_selection_changed(self, _event=None) -> None:
+        selection = self.status_tree.selection()
+        if selection:
+            streamer_id = selection[0]
+            if self.streamer_tree.exists(streamer_id):
+                self.streamer_tree.selection_set(streamer_id)
+                self.streamer_tree.focus(streamer_id)
+            self._on_streamer_selected()
+        self._update_stop_selected_button()
+
+    def _update_stop_selected_button(self) -> None:
+        running = bool(
+            self.service is not None
+            and self.service_thread is not None
+            and self.service_thread.is_alive()
+        )
+        selection = self.status_tree.selection()
+        runtime = self.runtime_by_id.get(selection[0], {}) if selection else {}
+        can_stop = bool(
+            running
+            and runtime
+            and not runtime.get("suspended", False)
+            and runtime.get("status") != "stopped"
+        )
+        self.stop_selected_button.configure(
+            state=tk.NORMAL if can_stop else tk.DISABLED
+        )
+
+    def _stop_selected_streamer(self) -> None:
+        selection = self.status_tree.selection()
+        if not selection or self.service is None:
+            messagebox.showinfo(
+                "停止主播", "请先在任务状态中选择一个正在监控的主播。", parent=self.root
+            )
+            return
+        streamer_id = selection[0]
+        entry = next(
+            (item for item in self.entries if item["id"] == streamer_id), None
+        )
+        runtime = self.runtime_by_id.get(streamer_id, {})
+        name = compact_ui_text(
+            runtime.get("nickname")
+            or (entry or {}).get("label")
+            or "所选主播",
+            80,
+        )
+        if not messagebox.askyesno(
+            "停止所选主播",
+            f"确定停止“{name}”的本次监控吗？\n\n其他主播会继续运行。",
+            parent=self.root,
+        ):
+            return
+        if not self.service.stop_streamer(streamer_id):
+            messagebox.showinfo(
+                "停止主播", "该主播尚未开始或已经停止。", parent=self.root
+            )
+            return
+        self.stop_selected_button.configure(state=tk.DISABLED)
 
     def _show_streamer_log(self, streamer_id: str) -> None:
         existing = self.streamer_log_windows.get(streamer_id)
@@ -1155,6 +1242,11 @@ class MonitorGui:
         self.streamer_label_var.set(entry.get("label", ""))
         self.streamer_url_var.set(entry["url"])
         self.streamer_enabled_var.set(entry.get("enabled", True))
+        if self.status_tree.exists(streamer_id):
+            if self.status_tree.selection() != (streamer_id,):
+                self.status_tree.selection_set(streamer_id)
+            self.status_tree.focus(streamer_id)
+        self._update_stop_selected_button()
 
     def _save_streamer(self) -> None:
         try:
@@ -1289,7 +1381,7 @@ class MonitorGui:
 
     def _set_running_ui(self, running: bool) -> None:
         self.start_button.configure(
-            text="停止监控" if running else "开始监控",
+            text="停止全部" if running else "开始监控",
             command=self._stop_monitoring if running else self._start_monitoring,
             state=tk.NORMAL,
         )
@@ -1311,6 +1403,7 @@ class MonitorGui:
             *self.setting_inputs,
         ):
             widget.configure(state=edit_state)
+        self._update_stop_selected_button()
 
     def _set_global_status(self, state: str, detail: str) -> None:
         self.global_status_var.set(status_text(state))
@@ -1381,6 +1474,7 @@ class MonitorGui:
             "status",
             "error",
             "suspended",
+            "streamer_stopped",
         }:
             if self.service is not None:
                 self.runtime_by_id = {
@@ -1400,6 +1494,7 @@ class MonitorGui:
                 "live" if live else "starting",
                 f"{runnable} 个任务运行，{live} 个直播中",
             )
+            self._update_stop_selected_button()
         elif event_type == "service_finished":
             self._detach_streamer_log_handler()
             self._set_running_ui(False)
