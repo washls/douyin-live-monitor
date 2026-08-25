@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.1.1-orange.svg" alt="Version 1.1.1">
+  <img src="https://img.shields.io/badge/version-1.2.0-orange.svg" alt="Version 1.2.0">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
 
@@ -15,28 +15,29 @@
 
 ## ✨ 功能特性
 
-- 🔍 **直播状态监控**：定时检查指定主播，自动识别开播、持续直播、切换直播间和下播
+- 👥 **多主播监控**：在一个进程中同时监控多个主播，各自维护直播与通知状态
+- 🔍 **直播状态监控**：定时检查已启用主播，自动识别开播、持续直播、切换直播间和下播
 - 🔄 **8 种检测方式**：Douyin API、Webcast、用户主页和 IES 接口自动回退
 - 📲 **完整通知流程**：支持开播、下播、持续直播、启动测试和每日亲密度提醒
 - 🛡️ **通知防重**：推送超时或连接异常时不自动重放同一个 POST，避免服务端已接收后再次发送
 - ⏰ **持续直播提醒**：默认每 10 分钟提醒一次，间隔和最多提醒次数都可配置
 - 🌙 **每日亲密度提醒**：主播在线时，在 23:57、23:58、23:59 分别发送提醒
 - 🧠 **记住上次主播**：再次启动时可继续监控，也可以切换主播
-- 🪶 **低资源占用**：复用检测连接、限制连接池和页面缓存，并缓存短链接解析结果
+- 🪶 **低资源占用**：默认最多并发检测 2 个主播，复用检测连接并限制连接池和页面缓存
 - 📝 **滚动日志**：终端只显示状态摘要，详细日志自动轮转，避免长期运行无限增长
 - ⌨️ **随时退出**：输入 `q` 后回车，或按 `Ctrl+C`，即可停止监控并退出
 - 🎯 **交互式配置**：首次运行按提示填写推送 URL 和主播链接
 - 📦 **Windows EXE**：Releases 提供打包好的可执行文件，无需安装 Python
 
-## 🆕 v1.1.1
+## 🆕 v1.2.0
 
-这一版修复了推送重复发送和长时间空闲连接导致的超时问题，同时补充了退出命令、滚动日志、短链接缓存和隐私保护。完整更新记录见 [v1.1.1 Release](https://github.com/washls/douyin-live-monitor/releases/tag/v1.1.1)。
+这一版增加了多主播监控。每个主播使用独立的检测客户端、通知器和状态，单个任务连续失败不会中断其他主播。旧版记录的单主播会自动加入新列表，原状态文件不会被删除。如需回退，可以继续使用 [v1.1.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.1.1)。
 
 ## 🚀 快速开始
 
 ### Windows 直接运行
 
-从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.1.1.exe`，双击后按照提示完成配置。
+从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.2.0.exe`，双击后按照提示完成配置。
 
 ### 从源码运行
 
@@ -84,19 +85,46 @@ python monitor.py --quiet
 
 # 保存原始响应，排查检测问题
 python monitor.py --debug
+
+# 查看主播列表
+python monitor.py --list-streamers
+
+# 添加主播，可选保存显示名称
+python monitor.py --add-streamer "https://www.douyin.com/user/xxxxx" --label "主播名称"
+
+# 停用或重新启用主播
+python monitor.py --disable-streamer STREAMER_ID
+python monitor.py --enable-streamer STREAMER_ID
+
+# 删除主播，脚本或无输入环境需要加 --yes
+python monitor.py --remove-streamer STREAMER_ID
 ```
 
-持续监控开始后，输入 `q` 并回车即可退出，也可以按 `Ctrl+C`。
+持续监控会启动全部已启用的主播。输入 `q` 并回车即可停止所有任务，也可以按 `Ctrl+C`。
 
 ### 首次运行引导
 
 程序首次启动时会**自动弹出配置引导**：
 
 1. **配置推送**：粘贴你的 Server 酱³ 推送 URL（从 [sc3.ft07.com](https://sc3.ft07.com) 获取）
-2. **选择主播**：粘贴要监控的抖音博主主页链接
-3. **开始监控**：配置自动保存，下次启动可以继续监控同一主播
+2. **选择主播**：粘贴第一个要监控的抖音博主主页链接
+3. **开始监控**：配置自动保存，下次启动会监控列表中所有已启用主播
 
-> 之后再次运行时，会记住上次监控的主播，可选择继续或切换。
+> 升级时会把 `.monitor_state.json` 中原有的单主播加入新列表，并保留旧状态文件。其他主播可以通过 `--add-streamer` 添加。
+
+## 👥 主播管理
+
+每个主播都有一个 12 位本地 ID，单个配置最多保存 100 个主播。使用 `--list-streamers` 查看 ID，再执行停用、启用或删除操作。删除需要确认，非交互环境必须同时使用 `--yes`。
+
+```bash
+python monitor.py --list-streamers
+python monitor.py --add-streamer "https://www.douyin.com/user/xxxxx" --label "显示名称"
+python monitor.py --disable-streamer STREAMER_ID
+python monitor.py --enable-streamer STREAMER_ID
+python monitor.py --remove-streamer STREAMER_ID --yes
+```
+
+同一抖音账号如果通过两个不同链接重复添加，启动时会根据解析出的 `sec_uid` 识别，保留列表中靠前的任务并暂停重复项。
 
 ## ⚙️ 配置说明
 
@@ -112,7 +140,16 @@ python monitor.py --debug
     "repeat_notify_interval": 600,
     "max_repeat_notifications": 3,
     "startup_notify": false,
-    "enable_daily_intimacy_reminder": true
+    "enable_daily_intimacy_reminder": true,
+    "max_concurrent_checks": 2,
+    "streamers": [
+        {
+            "id": "a1b2c3d4e5f6",
+            "url": "https://www.douyin.com/user/xxxxx",
+            "label": "主播名称",
+            "enabled": true
+        }
+    ]
 }
 ```
 
@@ -127,10 +164,12 @@ python monitor.py --debug
 | `max_repeat_notifications` | 单次直播最多重复提醒次数 | 3 |
 | `startup_notify` | 启动时发送测试通知 | false |
 | `enable_daily_intimacy_reminder` | 23:57 至 23:59 发送亲密度提醒 | true |
+| `max_concurrent_checks` | 同时检测的主播数量，范围为 1 至 8 | 2 |
+| `streamers` | 主播列表，由程序或管理命令维护，最多 100 项 | 空列表 |
 
 > **获取推送 URL**：访问 [sc3.ft07.com](https://sc3.ft07.com) → 微信扫码登录 → 「发送消息」→ 复制完整推送 URL
 
-> **隐私说明**：`config.json`、`*.log`、`.monitor_state.json`、`debug_dumps/`、`dist/` 和 `build/` 均不会提交到 Git 仓库。请勿公开包含真实推送 URL、SendKey 或运行日志的文件。
+> **隐私说明**：`config.json`、`*.log`、`.monitor_state.json`、`debug_dumps/`、`dist/`、`build/` 和原子写入产生的临时文件均不会提交到 Git 仓库。请勿公开包含真实推送 URL、SendKey 或运行日志的文件。
 
 ## 🔔 通知规则
 
@@ -142,6 +181,7 @@ python monitor.py --debug
 | 检测到下播 | 发送下播通知，可通过配置关闭 |
 | 每日亲密度提醒 | 主播在线时，在 23:57、23:58、23:59 各提醒一次 |
 | 推送超时或连接异常 | 不自动重复提交相同 POST，避免服务端已接收时产生重复通知 |
+| 单个主播连续检测失败 | 达到 10 次后只暂停该主播，其他任务继续运行 |
 
 ## 🖥️ 运行控制与日志
 
@@ -185,11 +225,15 @@ python monitor.py --debug
 ```
 douyin-live-monitor/
 ├── monitor.py           # 主程序入口 & 交互式引导
+├── monitor_service.py   # 多主播调度、状态汇总与统一停止
+├── streamer_config.py   # 主播列表校验、迁移与原子保存
 ├── douyin_client.py     # 抖音直播状态检测核心（8 种方法）
 ├── notifier.py          # Server 酱³ 推送通知模块
 ├── abogus.py            # a_bogus / msToken 签名生成 (纯 Python)
 ├── x-bogus.js           # PyInstaller 打包所需签名资源
-├── test_monitor.py      # 回归测试
+├── test_monitor.py      # 单主播状态与推送回归测试
+├── test_monitor_service.py  # 多主播调度回归测试
+├── test_streamer_config.py  # 配置迁移与管理回归测试
 ├── douyin-monitor.spec  # PyInstaller 打包配置
 ├── config.example.json  # 配置文件示例
 ├── requirements.txt     # Python 依赖
@@ -241,6 +285,11 @@ WantedBy=multi-user.target
 <details>
 <summary><b>打包好的 exe 在哪里？</b></summary>
 在 <a href="https://github.com/washls/douyin-live-monitor/releases">Releases</a> 页面下载最新版本。
+</details>
+
+<details>
+<summary><b>如何回退到上一个版本？</b></summary>
+从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.1.1">v1.1.1 Release</a> 重新下载旧版 EXE。v1.2.0 的迁移不会删除旧的 <code>.monitor_state.json</code>，旧版仍可读取原来的单主播记录。
 </details>
 
 ## ⚠️ 免责声明

@@ -42,6 +42,8 @@ echo      测试 Server酱³ 连接是否正常
 echo   3. (可选) 运行: python monitor.py --once
 echo      执行一次检测，确认目标博主信息正确
 echo   4. 运行: python monitor.py
-echo      开始持续监控!
+echo      开始监控全部已启用主播!
+echo   5. (可选) 运行: python monitor.py --add-streamer URL
+echo      添加更多主播
 echo ========================================
 pause

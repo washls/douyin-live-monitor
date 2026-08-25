@@ -2,8 +2,8 @@
 """
 Douyin Live Monitor with Server酱³ Push Notifications
 
-Monitors a Douyin blogger's live status and sends push notifications
-via Server酱³ when they go live.
+Monitors multiple Douyin streamers and sends push notifications via
+Server酱³ when their live status changes.
 
 Usage:
     python monitor.py                  # Run with config.json
@@ -15,7 +15,6 @@ import argparse
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-import os
 import signal
 import sys
 import threading
@@ -25,7 +24,18 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from douyin_client import DouyinClient
+from monitor_service import MonitorService
 from notifier import ServerChanNotifier
+from streamer_config import (
+    add_streamer,
+    enabled_streamers,
+    migrate_legacy_streamer,
+    normalize_streamers,
+    remove_streamer,
+    save_config_atomic,
+    set_streamer_enabled,
+    validate_streamer_url,
+)
 
 # ===== Path Helpers (supports PyInstaller frozen exe) =====
 
@@ -41,13 +51,23 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
 STATE_FILE = BASE_DIR / ".monitor_state.json"
 
 # ===== Logging Setup =====
+
+
+def _configure_console_output(stream) -> None:
+    """Use UTF-8 on Windows without replacing or closing the stdio stream."""
+    if sys.platform != "win32" or not hasattr(stream, "reconfigure"):
+        return
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -66,11 +86,8 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     root.setLevel(logging.DEBUG)
 
     # --- console handler ------------------------------------------------
-    try:
-        console_out = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
-    except (AttributeError, OSError):
-        console_out = sys.stdout
-    console = logging.StreamHandler(console_out)
+    _configure_console_output(sys.stdout)
+    console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if verbose else logging.WARNING)
     console.setFormatter(
         logging.Formatter(
@@ -277,8 +294,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         logger.info(f"配置文件不存在，将创建默认配置: {config_path}")
         config = _default_config()
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=4)
+            save_config_atomic(config_path, config)
         except OSError as e:
             logger.warning(f"创建配置文件失败: {e}")
         return config
@@ -301,6 +317,8 @@ def _default_config() -> Dict[str, Any]:
         "max_repeat_notifications": 3,
         "startup_notify": False,
         "enable_daily_intimacy_reminder": True,
+        "max_concurrent_checks": 2,
+        "streamers": [],
     }
 
 
@@ -385,8 +403,7 @@ def prompt_serverchan_config(config_path: Path, config: Dict[str, Any]) -> Dict[
 
             # Save config
             try:
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(config, f, ensure_ascii=False, indent=4)
+                save_config_atomic(config_path, config)
                 print()
                 print("✅ Server酱³ 配置已保存!")
                 print()
@@ -452,7 +469,7 @@ def prompt_target_url() -> str:
 
     print()
     print("=" * 50)
-    print("         Douyin Live Monitor  v2.0")
+    print(f"         Douyin Live Monitor  v{APP_VERSION}")
     print("=" * 50)
     print()
 
@@ -524,13 +541,10 @@ def prompt_target_url() -> str:
             # Fallback: take the first token if none starts with http
             url = tokens[0] if tokens else ""
 
-        # Basic URL validation
-        if not (url.startswith("http://") or url.startswith("https://")):
-            print("❌ 请输入有效的网址 (以 http:// 或 https:// 开头)")
-            continue
-
-        if "douyin.com" not in url and "iesdouyin.com" not in url:
-            print("⚠️  该链接似乎不是抖音链接，请确认后重新输入")
+        try:
+            url = validate_streamer_url(url)
+        except ValueError as exc:
+            print(f"⚠️  {exc}，请确认后重新输入")
             continue
 
         print(f"\n✅ 已设置监控目标: {url}")
@@ -592,6 +606,10 @@ class DouyinLiveMonitor:
         except Exception as e:
             logger.error(f"解析用户失败: {e}")
             return None
+
+    def prepare(self) -> Optional[str]:
+        """Resolve the target before scheduled checks begin."""
+        return self._resolve_sec_uid()
 
     def _handle_live_detected(self, info: Dict[str, Any]) -> None:
         """Handle when streamer goes live (first detection)."""
@@ -880,6 +898,139 @@ class DouyinLiveMonitor:
 # ===== CLI Entry Point =====
 
 
+def _load_streamer_entries(
+    config_path: Path, config: Dict[str, Any]
+) -> list[Dict[str, Any]]:
+    """Validate v1.2 config and import the legacy single target once."""
+    legacy_state = load_monitor_state()
+    entries, normalized = normalize_streamers(config)
+    changed = normalized
+    migrated = False
+    if not entries and legacy_state.get("target_url"):
+        try:
+            migrated = migrate_legacy_streamer(config, legacy_state)
+            entries, normalized = normalize_streamers(config)
+            changed = changed or migrated or normalized
+        except ValueError as exc:
+            logger.warning(f"旧版主播记录无效，已跳过迁移: {exc}")
+    if changed:
+        save_config_atomic(config_path, config)
+    if migrated:
+        logger.info("已将上次监控的主播迁移到多主播配置")
+    return entries
+
+
+def _print_streamers(entries: list[Dict[str, Any]]) -> None:
+    """Print the configured streamer list without exposing push secrets."""
+    if not entries:
+        print("尚未配置主播。")
+        return
+    print(f"已配置 {len(entries)} 个主播:")
+    for entry in entries:
+        status = "启用" if entry.get("enabled", True) else "停用"
+        label = entry.get("label") or "未命名"
+        print(f"  [{status}] {entry['id']}  {label}  {entry['url']}")
+
+
+def _confirm_remove(entry: Dict[str, Any], assume_yes: bool) -> bool:
+    """Require confirmation before deleting a configured streamer."""
+    if assume_yes:
+        return True
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None or not hasattr(stdin, "isatty") or not stdin.isatty():
+        raise ValueError("非交互环境删除主播时必须同时使用 --yes")
+    label = entry.get("label") or entry["url"]
+    try:
+        answer = input(
+            f"确认删除主播 {label} ({entry['id']})？[y/N]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise ValueError("无法读取确认输入，请同时使用 --yes") from exc
+    return answer in {"y", "yes"}
+
+
+def _handle_streamer_command(
+    args: argparse.Namespace,
+    config_path: Path,
+    config: Dict[str, Any],
+    entries: list[Dict[str, Any]],
+) -> bool:
+    """Handle one configuration-only CLI command and report completion."""
+    if args.list_streamers:
+        _print_streamers(entries)
+        return True
+
+    if args.add_streamer:
+        entry = add_streamer(config, args.add_streamer, label=args.label or "")
+        save_config_atomic(config_path, config)
+        print(f"已添加主播: {entry['id']}  {entry['url']}")
+        return True
+
+    if args.remove_streamer:
+        entry = next(
+            (
+                item
+                for item in entries
+                if item["id"] == args.remove_streamer.strip()
+            ),
+            None,
+        )
+        if entry is None:
+            raise ValueError(f"未找到主播 ID: {args.remove_streamer}")
+        if not _confirm_remove(entry, args.yes):
+            print("已取消删除。")
+            return True
+        removed = remove_streamer(config, args.remove_streamer)
+        save_config_atomic(config_path, config)
+        print(f"已删除主播: {removed['id']}  {removed['url']}")
+        return True
+
+    if args.enable_streamer:
+        entry = set_streamer_enabled(config, args.enable_streamer, True)
+        save_config_atomic(config_path, config)
+        print(f"已启用主播: {entry['id']}  {entry['url']}")
+        return True
+
+    if args.disable_streamer:
+        entry = set_streamer_enabled(config, args.disable_streamer, False)
+        save_config_atomic(config_path, config)
+        print(f"已停用主播: {entry['id']}  {entry['url']}")
+        return True
+
+    return False
+
+
+def _safe_print(value: str) -> None:
+    """Print safely on legacy Windows consoles."""
+    try:
+        print(value)
+    except UnicodeEncodeError:
+        print(value.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _print_once_results(
+    entries: list[Dict[str, Any]], results: Dict[str, Dict[str, Any]]
+) -> None:
+    """Print one detailed result block per successfully checked streamer."""
+    by_id = {entry["id"]: entry for entry in entries}
+    for streamer_id, result in results.items():
+        entry = by_id.get(streamer_id, {})
+        _safe_print("\n" + "=" * 48)
+        _safe_print(f"主播 ID: {streamer_id}")
+        _safe_print(
+            f"  博主: {result.get('nickname') or entry.get('label') or '未知'}"
+        )
+        _safe_print(
+            f"  直播中: {'是 [LIVE]' if result.get('is_live') else '否 [OFFLINE]'}"
+        )
+        _safe_print(f"  房间 ID: {result.get('room_id', 'N/A')}")
+        _safe_print(f"  标题: {result.get('title', 'N/A')}")
+        _safe_print(f"  检测方法: {result.get('method', 'N/A')}")
+        _safe_print(f"  尝试方法: {result.get('methods_tried', 'N/A')}")
+    if results:
+        _safe_print("=" * 48)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="抖音直播监听器 - 检测开播并通过Server酱³推送通知",
@@ -890,6 +1041,8 @@ def main():
   python monitor.py --once             # 单次检测
   python monitor.py --config my.json   # 使用自定义配置
   python monitor.py --test             # 测试 Server酱³ 连接
+  python monitor.py --list-streamers   # 查看主播列表
+  python monitor.py --add-streamer URL # 添加主播
         """,
     )
     parser.add_argument(
@@ -903,15 +1056,50 @@ def main():
         default=str(DEFAULT_CONFIG),
         help=f"配置文件路径 (默认: {DEFAULT_CONFIG})",
     )
-    parser.add_argument(
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument(
         "--once",
         action="store_true",
-        help="仅执行一次检测后退出",
+        help="对全部已启用主播执行一次检测后退出",
     )
-    parser.add_argument(
+    operation.add_argument(
         "--test",
         action="store_true",
         help="测试 Server酱³ 连接后退出",
+    )
+    operation.add_argument(
+        "--list-streamers",
+        action="store_true",
+        help="列出全部主播后退出",
+    )
+    operation.add_argument(
+        "--add-streamer",
+        metavar="URL",
+        help="添加一个主播后退出",
+    )
+    operation.add_argument(
+        "--remove-streamer",
+        metavar="ID",
+        help="按完整 ID 删除一个主播后退出",
+    )
+    operation.add_argument(
+        "--enable-streamer",
+        metavar="ID",
+        help="按完整 ID 启用一个主播后退出",
+    )
+    operation.add_argument(
+        "--disable-streamer",
+        metavar="ID",
+        help="按完整 ID 停用一个主播后退出",
+    )
+    parser.add_argument(
+        "--label",
+        help="配合 --add-streamer 保存显示名称",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认非交互式删除操作",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -930,6 +1118,10 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.label and not args.add_streamer:
+        parser.error("--label 只能与 --add-streamer 一起使用")
+    if args.yes and not args.remove_streamer:
+        parser.error("--yes 只能与 --remove-streamer 一起使用")
 
     # Reconfigure console level for --verbose / --quiet
     if args.verbose:
@@ -941,16 +1133,18 @@ def main():
             if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
                 h.setLevel(logging.ERROR)
 
-    # Load config
     config_path = Path(args.config)
-    config = load_config(config_path)
-
-    # First-launch: prompt for Server酱 config if not set
-    if not args.test and not is_serverchan_configured(config):
-        config = prompt_serverchan_config(config_path, config)
+    try:
+        config = load_config(config_path)
+        entries = _load_streamer_entries(config_path, config)
+        if _handle_streamer_command(args, config_path, config, entries):
+            return
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.error(f"配置处理失败: {exc}")
+        _pause_if_frozen()
+        sys.exit(2)
 
     if args.test:
-        # Check if Server酱 is configured before testing
         if not is_serverchan_configured(config):
             logger.error(
                 "Server酱³ 尚未配置!\n"
@@ -960,10 +1154,7 @@ def main():
             )
             _pause_if_frozen()
             sys.exit(1)
-
-        # Test Server酱³ connection (no target URL needed)
         notifier = _create_notifier(config)
-
         logger.info("测试 Server酱³ 连接...")
         if notifier.verify_connection():
             logger.info("[OK] Server酱³ 连接测试成功!")
@@ -971,57 +1162,67 @@ def main():
             logger.error("[FAIL] Server酱³ 连接测试失败!")
         return
 
-    # Prompt for target URL (interactive)
-    target_url = prompt_target_url()
+    if not is_serverchan_configured(config):
+        config = prompt_serverchan_config(config_path, config)
 
-    # Create monitor
-    monitor = DouyinLiveMonitor(config, target_url=target_url, debug=args.debug)
+    if not entries:
+        target_url = prompt_target_url()
+        entry = add_streamer(config, target_url)
+        save_config_atomic(config_path, config)
+        entries = list(config["streamers"])
+        print(f"已保存主播: {entry['id']}  {entry['url']}")
 
-    # Handle signals for graceful shutdown
+    active_entries = enabled_streamers(entries)
+    if not active_entries:
+        logger.error(
+            "没有已启用的主播，请使用 --enable-streamer ID 启用任务"
+        )
+        _pause_if_frozen()
+        sys.exit(1)
+
+    def worker_factory(entry: Dict[str, Any]) -> DouyinLiveMonitor:
+        return DouyinLiveMonitor(
+            dict(config),
+            target_url=entry["url"],
+            debug=args.debug,
+        )
+
+    try:
+        service = MonitorService(
+            active_entries,
+            worker_factory=worker_factory,
+            check_interval=config.get("check_interval", 30),
+            max_concurrent_checks=config.get("max_concurrent_checks", 2),
+            startup_notify=config.get("startup_notify", False),
+        )
+    except (TypeError, ValueError) as exc:
+        logger.error(f"监控参数无效: {exc}")
+        _pause_if_frozen()
+        sys.exit(2)
+
     def signal_handler(sig, frame):
         logger.info("\n收到退出信号...")
-        monitor.stop()
+        service.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
-    # Note: SIGTERM is not supported on Windows — the handler is installed
-    # only on POSIX platforms where it actually works.
-    if hasattr(signal, 'SIGTERM'):
+    if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         if args.once:
-            # Single check mode
-            logger.info("执行单次检测...")
-            sec_uid = monitor._resolve_sec_uid()
-            if not sec_uid:
-                logger.error("无法解析目标用户")
+            logger.info("对全部已启用主播执行单次检测...")
+            results = service.check_all_once()
+            _print_once_results(active_entries, results)
+            if not results:
                 sys.exit(1)
-
-            result = monitor.check_once()
-
-            # Use safe print for Windows GBK consoles
-            def safe_print(s):
-                try:
-                    print(s)
-                except UnicodeEncodeError:
-                    print(s.encode('ascii', errors='replace').decode('ascii'))
-
-            safe_print("\n" + "=" * 40)
-            safe_print("检测结果:")
-            safe_print(f"  博主: {result.get('nickname', '未知')}")
-            safe_print(f"  直播中: {'是 [LIVE]' if result.get('is_live') else '否 [OFFLINE]'}")
-            safe_print(f"  房间ID: {result.get('room_id', 'N/A')}")
-            safe_print(f"  标题: {result.get('title', 'N/A')}")
-            safe_print(f"  检测方法: {result.get('method', 'N/A')}")
-            safe_print(f"  尝试方法: {result.get('methods_tried', 'N/A')}")
-            safe_print("=" * 40)
         else:
-            # Continuous monitoring
-            monitor.run()
-
+            if not service.run():
+                sys.exit(1)
     except KeyboardInterrupt:
+        service.stop()
         logger.info("用户中断")
     except Exception as e:
+        service.stop()
         logger.error(f"程序异常: {e}", exc_info=True)
         _pause_if_frozen()
         sys.exit(1)
@@ -1031,16 +1232,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Fix Windows GBK console encoding — replace stdout with a UTF-8 wrapper.
-    # setup_logging() also wraps stdout for its console handler, so this
-    # ensures any direct print() calls also use UTF-8.
-    if sys.platform == 'win32':
-        try:
-            old_stdout = sys.stdout
-            sys.stdout = open(
-                sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1
-            )
-            old_stdout.close()
-        except (AttributeError, OSError):
-            pass
     main()

@@ -3,7 +3,13 @@ from unittest.mock import Mock, patch
 import requests
 import threading
 
-from monitor import DouyinLiveMonitor, MonitorState
+from monitor import (
+    DouyinLiveMonitor,
+    MonitorState,
+    _configure_console_output,
+    _confirm_remove,
+    _load_streamer_entries,
+)
 from notifier import ServerChanNotifier
 from douyin_client import DouyinClient
 
@@ -92,6 +98,17 @@ class NotifierTests(unittest.TestCase):
 
 
 class MonitorControlTests(unittest.TestCase):
+    def test_windows_console_is_reconfigured_without_being_closed(self):
+        stream = Mock()
+
+        with patch("monitor.sys.platform", "win32"):
+            _configure_console_output(stream)
+
+        stream.reconfigure.assert_called_once_with(
+            encoding="utf-8", errors="replace"
+        )
+        stream.close.assert_not_called()
+
     def test_stop_marks_monitor_as_not_running(self):
         monitor = object.__new__(DouyinLiveMonitor)
         monitor.running = True
@@ -101,6 +118,57 @@ class MonitorControlTests(unittest.TestCase):
 
         self.assertFalse(monitor.running)
         self.assertTrue(monitor._stop_event.is_set())
+
+    def test_remove_confirmation_eof_requires_yes_flag(self):
+        stdin = Mock()
+        stdin.isatty.return_value = True
+        entry = {
+            "id": "streamer-one",
+            "url": "https://www.douyin.com/user/example",
+            "label": "测试主播",
+        }
+
+        with patch("monitor.sys.stdin", stdin), patch(
+            "builtins.input", side_effect=EOFError
+        ):
+            with self.assertRaisesRegex(ValueError, "--yes"):
+                _confirm_remove(entry, assume_yes=False)
+
+    def test_existing_streamers_do_not_log_legacy_migration(self):
+        config = {
+            "streamers": [
+                {
+                    "id": "streamer-one",
+                    "url": "https://www.douyin.com/user/example",
+                    "label": "现有主播",
+                    "enabled": True,
+                }
+            ],
+            "max_concurrent_checks": 2,
+        }
+        legacy = {"target_url": "https://v.douyin.com/old/"}
+
+        with patch("monitor.load_monitor_state", return_value=legacy), patch(
+            "monitor.logger.info"
+        ) as log_info:
+            entries = _load_streamer_entries(Mock(), config)
+
+        self.assertEqual(len(entries), 1)
+        self.assertFalse(
+            any("迁移" in str(call) for call in log_info.call_args_list)
+        )
+
+    def test_invalid_legacy_streamer_does_not_block_empty_config(self):
+        config = {"streamers": [], "max_concurrent_checks": 2}
+        legacy = {"target_url": "https://example.com/not-douyin"}
+
+        with patch("monitor.load_monitor_state", return_value=legacy), patch(
+            "monitor.logger.warning"
+        ) as log_warning:
+            entries = _load_streamer_entries(Mock(), config)
+
+        self.assertEqual(entries, [])
+        self.assertTrue(log_warning.called)
 
 
 if __name__ == "__main__":

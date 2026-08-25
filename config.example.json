@@ -7,5 +7,7 @@
     "repeat_notify_interval": 600,
     "max_repeat_notifications": 3,
     "startup_notify": false,
-    "enable_daily_intimacy_reminder": true
+    "enable_daily_intimacy_reminder": true,
+    "max_concurrent_checks": 2,
+    "streamers": []
 }
