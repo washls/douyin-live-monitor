@@ -93,6 +93,51 @@ def test_one_worker_failure_does_not_block_other_worker():
     assert snapshot["bad"]["suspended"] is False
 
 
+def test_four_streamers_recover_one_failed_worker_without_restart():
+    entries = [streamer(f"streamer-{index}") for index in range(4)]
+
+    class RecoveringWorker(FakeWorker):
+        def __init__(self, entry):
+            super().__init__(entry)
+            self.calls = 0
+
+        def check_once(self):
+            self.calls += 1
+            if self.entry["id"] == "streamer-2" and self.calls == 1:
+                raise RuntimeError("profile_api_empty_response")
+            return {
+                "nickname": self.entry["id"],
+                "is_live": self.entry["id"] in {"streamer-0", "streamer-2"},
+                "method": "api",
+            }
+
+    events = []
+    service = MonitorService(
+        entries,
+        worker_factory=RecoveringWorker,
+        max_concurrent_checks=2,
+        on_event=events.append,
+    )
+
+    first = service.check_all_once()
+    first_snapshot = {item["id"]: item for item in service.snapshot()}
+    second = service.check_all_once()
+    second_snapshot = {item["id"]: item for item in service.snapshot()}
+
+    assert set(first) == {"streamer-0", "streamer-1", "streamer-3"}
+    assert first_snapshot["streamer-0"]["status"] == "live"
+    assert first_snapshot["streamer-2"]["status"] == "error"
+    assert first_snapshot["streamer-3"]["status"] == "offline"
+    assert set(second) == {entry["id"] for entry in entries}
+    assert second_snapshot["streamer-2"]["status"] == "live"
+    assert second_snapshot["streamer-2"]["consecutive_errors"] == 0
+    assert any(
+        event["type"] == "status"
+        and event["streamer_id"] == "streamer-2"
+        for event in events
+    )
+
+
 def test_startup_notification_is_aggregated_into_one_post():
     entries = [streamer("one", "主播甲"), streamer("two", "主播乙")]
     workers = {}

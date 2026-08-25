@@ -135,6 +135,43 @@ class NotifierTests(unittest.TestCase):
 
 
 class MonitorControlTests(unittest.TestCase):
+    def test_indeterminate_check_then_live_notifies_once(self):
+        live_monitor = object.__new__(DouyinLiveMonitor)
+        live_monitor.target_url = "https://www.douyin.com/user/recovering"
+        live_monitor.client = Mock()
+        live_monitor.client.check_live.side_effect = [
+            {
+                "is_live": False,
+                "indeterminate": True,
+                "error": "profile_api_empty_response",
+            },
+            {
+                "is_live": True,
+                "nickname": "恢复主播",
+                "room_id": "room-1",
+                "title": "直播标题",
+            },
+            {
+                "is_live": True,
+                "nickname": "恢复主播",
+                "room_id": "room-1",
+                "title": "直播标题",
+            },
+        ]
+        live_monitor.state = MonitorState()
+        live_monitor.notifier = Mock(delivery_unknown=False)
+        live_monitor.notifier.send_live_notification.return_value = True
+        live_monitor.config = {"enable_daily_intimacy_reminder": False}
+        live_monitor.notify_on_end = True
+
+        with self.assertRaisesRegex(RuntimeError, "profile_api_empty_response"):
+            live_monitor.check_once()
+
+        live_monitor.check_once()
+        live_monitor.check_once()
+
+        live_monitor.notifier.send_live_notification.assert_called_once()
+
     def test_windows_console_is_reconfigured_without_being_closed(self):
         stream = Mock()
 
