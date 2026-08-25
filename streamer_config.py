@@ -203,6 +203,38 @@ def set_streamer_enabled(
     raise ValueError(f"未找到主播 ID: {exact_id}")
 
 
+def update_streamer(
+    config: Dict[str, Any],
+    streamer_id: str,
+    url: str,
+    label: str = "",
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    """Update one streamer while preserving its stable local ID."""
+    entries, _ = normalize_streamers(config)
+    exact_id = (streamer_id or "").strip()
+    clean_url = validate_streamer_url(url)
+    clean_label = (label or "").strip()
+    if len(clean_label) > MAX_LABEL_LENGTH:
+        raise ValueError(f"主播名称不能超过 {MAX_LABEL_LENGTH} 个字符")
+    if any(
+        entry["id"] != exact_id and entry["url"] == clean_url
+        for entry in entries
+    ):
+        raise ValueError("该主播链接已经在监控列表中")
+    for entry in entries:
+        if entry["id"] == exact_id:
+            entry.update(
+                {
+                    "url": clean_url,
+                    "label": clean_label,
+                    "enabled": bool(enabled),
+                }
+            )
+            return entry
+    raise ValueError(f"未找到主播 ID: {exact_id}")
+
+
 def enabled_streamers(entries: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """Return enabled streamer entries as independent dictionaries."""
     return [dict(entry) for entry in entries if bool(entry.get("enabled", True))]

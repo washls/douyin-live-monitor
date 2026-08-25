@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.2.0-orange.svg" alt="Version 1.2.0">
+  <img src="https://img.shields.io/badge/version-1.3.0-orange.svg" alt="Version 1.3.0">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
 
@@ -16,6 +16,7 @@
 ## ✨ 功能特性
 
 - 👥 **多主播监控**：在一个进程中同时监控多个主播，各自维护直播与通知状态
+- 🖥️ **Windows 图形界面**：在一个窗口中管理主播、配置推送并查看实时状态
 - 🔍 **直播状态监控**：定时检查已启用主播，自动识别开播、持续直播、切换直播间和下播
 - 🔄 **8 种检测方式**：Douyin API、Webcast、用户主页和 IES 接口自动回退
 - 📲 **完整通知流程**：支持开播、下播、持续直播、启动测试和每日亲密度提醒
@@ -26,10 +27,14 @@
 - 🪶 **低资源占用**：默认最多并发检测 2 个主播，复用检测连接并限制连接池和页面缓存
 - 📝 **滚动日志**：终端只显示状态摘要，详细日志自动轮转，避免长期运行无限增长
 - ⌨️ **随时退出**：输入 `q` 后回车，或按 `Ctrl+C`，即可停止监控并退出
-- 🎯 **交互式配置**：首次运行按提示填写推送 URL 和主播链接
+- 🎯 **图形化配置**：表单就地校验，推送地址默认隐藏并只保存在本机
 - 📦 **Windows EXE**：Releases 提供打包好的可执行文件，无需安装 Python
 
-## 🆕 v1.2.0
+## 🆕 v1.3.0
+
+这一版增加了浅色 Windows 原生风格的 GUI。双击 EXE 会直接打开图形界面，可以添加、编辑、停用或删除主播，设置检测与提醒参数，并查看每个任务的运行状态。带参数启动 EXE 时仍进入原有命令行模式，现有脚本不需要修改。如需回退，可以继续使用 [v1.2.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.2.0)。
+
+## v1.2.0
 
 这一版增加了多主播监控。每个主播使用独立的检测客户端、通知器和状态，单个任务连续失败不会中断其他主播。旧版记录的单主播会自动加入新列表，原状态文件不会被删除。如需回退，可以继续使用 [v1.1.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.1.1)。
 
@@ -37,7 +42,7 @@
 
 ### Windows 直接运行
 
-从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.2.0.exe`，双击后按照提示完成配置。
+从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.3.0.exe`。双击后会打开图形界面；需要命令行模式时，可以在终端中给同一个 EXE 传入原有参数。
 
 ### 从源码运行
 
@@ -62,7 +67,13 @@ setup.bat
 #### 运行
 
 ```bash
-# 首次运行：跟随引导完成配置
+# 打开图形界面
+python gui_entry.py
+
+# 使用自定义配置打开图形界面
+python gui_entry.py --gui --config my_config.json
+
+# 命令行模式：首次运行时跟随引导完成配置
 python monitor.py
 
 # 测试推送连接
@@ -102,15 +113,15 @@ python monitor.py --remove-streamer STREAMER_ID
 
 持续监控会启动全部已启用的主播。输入 `q` 并回车即可停止所有任务，也可以按 `Ctrl+C`。
 
-### 首次运行引导
+### 首次运行
 
-程序首次启动时会**自动弹出配置引导**：
+双击 EXE 或运行 `python gui_entry.py` 后：
 
-1. **配置推送**：粘贴你的 Server 酱³ 推送 URL（从 [sc3.ft07.com](https://sc3.ft07.com) 获取）
-2. **选择主播**：粘贴第一个要监控的抖音博主主页链接
-3. **开始监控**：配置自动保存，下次启动会监控列表中所有已启用主播
+1. 在“监控设置”中填写 Server 酱³ 推送 URL，并保存设置。
+2. 点击“新增主播”，填写抖音主页链接和显示名称。
+3. 点击“开始监控”，窗口会显示每个主播的检测状态。
 
-> 升级时会把 `.monitor_state.json` 中原有的单主播加入新列表，并保留旧状态文件。其他主播可以通过 `--add-streamer` 添加。
+> 升级时会把 `.monitor_state.json` 中原有的单主播加入新列表，并保留旧状态文件。命令行管理功能也继续保留。
 
 ## 👥 主播管理
 
@@ -224,6 +235,8 @@ python monitor.py --remove-streamer STREAMER_ID --yes
 
 ```
 douyin-live-monitor/
+├── gui_entry.py         # EXE 统一入口，双击进入 GUI，带参数进入 CLI
+├── gui_app.py           # Tkinter/ttk 图形界面与后台服务协调
 ├── monitor.py           # 主程序入口 & 交互式引导
 ├── monitor_service.py   # 多主播调度、状态汇总与统一停止
 ├── streamer_config.py   # 主播列表校验、迁移与原子保存
@@ -232,6 +245,7 @@ douyin-live-monitor/
 ├── abogus.py            # a_bogus / msToken 签名生成 (纯 Python)
 ├── x-bogus.js           # PyInstaller 打包所需签名资源
 ├── test_monitor.py      # 单主播状态与推送回归测试
+├── test_gui_app.py      # GUI 设置、窗口构建和服务生命周期测试
 ├── test_monitor_service.py  # 多主播调度回归测试
 ├── test_streamer_config.py  # 配置迁移与管理回归测试
 ├── douyin-monitor.spec  # PyInstaller 打包配置
@@ -289,7 +303,7 @@ WantedBy=multi-user.target
 
 <details>
 <summary><b>如何回退到上一个版本？</b></summary>
-从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.1.1">v1.1.1 Release</a> 重新下载旧版 EXE。v1.2.0 的迁移不会删除旧的 <code>.monitor_state.json</code>，旧版仍可读取原来的单主播记录。
+从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.2.0">v1.2.0 Release</a> 重新下载旧版 EXE。v1.3.0 沿用原有配置结构，没有不可逆迁移。
 </details>
 
 ## ⚠️ 免责声明

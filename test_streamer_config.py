@@ -9,6 +9,7 @@ from streamer_config import (
     remove_streamer,
     save_config_atomic,
     set_streamer_enabled,
+    update_streamer,
 )
 
 
@@ -89,6 +90,26 @@ def test_add_disable_enable_and_remove_streamer():
     assert set_streamer_enabled(config, entry["id"], True)["enabled"] is True
     assert remove_streamer(config, entry["id"])["id"] == entry["id"]
     assert config["streamers"] == []
+
+
+def test_update_streamer_preserves_id_and_rejects_duplicate_url():
+    config = {"streamers": [], "max_concurrent_checks": 2}
+    first = add_streamer(config, "https://www.douyin.com/user/first")
+    second = add_streamer(config, "https://www.douyin.com/user/second")
+
+    updated = update_streamer(
+        config,
+        first["id"],
+        "https://www.douyin.com/user/updated",
+        label="更新后的主播",
+        enabled=False,
+    )
+
+    assert updated["id"] == first["id"]
+    assert updated["label"] == "更新后的主播"
+    assert updated["enabled"] is False
+    with pytest.raises(ValueError, match="已经在监控列表中"):
+        update_streamer(config, first["id"], second["url"])
 
 
 def test_remove_requires_exact_id():

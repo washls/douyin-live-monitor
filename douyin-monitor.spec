@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['monitor.py'],
+    ['gui_entry.py'],
     pathex=[],
     binaries=[],
     datas=[('x-bogus.js', '.')],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='douyin-monitor-v1.2.0',
+    name='douyin-monitor-v1.3.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

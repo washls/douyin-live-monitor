@@ -51,7 +51,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -346,9 +346,13 @@ def _create_notifier(config: Dict[str, Any]) -> ServerChanNotifier:
 
 def is_serverchan_configured(config: Dict[str, Any]) -> bool:
     """Check if Server酱 is properly configured."""
-    # Check if push_url is set
-    if config.get("push_url") and config["push_url"] != "YOUR_PUSH_URL_HERE":
-        return True
+    push_url = config.get("push_url")
+    if push_url and push_url != "YOUR_PUSH_URL_HERE":
+        try:
+            ServerChanNotifier._parse_push_url(str(push_url))
+            return True
+        except ValueError:
+            return False
     # Check if sendkey is set
     if config.get("sendkey") and config["sendkey"] not in ("", "YOUR_SENDKEY_HERE"):
         return True
@@ -395,8 +399,13 @@ def prompt_serverchan_config(config_path: Path, config: Dict[str, Any]) -> Dict[
             print()
             break
 
-        # Validate URL format
-        if "push.ft07.com" in url:
+        try:
+            ServerChanNotifier._parse_push_url(url)
+        except ValueError:
+            print("❌ URL 格式不正确，请粘贴完整的 HTTPS 推送 URL")
+            print("   格式示例: https://12345.push.ft07.com/send/SCTxxxxxx.send")
+            print()
+        else:
             config["push_url"] = url
             config["sendkey"] = ""  # Will be parsed from URL
             config["push_uid"] = ""  # Will be parsed from URL
@@ -410,10 +419,6 @@ def prompt_serverchan_config(config_path: Path, config: Dict[str, Any]) -> Dict[
             except OSError as e:
                 logger.warning(f"保存配置失败: {e}")
             break
-        else:
-            print("❌ URL 格式不正确，请粘贴完整的推送 URL")
-            print("   格式示例: https://12345.push.ft07.com/send/SCTxxxxxx.send")
-            print()
 
     return config
 

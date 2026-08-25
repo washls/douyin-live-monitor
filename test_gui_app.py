@@ -1,0 +1,153 @@
+import pytest
+import tkinter as tk
+import threading
+
+import monitor
+from gui_app import MonitorGui, compact_ui_text, status_text, validate_gui_settings
+from streamer_config import add_streamer, save_config_atomic
+
+
+def valid_settings():
+    return {
+        "push_url": "https://12345.push.ft07.com/send/example-key.send",
+        "check_interval": "30",
+        "repeat_notify_interval": "600",
+        "max_repeat_notifications": "3",
+        "max_concurrent_checks": "2",
+        "notify_on_stream_end": True,
+        "startup_notify": False,
+        "enable_daily_intimacy_reminder": True,
+    }
+
+
+def test_gui_settings_are_normalized_without_exposing_legacy_credentials():
+    settings = valid_settings()
+    settings["sendkey"] = "legacy-key"
+    settings["push_uid"] = "legacy-uid"
+
+    normalized = validate_gui_settings(settings)
+
+    assert normalized["check_interval"] == 30
+    assert normalized["max_concurrent_checks"] == 2
+    assert normalized["sendkey"] == ""
+    assert normalized["push_uid"] == ""
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("check_interval", "0", "检测间隔"),
+        ("repeat_notify_interval", "86401", "重复提醒间隔"),
+        ("max_repeat_notifications", "101", "最多重复提醒"),
+        ("max_concurrent_checks", "9", "并发检测数"),
+    ],
+)
+def test_gui_settings_reject_out_of_range_values(key, value, message):
+    settings = valid_settings()
+    settings[key] = value
+
+    with pytest.raises(ValueError, match=message):
+        validate_gui_settings(settings)
+
+
+def test_gui_settings_reject_invalid_push_url():
+    settings = valid_settings()
+    settings["push_url"] = "https://example.com/not-serverchan"
+
+    with pytest.raises(ValueError, match="无法解析推送 URL"):
+        validate_gui_settings(settings)
+
+
+def test_status_text_has_a_safe_fallback():
+    assert status_text("live") == "直播中"
+    assert status_text("unexpected") == "未知"
+
+
+def test_remote_text_is_single_line_and_bounded():
+    assert compact_ui_text("主播\n名称  测试", 6) == "主播 名称"
+
+
+def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    config = monitor._default_config()
+    first = add_streamer(
+        config,
+        "https://www.douyin.com/user/gui-test",
+        label="界面测试主播",
+    )
+    config_path = tmp_path / "config.json"
+    save_config_atomic(config_path, config)
+    monkeypatch.setattr(
+        monitor,
+        "_load_streamer_entries",
+        lambda _path, loaded: list(loaded["streamers"]),
+    )
+    monkeypatch.setattr("gui_app.messagebox.askyesno", lambda *args, **kwargs: True)
+    finished = threading.Event()
+
+    class FakeService:
+        def __init__(self, streamers, on_event, **_kwargs):
+            self.streamers = streamers
+            self.on_event = on_event
+            self.running = False
+
+        def run(self):
+            self.running = True
+            self.on_event(
+                {
+                    "type": "status",
+                    "streamer_id": first["id"],
+                    "result": {"is_live": False},
+                }
+            )
+            self.running = False
+            finished.set()
+            return True
+
+        def stop(self):
+            self.running = False
+
+        def snapshot(self):
+            return [
+                {
+                    "id": first["id"],
+                    "status": "offline",
+                    "nickname": "界面测试主播",
+                    "last_check": "08-25 18:00",
+                    "last_error": "",
+                    "method": "fake",
+                    "suspended": False,
+                }
+            ]
+
+    monkeypatch.setattr("gui_app.MonitorService", FakeService)
+
+    try:
+        app = MonitorGui(root, config_path)
+        root.update_idletasks()
+
+        assert app.selected_streamer_id == first["id"]
+        assert app.streamer_label_var.get() == "界面测试主播"
+        assert app.status_tree.item(first["id"], "values")[3] == "等待首次检测"
+        app._start_monitoring()
+        assert finished.wait(timeout=1)
+        assert app.service_thread is not None
+        app.service_thread.join(timeout=1)
+        app._drain_events()
+
+        assert app.service is None
+        assert app.service_thread is None
+        assert app.global_status_var.get() == "已停止"
+        assert app.runtime_by_id[first["id"]]["status"] == "offline"
+        assert app.status_tree.item(first["id"], "values") == (
+            "未开播",
+            "界面测试主播",
+            "08-25 18:00",
+            "fake",
+        )
+    finally:
+        root.destroy()

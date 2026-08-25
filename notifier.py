@@ -70,7 +70,7 @@ class ServerChanNotifier:
                 uid=self.uid, sendkey=self.sendkey
             )
 
-        logger.debug(f"Server酱³ 通知器已初始化")
+        logger.debug("Server酱³ 通知器已初始化")
 
     @staticmethod
     def _parse_push_url(url: str) -> Dict[str, str]:
@@ -87,9 +87,9 @@ class ServerChanNotifier:
         """
         # Match: https://<uid>.push.ft07.com/send/<sendkey>.send
         # UID is typically numeric but may change; accept alphanumeric + hyphens
-        match = re.match(
-            r'https?://([\w-]+)\.push\.ft07\.com/send/([\w-]+)\.send',
-            url
+        match = re.fullmatch(
+            r"https://([\w-]+)\.push\.ft07\.com/send/([\w-]+)\.send/?",
+            (url or "").strip(),
         )
         if match:
             return {"uid": match.group(1), "sendkey": match.group(2)}

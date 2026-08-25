@@ -35,14 +35,14 @@ echo ========================================
 echo   安装完成!
 echo.
 echo   下一步:
-echo   1. 运行: python monitor.py
-echo      首次运行会提示你配置 Server酱³ 推送和选择监控主播
+echo   1. 运行: python gui_entry.py
+echo      打开图形界面，添加主播并配置 Server酱³ 推送
 echo   2. (可选) 运行: python monitor.py --test
 echo      测试 Server酱³ 连接是否正常
 echo   3. (可选) 运行: python monitor.py --once
 echo      执行一次检测，确认目标博主信息正确
-echo   4. 运行: python monitor.py
-echo      开始监控全部已启用主播!
+echo   4. 运行: python gui_entry.py
+echo      在图形界面中开始监控全部已启用主播
 echo   5. (可选) 运行: python monitor.py --add-streamer URL
 echo      添加更多主播
 echo ========================================

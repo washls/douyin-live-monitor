@@ -9,6 +9,7 @@ from monitor import (
     _configure_console_output,
     _confirm_remove,
     _load_streamer_entries,
+    is_serverchan_configured,
 )
 from notifier import ServerChanNotifier
 from douyin_client import DouyinClient
@@ -47,6 +48,42 @@ class MonitorStateTests(unittest.TestCase):
 
 
 class NotifierTests(unittest.TestCase):
+    def test_push_url_requires_exact_https_serverchan_address(self):
+        valid = "https://12345.push.ft07.com/send/example-key.send"
+
+        self.assertEqual(
+            ServerChanNotifier._parse_push_url(valid),
+            {"uid": "12345", "sendkey": "example-key"},
+        )
+        for invalid in (
+            "http://12345.push.ft07.com/send/example-key.send",
+            f"{valid}.extra",
+            "https://example.com/send/example-key.send",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    ServerChanNotifier._parse_push_url(invalid)
+
+    def test_serverchan_configuration_uses_the_same_url_validation(self):
+        self.assertTrue(
+            is_serverchan_configured(
+                {
+                    "push_url": (
+                        "https://12345.push.ft07.com/send/example-key.send"
+                    )
+                }
+            )
+        )
+        self.assertFalse(
+            is_serverchan_configured(
+                {
+                    "push_url": (
+                        "http://12345.push.ft07.com/send/example-key.send"
+                    )
+                }
+            )
+        )
+
     def test_successful_send_posts_once(self):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
         response = Mock(text='{"code": 0, "message": "ok"}')
