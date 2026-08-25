@@ -10,6 +10,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
+from streamer_logging import run_with_streamer_context, streamer_log_context
+
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,9 @@ class MonitorService:
         for entry in self.streamers:
             streamer_id = str(entry["id"])
             try:
-                candidates[streamer_id] = self.worker_factory(entry)
+                candidates[streamer_id] = run_with_streamer_context(
+                    streamer_id, self.worker_factory, entry
+                )
             except Exception as exc:
                 self._mark_prepare_error(streamer_id, exc)
 
@@ -110,7 +114,11 @@ class MonitorService:
                 thread_name_prefix="monitor-prepare",
             ) as executor:
                 futures = {
-                    executor.submit(worker.prepare): streamer_id
+                    executor.submit(
+                        run_with_streamer_context,
+                        streamer_id,
+                        worker.prepare,
+                    ): streamer_id
                     for streamer_id, worker in candidates.items()
                 }
                 for future in as_completed(futures):
@@ -122,7 +130,9 @@ class MonitorService:
                         prepared_sec_uids[streamer_id] = str(sec_uid)
                     except Exception as exc:
                         self._mark_prepare_error(streamer_id, exc)
-                        candidates[streamer_id].stop()
+                        run_with_streamer_context(
+                            streamer_id, candidates[streamer_id].stop
+                        )
 
         seen_sec_uids: Dict[str, str] = {}
         for entry in self.streamers:
@@ -134,7 +144,9 @@ class MonitorService:
             if duplicate_of:
                 message = f"与主播 {duplicate_of} 指向同一账号，已跳过"
                 self._mark_prepare_error(streamer_id, RuntimeError(message))
-                candidates[streamer_id].stop()
+                run_with_streamer_context(
+                    streamer_id, candidates[streamer_id].stop
+                )
                 continue
             seen_sec_uids[sec_uid] = streamer_id
             worker = candidates[streamer_id]
@@ -152,7 +164,8 @@ class MonitorService:
 
     def _mark_prepare_error(self, streamer_id: str, exc: Exception) -> None:
         message = str(exc)
-        logger.error("主播 %s 初始化失败: %s", streamer_id, message)
+        with streamer_log_context(streamer_id):
+            logger.error("主播 %s 初始化失败: %s", streamer_id, message)
         with self._lock:
             runtime = self._runtime[streamer_id]
             runtime["status"] = "error"
@@ -168,7 +181,10 @@ class MonitorService:
             runtime = self._runtime[streamer_id]
             names.append(worker.state.streamer_nickname or runtime["label"] or streamer_id)
         first_worker = next(iter(self._workers.values()))
-        first_worker.notifier.send(
+        first_streamer_id = next(iter(self._workers))
+        run_with_streamer_context(
+            first_streamer_id,
+            first_worker.notifier.send,
             title="[START] 抖音直播监听器已启动",
             desp=(
                 f"**监控主播数**: {len(names)}\n"
@@ -189,7 +205,11 @@ class MonitorService:
             thread_name_prefix="monitor-once",
         ) as executor:
             futures = {
-                executor.submit(worker.check_once): streamer_id
+                executor.submit(
+                    run_with_streamer_context,
+                    streamer_id,
+                    worker.check_once,
+                ): streamer_id
                 for streamer_id, worker in self._workers.items()
             }
             for future in as_completed(futures):
@@ -271,7 +291,11 @@ class MonitorService:
                 continue
             if now < self._next_due.get(streamer_id, now):
                 continue
-            future = self._executor.submit(worker.check_once)
+            future = self._executor.submit(
+                run_with_streamer_context,
+                streamer_id,
+                worker.check_once,
+            )
             self._futures[future] = streamer_id
             self._next_due[streamer_id] = float("inf")
             future.add_done_callback(lambda _future: self._wake_event.set())
@@ -318,7 +342,8 @@ class MonitorService:
         title = str(result.get("title") or "")[:30]
         if is_live and title:
             line += f" | {title}"
-        logger.info(line)
+        with streamer_log_context(streamer_id):
+            logger.info(line)
         if is_live or count % 10 == 1:
             print(line)
         self._emit("status", streamer_id, result=dict(result))
@@ -333,15 +358,17 @@ class MonitorService:
             runtime["status"] = "error"
             if count >= 10:
                 runtime["suspended"] = True
-        logger.error(
-            "主播 %s 检测异常 (连续错误 %s/10): %s",
-            streamer_id,
-            count,
-            message,
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
+        with streamer_log_context(streamer_id):
+            logger.error(
+                "主播 %s 检测异常 (连续错误 %s/10): %s",
+                streamer_id,
+                count,
+                message,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
         if count >= 10:
-            logger.error("主播 %s 已暂停，其他主播继续监控", streamer_id)
+            with streamer_log_context(streamer_id):
+                logger.error("主播 %s 已暂停，其他主播继续监控", streamer_id)
             self._emit("suspended", streamer_id, error=message)
         else:
             self._emit("error", streamer_id, error=message, count=count)
@@ -369,11 +396,11 @@ class MonitorService:
         self._stop_event.set()
         self._wake_event.set()
         with self._lock:
-            workers = list(self._workers.values())
+            workers = list(self._workers.items())
             emit_stopped = not self._stopped_emitted
             self._stopped_emitted = True
-        for worker in workers:
-            worker.stop()
+        for streamer_id, worker in workers:
+            run_with_streamer_context(streamer_id, worker.stop)
         if emit_stopped:
             self._emit("stopped")
 

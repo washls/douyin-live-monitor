@@ -232,7 +232,23 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.selected_streamer_id == first["id"]
         assert app.streamer_label_var.get() == "界面测试主播"
         assert app.status_tree.item(first["id"], "values")[3] == "等待首次检测"
+        assert app.status_tree.bind("<Double-1>")
         assert app.settings_canvas.winfo_exists()
+
+        app._show_streamer_log(first["id"])
+        app._handle_event(
+            {
+                "type": "log",
+                "streamer_id": first["id"],
+                "message": "12:00:00 [INFO] 实时检测日志",
+            }
+        )
+        root.update_idletasks()
+        log_text = app.streamer_log_windows[first["id"]]["text"].get(
+            "1.0", tk.END
+        )
+        assert "实时检测日志" in log_text
+
         app._start_monitoring()
         assert finished.wait(timeout=1)
         assert app.service_thread is not None

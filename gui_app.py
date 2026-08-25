@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import queue
 import sys
 import threading
@@ -11,6 +12,7 @@ import tkinter as tk
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, Mapping
 
 import monitor
@@ -23,6 +25,7 @@ from streamer_config import (
     save_config_atomic,
     update_streamer,
 )
+from streamer_logging import StreamerLogHandler, StreamerLogStore
 
 
 COLORS = {
@@ -233,6 +236,9 @@ class MonitorGui:
         self.testing_push = False
         self.selected_streamer_id = ""
         self.runtime_by_id: Dict[str, Dict[str, Any]] = {}
+        self.streamer_logs = StreamerLogStore(max_lines=500)
+        self.streamer_log_handler: StreamerLogHandler | None = None
+        self.streamer_log_windows: Dict[str, Dict[str, Any]] = {}
 
         self._configure_window()
         self._configure_styles()
@@ -596,6 +602,7 @@ class MonitorGui:
         self.status_tree.configure(
             yscrollcommand=scroll.set, xscrollcommand=horizontal_scroll.set
         )
+        self.status_tree.bind("<Double-1>", self._on_status_tree_double_click)
         self.status_tree.tag_configure("live", foreground=COLORS["success"])
         self.status_tree.tag_configure("error", foreground=COLORS["danger"])
         self.status_tree.tag_configure("suspended", foreground=COLORS["warning"])
@@ -966,6 +973,125 @@ class MonitorGui:
                 tags=(state,),
             )
 
+    def _on_status_tree_double_click(self, event) -> None:
+        streamer_id = self.status_tree.identify_row(event.y)
+        if not streamer_id:
+            return
+        self.status_tree.selection_set(streamer_id)
+        self.status_tree.focus(streamer_id)
+        self._show_streamer_log(streamer_id)
+
+    def _show_streamer_log(self, streamer_id: str) -> None:
+        existing = self.streamer_log_windows.get(streamer_id)
+        if existing and existing["window"].winfo_exists():
+            existing["window"].deiconify()
+            existing["window"].lift()
+            existing["window"].focus_force()
+            return
+
+        entry = next(
+            (item for item in self.entries if item["id"] == streamer_id), None
+        )
+        if entry is None:
+            return
+        runtime = self.runtime_by_id.get(streamer_id, {})
+        name = compact_ui_text(
+            runtime.get("nickname") or entry.get("label") or "未命名主播",
+            80,
+        )
+
+        window = tk.Toplevel(self.root)
+        window.title(f"{name} · 实时运行日志")
+        window.configure(background=COLORS["surface"])
+        width = min(self._px(780), max(self._px(520), self.root.winfo_width()))
+        height = min(self._px(520), max(self._px(360), self.root.winfo_height()))
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.minsize(self._px(520), self._px(340))
+
+        content = ttk.Frame(
+            window, style="Surface.TFrame", padding=self._px(16)
+        )
+        content.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            content,
+            text=name,
+            style="Section.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            content,
+            text="当前监控会话日志，停止后仍可查看。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(self._px(3), self._px(10)))
+
+        text = ScrolledText(
+            content,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            background="#fbfbfb",
+            foreground=COLORS["text"],
+            borderwidth=1,
+            relief=tk.SOLID,
+            padx=self._px(10),
+            pady=self._px(8),
+        )
+        text.pack(fill=tk.BOTH, expand=True)
+        self.streamer_log_windows[streamer_id] = {
+            "window": window,
+            "text": text,
+            "has_logs": False,
+        }
+
+        def close_window() -> None:
+            self.streamer_log_windows.pop(streamer_id, None)
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        self._render_streamer_log_window(streamer_id)
+
+    def _render_streamer_log_window(self, streamer_id: str) -> None:
+        log_window = self.streamer_log_windows.get(streamer_id)
+        if not log_window:
+            return
+        lines = self.streamer_logs.get(streamer_id)
+        text = log_window["text"]
+        text.configure(state=tk.NORMAL)
+        text.delete("1.0", tk.END)
+        if lines:
+            text.insert(tk.END, "\n".join(lines) + "\n")
+        else:
+            text.insert(tk.END, "当前会话暂无日志。监控开始后将在这里实时显示。\n")
+        text.configure(state=tk.DISABLED)
+        text.see(tk.END)
+        log_window["has_logs"] = bool(lines)
+
+    def _append_streamer_log(self, streamer_id: str, message: Any) -> None:
+        line = self.streamer_logs.append(streamer_id, message)
+        log_window = self.streamer_log_windows.get(streamer_id)
+        if not log_window:
+            return
+        text = log_window["text"]
+        text.configure(state=tk.NORMAL)
+        if not log_window["has_logs"]:
+            text.delete("1.0", tk.END)
+            log_window["has_logs"] = True
+        text.insert(tk.END, line + "\n")
+        text.configure(state=tk.DISABLED)
+        text.see(tk.END)
+
+    def _attach_streamer_log_handler(self) -> None:
+        self._detach_streamer_log_handler()
+        self.streamer_log_handler = StreamerLogHandler(self.event_queue.put)
+        logging.getLogger().addHandler(self.streamer_log_handler)
+
+    def _detach_streamer_log_handler(self) -> None:
+        if self.streamer_log_handler is None:
+            return
+        logging.getLogger().removeHandler(self.streamer_log_handler)
+        self.streamer_log_handler.close()
+        self.streamer_log_handler = None
+
     def _new_streamer(self) -> None:
         self.selected_streamer_id = ""
         self.streamer_id_var.set("新增后自动生成")
@@ -1088,6 +1214,10 @@ class MonitorGui:
         except (TypeError, ValueError) as exc:
             messagebox.showerror("无法开始监控", str(exc), parent=self.root)
             return
+        self.streamer_logs.clear()
+        for streamer_id in list(self.streamer_log_windows):
+            self._render_streamer_log_window(streamer_id)
+        self._attach_streamer_log_handler()
         self._set_running_ui(True)
         self._set_global_status("starting", f"正在初始化 {len(active_entries)} 个主播")
 
@@ -1187,7 +1317,11 @@ class MonitorGui:
 
     def _handle_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("type")
-        if event_type in {
+        if event_type == "log":
+            streamer_id = str(event.get("streamer_id") or "")
+            if streamer_id:
+                self._append_streamer_log(streamer_id, event.get("message", ""))
+        elif event_type in {
             "prepared",
             "prepare_error",
             "status",
@@ -1213,6 +1347,7 @@ class MonitorGui:
                 f"{runnable} 个任务运行，{live} 个直播中",
             )
         elif event_type == "service_finished":
+            self._detach_streamer_log_handler()
             self._set_running_ui(False)
             if event.get("success"):
                 self._set_global_status("stopped", "监控已停止")
@@ -1221,6 +1356,7 @@ class MonitorGui:
             self.service = None
             self.service_thread = None
         elif event_type == "fatal_error":
+            self._detach_streamer_log_handler()
             self._set_running_ui(False)
             self._set_global_status("error", "监控服务异常结束")
             messagebox.showerror(
@@ -1254,6 +1390,7 @@ class MonitorGui:
             self.pending_close = True
             self._stop_monitoring()
             return
+        self._detach_streamer_log_handler()
         self.root.destroy()
 
 

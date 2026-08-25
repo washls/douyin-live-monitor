@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+import logging
 import threading
 
 import pytest
 
 from monitor_service import MonitorService
+from streamer_logging import StreamerLogHandler
 
 
 @dataclass
@@ -136,6 +138,36 @@ def test_four_streamers_recover_one_failed_worker_without_restart():
         and event["streamer_id"] == "streamer-2"
         for event in events
     )
+
+
+def test_worker_logs_receive_the_matching_streamer_context():
+    events = []
+    handler = StreamerLogHandler(events.append)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+
+    class LoggingWorker(FakeWorker):
+        def check_once(self):
+            logging.getLogger("worker-test").warning(
+                "检测 %s", self.entry["id"]
+            )
+            return super().check_once()
+
+    try:
+        service = MonitorService(
+            [streamer("one"), streamer("two")],
+            worker_factory=LoggingWorker,
+            max_concurrent_checks=2,
+        )
+        service.check_all_once()
+    finally:
+        root_logger.removeHandler(handler)
+
+    messages_by_id = {
+        event["streamer_id"]: event["message"] for event in events
+    }
+    assert "检测 one" in messages_by_id["one"]
+    assert "检测 two" in messages_by_id["two"]
 
 
 def test_startup_notification_is_aggregated_into_one_post():
