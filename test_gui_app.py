@@ -269,6 +269,12 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
 
         app._set_running_ui(False)
         assert str(app.stop_selected_button.cget("state")) == tk.DISABLED
+        app._set_global_status("stopped", "监控已停止")
+        app._handle_event(
+            {"type": "streamer_stopped", "streamer_id": first["id"]}
+        )
+        assert app.global_status_var.get() == "已停止"
+        assert app.global_detail_var.get() == "监控已停止"
 
         app.service = None
         app.service_thread = None

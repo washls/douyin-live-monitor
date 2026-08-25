@@ -1489,6 +1489,8 @@ class MonitorGui:
             "suspended",
             "streamer_stopped",
         }:
+            if not self.monitoring_ui_active:
+                return
             if self.service is not None:
                 self.runtime_by_id = {
                     item["id"]: item for item in self.service.snapshot()
