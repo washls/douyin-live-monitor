@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='douyin-monitor-v1.3.1',
+    name='douyin-monitor-v1.4.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

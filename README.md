@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.3.1-orange.svg" alt="Version 1.3.1">
+  <img src="https://img.shields.io/badge/version-1.4.0-orange.svg" alt="Version 1.4.0">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
 
@@ -16,7 +16,7 @@
 ## ✨ 功能特性
 
 - 👥 **多主播监控**：在一个进程中同时监控多个主播，各自维护直播与通知状态
-- 🖥️ **Windows 图形界面**：在一个窗口中管理主播、配置推送并查看实时状态
+- 🖥️ **Windows 图形界面**：在一个窗口中管理主播、配置推送并查看实时状态和单主播日志
 - 🔍 **直播状态监控**：定时检查已启用主播，自动识别开播、持续直播、切换直播间和下播
 - 🔄 **8 种检测方式**：Douyin API、Webcast、用户主页和 IES 接口自动回退
 - 📲 **完整通知流程**：支持开播、下播、持续直播、启动测试和每日亲密度提醒
@@ -30,7 +30,11 @@
 - 🎯 **图形化配置**：表单就地校验，推送地址默认隐藏并只保存在本机
 - 📦 **Windows EXE**：Releases 提供打包好的可执行文件，无需安装 Python
 
-## 🆕 v1.3.1
+## 🆕 v1.4.0
+
+这一版增强了多主播长时间监控的可靠性。抖音主接口出现空响应时会自动刷新当前主播的独立会话并重试，不会把无法确认的结果误判为下播，也不会影响其他主播。GUI 支持双击任务状态行查看该主播本次监控的实时日志；停止后状态恢复为“待启动”，任务表文字统一居中。双击 EXE 时不再保留程序自建的黑色控制台窗口，从已有终端带参数启动时仍保留命令行功能。如需回退，可以继续使用 [v1.3.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.3.1)。
+
+## v1.3.1
 
 这一版修复了 Windows 缩放后 GUI 发糊的问题，并适配常见分辨率和 100% 至 200% 显示缩放。窗口会按当前显示器 DPI 调整尺寸，且不会超过任务栏以上的可用区域；空间不足时自动使用紧凑布局，设置页面可以滚动。如需回退，可以继续使用 [v1.3.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.3.0)。
 
@@ -46,7 +50,7 @@
 
 ### Windows 直接运行
 
-从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.3.1.exe`。双击后会打开图形界面；需要命令行模式时，可以在终端中给同一个 EXE 传入原有参数。
+从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.4.0.exe`。双击后只会保留图形界面；需要命令行模式时，可以在终端中给同一个 EXE 传入原有参数。
 
 ### 从源码运行
 
@@ -124,6 +128,7 @@ python monitor.py --remove-streamer STREAMER_ID
 1. 在“监控设置”中填写 Server 酱³ 推送 URL，并保存设置。
 2. 点击“新增主播”，填写抖音主页链接和显示名称。
 3. 点击“开始监控”，窗口会显示每个主播的检测状态。
+4. 在“任务状态”中双击主播，可以查看该主播本次监控的实时运行日志。
 
 > 升级时会把 `.monitor_state.json` 中原有的单主播加入新列表，并保留旧状态文件。命令行管理功能也继续保留。
 
@@ -201,6 +206,7 @@ python monitor.py --remove-streamer STREAMER_ID --yes
 ## 🖥️ 运行控制与日志
 
 - 输入 `q` 后回车，或按 `Ctrl+C`，可立即结束等待并退出程序。
+- GUI 中双击“任务状态”里的主播可查看当前监控会话的独立实时日志；停止后仍可查看，下一次开始监控时清空。
 - `monitor.log` 每个文件最大 2 MB，最多保留当前文件和 2 个备份，总占用约 6 MB。
 - `--verbose` 在终端显示详细日志，`--quiet` 只显示错误。
 - `--debug` 会把原始接口响应保存到 `debug_dumps/`。这些文件可能含主播标识或接口参数，排查完成后请妥善处理。
@@ -308,7 +314,7 @@ WantedBy=multi-user.target
 
 <details>
 <summary><b>如何回退到上一个版本？</b></summary>
-从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.3.0">v1.3.0 Release</a> 重新下载旧版 EXE。v1.3.1 沿用原有配置结构，没有不可逆迁移。
+从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.3.1">v1.3.1 Release</a> 重新下载旧版 EXE。v1.4.0 沿用原有配置结构，没有不可逆迁移。
 </details>
 
 ## ⚠️ 免责声明

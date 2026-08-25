@@ -81,3 +81,15 @@ def test_frozen_build_hides_its_console_after_bootloader_startup():
 
     assert "console=True" in spec
     assert "hide_console='hide-late'" in spec
+
+
+def test_release_version_metadata_is_synchronized():
+    version = monitor.APP_VERSION
+    spec = (PROJECT_ROOT / "douyin-monitor.spec").read_text(encoding="utf-8")
+    manifest = (PROJECT_ROOT / "windows-dpi.manifest").read_text(encoding="utf-8")
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert f"name='douyin-monitor-v{version}'" in spec
+    assert f'version="{version}.0"' in manifest
+    assert f"version-{version}-orange.svg" in readme
+    assert f"douyin-monitor-v{version}.exe" in readme
