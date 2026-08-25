@@ -1350,6 +1350,8 @@ class MonitorGui:
             self._detach_streamer_log_handler()
             self._set_running_ui(False)
             if event.get("success"):
+                self.runtime_by_id = {}
+                self._refresh_streamer_views()
                 self._set_global_status("stopped", "监控已停止")
             else:
                 self._set_global_status("error", "没有可继续运行的主播任务")

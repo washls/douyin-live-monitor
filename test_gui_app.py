@@ -258,12 +258,12 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.service is None
         assert app.service_thread is None
         assert app.global_status_var.get() == "已停止"
-        assert app.runtime_by_id[first["id"]]["status"] == "offline"
+        assert app.runtime_by_id == {}
         assert app.status_tree.item(first["id"], "values") == (
-            "未开播",
+            "待启动",
             "界面测试主播",
-            "08-25 18:00",
-            "fake",
+            "",
+            "等待首次检测",
         )
     finally:
         root.destroy()
