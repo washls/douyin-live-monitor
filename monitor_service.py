@@ -33,6 +33,7 @@ class MonitorService:
         check_interval: int = 30,
         max_concurrent_checks: int = 2,
         startup_notify: bool = False,
+        enable_daily_intimacy_reminder: bool = True,
         on_event: Optional[EventCallback] = None,
     ):
         self.streamers = [dict(entry) for entry in streamers]
@@ -44,6 +45,9 @@ class MonitorService:
         if self.max_concurrent_checks < 1 or self.max_concurrent_checks > 8:
             raise ValueError("max_concurrent_checks 必须在 1 到 8 之间")
         self.startup_notify = bool(startup_notify)
+        self.enable_daily_intimacy_reminder = bool(
+            enable_daily_intimacy_reminder
+        )
         self.on_event = on_event
 
         self.running = False
@@ -56,6 +60,8 @@ class MonitorService:
         self._next_due: Dict[str, float] = {}
         self._executor: Optional[ThreadPoolExecutor] = None
         self._stopped_emitted = False
+        self._daily_reminder_date = ""
+        self._daily_reminder_minutes_sent: set[int] = set()
 
         for entry in self.streamers:
             streamer_id = str(entry["id"])
@@ -66,6 +72,8 @@ class MonitorService:
                 "nickname": entry.get("label", ""),
                 "status": "pending",
                 "method": "",
+                "room_id": "",
+                "title": "",
                 "last_check": "",
                 "last_error": "",
                 "check_count": 0,
@@ -195,6 +203,51 @@ class MonitorService:
             ),
         )
 
+    def _check_daily_intimacy_reminder(self) -> None:
+        """Send one reminder per minute containing every known live streamer."""
+        if not self.enable_daily_intimacy_reminder or not self._workers:
+            return
+        now = datetime.now()
+        minute = now.minute
+        if now.hour != 23 or minute not in (57, 58, 59):
+            return
+        today = now.strftime("%Y-%m-%d")
+        if self._daily_reminder_date != today:
+            self._daily_reminder_date = today
+            self._daily_reminder_minutes_sent.clear()
+        if minute in self._daily_reminder_minutes_sent:
+            return
+
+        with self._lock:
+            live_streamers = [
+                {
+                    "nickname": runtime["nickname"] or runtime["label"] or streamer_id,
+                    "room_id": runtime["room_id"],
+                    "title": runtime["title"],
+                }
+                for streamer_id, runtime in self._runtime.items()
+                if streamer_id in self._workers and runtime["status"] == "live"
+            ]
+        if not live_streamers:
+            return
+
+        notifier = next(iter(self._workers.values())).notifier
+        logger.info(
+            "[亲密度提醒] 23:%s 汇总 %s 位直播主播",
+            minute,
+            len(live_streamers),
+        )
+        success = notifier.send_daily_intimacy_reminder_for_streamers(
+            streamers=live_streamers,
+            minute=minute,
+        )
+        if success or notifier.delivery_unknown:
+            self._daily_reminder_minutes_sent.add(minute)
+        if success:
+            logger.info("[OK] 汇总亲密度提醒已发送 (23:%s)", minute)
+        else:
+            logger.error("[FAIL] 汇总亲密度提醒发送失败 (23:%s)", minute)
+
     def check_all_once(self) -> Dict[str, Dict[str, Any]]:
         """Prepare and check every valid streamer once."""
         self.prepare_all()
@@ -221,6 +274,7 @@ class MonitorService:
                     self._record_success(streamer_id, result)
                 except Exception as exc:
                     self._record_error(streamer_id, exc)
+        self._check_daily_intimacy_reminder()
         return results
 
     def run(self) -> bool:
@@ -302,16 +356,20 @@ class MonitorService:
             future.add_done_callback(lambda _future: self._wake_event.set())
 
     def _collect_finished(self) -> None:
+        collected = False
         for future, streamer_id in list(self._futures.items()):
             if not future.done():
                 continue
             del self._futures[future]
+            collected = True
             try:
                 result = future.result()
                 self._record_success(streamer_id, result)
             except Exception as exc:
                 self._record_error(streamer_id, exc)
             self._next_due[streamer_id] = time.monotonic() + self.check_interval
+        if collected:
+            self._check_daily_intimacy_reminder()
 
     def _record_success(self, streamer_id: str, result: Mapping[str, Any]) -> None:
         worker = self._workers[streamer_id]
@@ -329,6 +387,8 @@ class MonitorService:
             runtime["nickname"] = nickname
             runtime["status"] = "live" if is_live else "offline"
             runtime["method"] = method
+            runtime["room_id"] = str(result.get("room_id") or "")
+            runtime["title"] = str(result.get("title") or "")
             runtime["last_check"] = now_text
             runtime["last_error"] = ""
             runtime["check_count"] += 1

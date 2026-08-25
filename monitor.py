@@ -563,11 +563,20 @@ def prompt_target_url() -> str:
 class DouyinLiveMonitor:
     """Main monitor that orchestrates detection and notification."""
 
-    def __init__(self, config: Dict[str, Any], target_url: str = "", debug: bool = False):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        target_url: str = "",
+        debug: bool = False,
+        daily_reminder_managed_externally: bool = False,
+    ):
         self.config = config
         self.target_url = target_url or config.get("target_url", "")
         self.check_interval = config.get("check_interval", 30)
         self.notify_on_end = config.get("notify_on_stream_end", True)
+        self.daily_reminder_managed_externally = bool(
+            daily_reminder_managed_externally
+        )
 
         if not self.target_url:
             logger.error("未设置目标主播链接")
@@ -683,6 +692,8 @@ class DouyinLiveMonitor:
         Each minute slot is sent at most once per day.
         """
         if not self.config.get("enable_daily_intimacy_reminder", True):
+            return
+        if self.daily_reminder_managed_externally:
             return
 
         now = datetime.now()
@@ -1195,6 +1206,7 @@ def main():
             dict(config),
             target_url=entry["url"],
             debug=args.debug,
+            daily_reminder_managed_externally=True,
         )
 
     try:
@@ -1204,6 +1216,9 @@ def main():
             check_interval=config.get("check_interval", 30),
             max_concurrent_checks=config.get("max_concurrent_checks", 2),
             startup_notify=config.get("startup_notify", False),
+            enable_daily_intimacy_reminder=config.get(
+                "enable_daily_intimacy_reminder", True
+            ),
         )
     except (TypeError, ValueError) as exc:
         logger.error(f"监控参数无效: {exc}")

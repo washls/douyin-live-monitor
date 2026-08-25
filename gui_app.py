@@ -1240,7 +1240,10 @@ class MonitorGui:
 
         def worker_factory(entry: Mapping[str, Any]):
             return monitor.DouyinLiveMonitor(
-                dict(self.config), target_url=entry["url"], debug=self.debug
+                dict(self.config),
+                target_url=entry["url"],
+                debug=self.debug,
+                daily_reminder_managed_externally=True,
             )
 
         try:
@@ -1250,6 +1253,9 @@ class MonitorGui:
                 check_interval=self.config["check_interval"],
                 max_concurrent_checks=self.config["max_concurrent_checks"],
                 startup_notify=self.config.get("startup_notify", False),
+                enable_daily_intimacy_reminder=self.config.get(
+                    "enable_daily_intimacy_reminder", True
+                ),
                 on_event=self.event_queue.put,
             )
         except (TypeError, ValueError) as exc:

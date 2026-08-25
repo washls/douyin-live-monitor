@@ -8,7 +8,7 @@ API docs: https://doc2.ft07.com/zh/serverchan3
 import logging
 import re
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import requests
 
@@ -349,6 +349,57 @@ class ServerChanNotifier:
             desp=desp,
             tags="抖音直播|亲密度提醒",
             short=f"⏰{minute_label} 亲密度即将刷新 - {nickname} 直播中",
+        )
+
+    def send_daily_intimacy_reminder_for_streamers(
+        self,
+        streamers: Sequence[Mapping[str, Any]],
+        minute: int,
+    ) -> bool:
+        """Send one daily reminder covering all currently live streamers."""
+        live_streamers = list(streamers)
+        if not live_streamers:
+            return False
+        if len(live_streamers) == 1:
+            item = live_streamers[0]
+            return self.send_daily_intimacy_reminder(
+                nickname=str(item.get("nickname") or "未知主播"),
+                minute=minute,
+                room_id=str(item.get("room_id") or ""),
+                title=str(item.get("title") or ""),
+            )
+
+        remaining = 60 - minute
+        md_parts = [
+            "⏰ **每日亲密度刷新提醒**",
+            "",
+            f"当前有 **{len(live_streamers)} 位主播** 正在直播：",
+            "",
+        ]
+        for item in live_streamers:
+            nickname = str(item.get("nickname") or "未知主播")
+            room_id = str(item.get("room_id") or "")
+            title = str(item.get("title") or "")
+            live_url = f"https://live.douyin.com/{room_id}" if room_id else ""
+            line = f"- **{nickname}**"
+            if title:
+                line += f"：{title}"
+            if live_url:
+                line += f" [进入直播间]({live_url})"
+            md_parts.append(line)
+        md_parts.extend(
+            [
+                "",
+                f"距离今日亲密度刷新还剩 **{remaining} 分钟**。",
+                "",
+                f"提醒时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            ]
+        )
+        return self.send(
+            title=f"⏰ {len(live_streamers)} 位主播正在直播，亲密度即将刷新",
+            desp="\n".join(md_parts),
+            tags="抖音直播|亲密度提醒",
+            short=f"23:{minute} 亲密度即将刷新，{len(live_streamers)} 位主播直播中",
         )
 
     def verify_connection(self) -> bool:

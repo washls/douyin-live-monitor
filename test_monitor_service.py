@@ -17,9 +17,15 @@ class FakeState:
 class FakeNotifier:
     def __init__(self):
         self.messages = []
+        self.daily_messages = []
+        self.delivery_unknown = False
 
     def send(self, title, desp=""):
         self.messages.append((title, desp))
+        return True
+
+    def send_daily_intimacy_reminder_for_streamers(self, streamers, minute):
+        self.daily_messages.append((list(streamers), minute))
         return True
 
 
@@ -193,6 +199,95 @@ def test_startup_notification_is_aggregated_into_one_post():
     assert "已启动" in title
     assert "主播甲" in body
     assert "主播乙" in body
+
+
+def test_daily_intimacy_reminder_is_aggregated_once_per_minute(monkeypatch):
+    entries = [
+        streamer("one", "主播甲"),
+        streamer("two", "主播乙"),
+        streamer("offline", "未开播主播"),
+    ]
+    workers = {}
+
+    def factory(entry):
+        worker = FakeWorker(entry)
+        workers[entry["id"]] = worker
+        return worker
+
+    service = MonitorService(
+        entries,
+        worker_factory=factory,
+        enable_daily_intimacy_reminder=True,
+    )
+    service.prepare_all()
+    service._record_success(
+        "one",
+        {
+            "nickname": "主播甲",
+            "is_live": True,
+            "method": "api",
+            "room_id": "101",
+            "title": "甲的直播间",
+        },
+    )
+    service._record_success(
+        "two",
+        {
+            "nickname": "主播乙",
+            "is_live": True,
+            "method": "api",
+            "room_id": "202",
+            "title": "乙的直播间",
+        },
+    )
+    service._record_success(
+        "offline",
+        {"nickname": "未开播主播", "is_live": False, "method": "api"},
+    )
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime(2026, 8, 26, 23, 57, 10)
+
+    monkeypatch.setattr("monitor_service.datetime", FixedDateTime)
+
+    service._check_daily_intimacy_reminder()
+    service._check_daily_intimacy_reminder()
+
+    all_daily_messages = [
+        message
+        for worker in workers.values()
+        for message in worker.notifier.daily_messages
+    ]
+    assert len(all_daily_messages) == 1
+    live_streamers, minute = all_daily_messages[0]
+    assert minute == 57
+    assert [item["nickname"] for item in live_streamers] == ["主播甲", "主播乙"]
+    assert all(item["nickname"] != "未开播主播" for item in live_streamers)
+
+
+def test_daily_intimacy_reminder_respects_disabled_setting(monkeypatch):
+    worker = FakeWorker(streamer("one", "主播甲"))
+    service = MonitorService(
+        [streamer("one", "主播甲")],
+        worker_factory=lambda _entry: worker,
+        enable_daily_intimacy_reminder=False,
+    )
+    service.prepare_all()
+    service._record_success(
+        "one", {"nickname": "主播甲", "is_live": True, "method": "api"}
+    )
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime(2026, 8, 26, 23, 57, 10)
+
+    monkeypatch.setattr("monitor_service.datetime", FixedDateTime)
+    service._check_daily_intimacy_reminder()
+
+    assert worker.notifier.daily_messages == []
 
 
 def test_ten_errors_suspend_only_the_failing_worker():
