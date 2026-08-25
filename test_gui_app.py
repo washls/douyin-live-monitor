@@ -33,6 +33,10 @@ def test_high_dpi_prefers_per_monitor_v2(monkeypatch):
 def test_high_dpi_is_enabled_before_tk_window_creation(monkeypatch):
     calls = []
 
+    class FakeApp:
+        def show_window(self):
+            calls.append("show")
+
     class FakeRoot:
         def withdraw(self):
             calls.append("withdraw")
@@ -63,11 +67,42 @@ def test_high_dpi_is_enabled_before_tk_window_creation(monkeypatch):
 
     monkeypatch.setattr(gui_app, "enable_windows_high_dpi", lambda: calls.append("dpi"))
     monkeypatch.setattr(gui_app.tk, "Tk", lambda: calls.append("tk") or FakeRoot())
-    monkeypatch.setattr(gui_app, "MonitorGui", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gui_app, "MonitorGui", lambda *_args, **_kwargs: FakeApp())
 
     gui_app.run_gui()
 
     assert calls[:2] == ["dpi", "tk"]
+
+
+@pytest.mark.parametrize(
+    ("work_size", "scale", "expected_size", "compact"),
+    [
+        ((1920, 1040), 1.0, (1080, 700), False),
+        ((2560, 1400), 1.5, (1620, 1050), False),
+        ((3840, 2080), 2.0, (2160, 1400), False),
+        ((1366, 728), 1.25, (1350, 728), True),
+        ((1920, 1040), 2.0, (1920, 1040), True),
+    ],
+)
+def test_window_metrics_scale_and_stay_inside_work_area(
+    work_size, scale, expected_size, compact
+):
+    metrics = gui_app.calculate_window_metrics(*work_size, scale)
+
+    assert (metrics["width"], metrics["height"]) == expected_size
+    assert metrics["width"] <= work_size[0]
+    assert metrics["height"] <= work_size[1]
+    assert metrics["min_width"] <= metrics["width"]
+    assert metrics["min_height"] <= metrics["height"]
+    assert metrics["compact"] is compact
+
+
+def test_window_metrics_clamp_invalid_scale_and_large_requested_size():
+    metrics = gui_app.calculate_window_metrics(1280, 720, 20, 5000, 5000)
+
+    assert metrics["width"] == 1280
+    assert metrics["height"] == 720
+    assert metrics["compact"] is True
 
 
 def valid_settings():
@@ -193,9 +228,11 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         app = MonitorGui(root, config_path)
         root.update_idletasks()
 
+        assert 0.75 <= app.display_scale <= 4.0
         assert app.selected_streamer_id == first["id"]
         assert app.streamer_label_var.get() == "界面测试主播"
         assert app.status_tree.item(first["id"], "values")[3] == "等待首次检测"
+        assert app.settings_canvas.winfo_exists()
         app._start_monitoring()
         assert finished.wait(timeout=1)
         assert app.service_thread is not None

@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.3.0-orange.svg" alt="Version 1.3.0">
+  <img src="https://img.shields.io/badge/version-1.3.1-orange.svg" alt="Version 1.3.1">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
 
@@ -30,9 +30,13 @@
 - 🎯 **图形化配置**：表单就地校验，推送地址默认隐藏并只保存在本机
 - 📦 **Windows EXE**：Releases 提供打包好的可执行文件，无需安装 Python
 
-## 🆕 v1.3.0
+## 🆕 v1.3.1
 
-这一版增加了浅色 Windows 原生风格的 GUI。双击 EXE 会直接打开图形界面，可以添加、编辑、停用或删除主播，设置检测与提醒参数，并查看每个任务的运行状态。带参数启动 EXE 时仍进入原有命令行模式，现有脚本不需要修改。如需回退，可以继续使用 [v1.2.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.2.0)。
+这一版修复了 Windows 缩放后 GUI 发糊的问题，并适配常见分辨率和 100% 至 200% 显示缩放。窗口会按当前显示器 DPI 调整尺寸，且不会超过任务栏以上的可用区域；空间不足时自动使用紧凑布局，设置页面可以滚动。如需回退，可以继续使用 [v1.3.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.3.0)。
+
+## v1.3.0
+
+这一版增加了浅色 Windows 原生风格的 GUI。双击 EXE 会直接打开图形界面，可以添加、编辑、停用或删除主播，设置检测与提醒参数，并查看每个任务的运行状态。带参数启动 EXE 时仍进入原有命令行模式，现有脚本不需要修改。
 
 ## v1.2.0
 
@@ -42,7 +46,7 @@
 
 ### Windows 直接运行
 
-从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.3.0.exe`。双击后会打开图形界面；需要命令行模式时，可以在终端中给同一个 EXE 传入原有参数。
+从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.3.1.exe`。双击后会打开图形界面；需要命令行模式时，可以在终端中给同一个 EXE 传入原有参数。
 
 ### 从源码运行
 
@@ -237,6 +241,7 @@ python monitor.py --remove-streamer STREAMER_ID --yes
 douyin-live-monitor/
 ├── gui_entry.py         # EXE 统一入口，双击进入 GUI，带参数进入 CLI
 ├── gui_app.py           # Tkinter/ttk 图形界面与后台服务协调
+├── windows-dpi.manifest # Windows Per Monitor V2 高清缩放声明
 ├── monitor.py           # 主程序入口 & 交互式引导
 ├── monitor_service.py   # 多主播调度、状态汇总与统一停止
 ├── streamer_config.py   # 主播列表校验、迁移与原子保存
@@ -303,7 +308,7 @@ WantedBy=multi-user.target
 
 <details>
 <summary><b>如何回退到上一个版本？</b></summary>
-从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.2.0">v1.2.0 Release</a> 重新下载旧版 EXE。v1.3.0 沿用原有配置结构，没有不可逆迁移。
+从 <a href="https://github.com/washls/douyin-live-monitor/releases/tag/v1.3.0">v1.3.0 Release</a> 重新下载旧版 EXE。v1.3.1 沿用原有配置结构，没有不可逆迁移。
 </details>
 
 ## ⚠️ 免责声明

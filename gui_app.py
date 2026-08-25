@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Dict, Mapping
@@ -48,6 +49,47 @@ STATUS_TEXT = {
     "stopped": "已停止",
 }
 
+BASE_DPI = 96
+BASE_WINDOW_SIZE = (1080, 700)
+BASE_MIN_WINDOW_SIZE = (900, 600)
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = (
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    )
+
+
+def calculate_window_metrics(
+    work_width: int,
+    work_height: int,
+    scale: float,
+    requested_width: int = 0,
+    requested_height: int = 0,
+) -> Dict[str, int | bool]:
+    """Return bounded DPI-scaled dimensions for the current monitor."""
+    safe_scale = min(max(float(scale), 0.75), 4.0)
+    work_width = max(1, int(work_width))
+    work_height = max(1, int(work_height))
+    desired_width = max(round(BASE_WINDOW_SIZE[0] * safe_scale), requested_width)
+    desired_height = max(round(BASE_WINDOW_SIZE[1] * safe_scale), requested_height)
+    width = min(desired_width, work_width)
+    height = min(desired_height, work_height)
+    min_width = min(round(BASE_MIN_WINDOW_SIZE[0] * safe_scale), width)
+    min_height = min(round(BASE_MIN_WINDOW_SIZE[1] * safe_scale), height)
+    effective_width = work_width / safe_scale
+    effective_height = work_height / safe_scale
+    return {
+        "width": width,
+        "height": height,
+        "min_width": min_width,
+        "min_height": min_height,
+        "compact": effective_width < 1000 or effective_height < 650,
+    }
+
 
 def enable_windows_high_dpi() -> bool:
     """Enable sharp per-monitor rendering before the first Tk window exists."""
@@ -56,8 +98,13 @@ def enable_windows_high_dpi() -> bool:
 
     try:
         user32 = ctypes.windll.user32
-        current_context = user32.GetThreadDpiAwarenessContext()
-        if user32.GetAwarenessFromDpiAwarenessContext(current_context) == 2:
+        get_context = user32.GetThreadDpiAwarenessContext
+        get_context.restype = ctypes.c_void_p
+        get_awareness = user32.GetAwarenessFromDpiAwarenessContext
+        get_awareness.argtypes = [ctypes.c_void_p]
+        get_awareness.restype = ctypes.c_int
+        current_context = get_context()
+        if get_awareness(current_context) == 2:
             return True
     except (AttributeError, OSError, TypeError, ValueError):
         pass
@@ -81,6 +128,50 @@ def enable_windows_high_dpi() -> bool:
         return bool(ctypes.windll.user32.SetProcessDPIAware())
     except (AttributeError, OSError, TypeError, ValueError):
         return False
+
+
+def get_display_scale(root: tk.Misc) -> float:
+    """Read the DPI scale for the monitor that currently owns the root window."""
+    if sys.platform == "win32":
+        try:
+            get_dpi_for_window = ctypes.windll.user32.GetDpiForWindow
+            get_dpi_for_window.argtypes = [wintypes.HWND]
+            get_dpi_for_window.restype = wintypes.UINT
+            dpi = get_dpi_for_window(root.winfo_id())
+            if dpi:
+                return min(max(dpi / BASE_DPI, 0.75), 4.0)
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+    try:
+        return min(max(float(root.winfo_fpixels("1i")) / BASE_DPI, 0.75), 4.0)
+    except (tk.TclError, TypeError, ValueError):
+        return 1.0
+
+
+def get_work_area(root: tk.Misc) -> tuple[int, int, int, int]:
+    """Return the current monitor's usable work area in physical pixels."""
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            monitor_from_window = user32.MonitorFromWindow
+            monitor_from_window.argtypes = [wintypes.HWND, wintypes.DWORD]
+            monitor_from_window.restype = wintypes.HANDLE
+            get_monitor_info = user32.GetMonitorInfoW
+            get_monitor_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)]
+            get_monitor_info.restype = wintypes.BOOL
+            monitor = monitor_from_window(root.winfo_id(), 2)
+            info = _MonitorInfo(cbSize=ctypes.sizeof(_MonitorInfo))
+            if monitor and get_monitor_info(monitor, ctypes.byref(info)):
+                work = info.rcWork
+                return (
+                    work.left,
+                    work.top,
+                    work.right - work.left,
+                    work.bottom - work.top,
+                )
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
 def status_text(status: str) -> str:
@@ -155,29 +246,62 @@ class MonitorGui:
 
     def _configure_window(self) -> None:
         self.root.title(f"抖音直播监听器  v{monitor.APP_VERSION}")
-        self.root.geometry("1080x700")
-        self.root.minsize(900, 600)
+        self.display_scale = get_display_scale(self.root)
+        self.work_area = get_work_area(self.root)
+        initial = calculate_window_metrics(
+            self.work_area[2], self.work_area[3], self.display_scale
+        )
+        self.compact_layout = bool(initial["compact"])
+        self.layout_density = 0.82 if self.compact_layout else 1.0
+        self.root.geometry(f"{initial['width']}x{initial['height']}")
+        self.root.minsize(initial["min_width"], initial["min_height"])
         self.root.configure(background=COLORS["canvas"])
         self.root.option_add("*Font", "{Segoe UI} 10")
         self._app_icon = self._create_app_icon()
         self.root.iconphoto(True, self._app_icon)
 
+    def _px(self, value: int | float) -> int:
+        """Scale fixed visual dimensions while preserving compact density."""
+        return max(1, round(float(value) * self.display_scale * self.layout_density))
+
+    def show_window(self) -> None:
+        """Fit the completed layout inside the current monitor's work area."""
+        self.root.update_idletasks()
+        work_x, work_y, work_width, work_height = self.work_area
+        metrics = calculate_window_metrics(
+            work_width,
+            work_height,
+            self.display_scale,
+            self.root.winfo_reqwidth(),
+            self.root.winfo_reqheight(),
+        )
+        width = int(metrics["width"])
+        height = int(metrics["height"])
+        x = work_x + max(0, (work_width - width) // 2)
+        y = work_y + max(0, (work_height - height) // 2)
+        self.root.minsize(metrics["min_width"], metrics["min_height"])
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
     def _create_app_icon(self) -> tk.PhotoImage:
         """Create a small flat live-status mark without an external asset."""
-        icon = tk.PhotoImage(width=32, height=32)
+        size = max(32, self._px(32))
+        icon = tk.PhotoImage(width=size, height=size)
         blue = COLORS["accent"]
         white = "#ffffff"
         red = COLORS["danger"]
-        for y in range(3, 29):
-            inset = 2 if y in {3, 28} else 1 if y in {4, 27} else 0
-            icon.put(blue, to=(3 + inset, y, 29 - inset, y + 1))
-        for y in range(9, 23):
-            for x in range(9, 23):
-                distance = (x - 15.5) ** 2 + (y - 15.5) ** 2
-                if 31 <= distance <= 46:
-                    icon.put(white, (x, y))
-                elif distance <= 8:
-                    icon.put(red, (x, y))
+        for y in range(size):
+            source_y = (y + 0.5) * 32 / size
+            if 3 <= source_y < 29:
+                for x in range(size):
+                    source_x = (x + 0.5) * 32 / size
+                    if 3 <= source_x < 29:
+                        color = blue
+                        distance = (source_x - 16) ** 2 + (source_y - 16) ** 2
+                        if 31 <= distance <= 46:
+                            color = white
+                        elif distance <= 8:
+                            color = red
+                        icon.put(color, (x, y))
         return icon
 
     def _configure_styles(self) -> None:
@@ -191,7 +315,7 @@ class MonitorGui:
             "Title.TLabel",
             background=COLORS["canvas"],
             foreground=COLORS["text"],
-            font=("Segoe UI Semibold", 18),
+            font=("Segoe UI Semibold", 16 if self.compact_layout else 18),
         )
         style.configure(
             "Subtitle.TLabel",
@@ -217,9 +341,11 @@ class MonitorGui:
             foreground=COLORS["text"],
             font=("Segoe UI Semibold", 10),
         )
-        style.configure("Primary.TButton", padding=(16, 8))
-        style.configure("Action.TButton", padding=(12, 7))
-        style.configure("Treeview", rowheight=34, font=("Segoe UI", 9))
+        style.configure(
+            "Primary.TButton", padding=(self._px(16), self._px(8))
+        )
+        style.configure("Action.TButton", padding=(self._px(12), self._px(7)))
+        style.configure("Treeview", rowheight=self._px(34), font=("Segoe UI", 9))
         style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9))
         style.map(
             "Treeview",
@@ -248,7 +374,11 @@ class MonitorGui:
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
-        header = ttk.Frame(self.root, style="App.TFrame", padding=(24, 18, 24, 14))
+        header = ttk.Frame(
+            self.root,
+            style="App.TFrame",
+            padding=(self._px(24), self._px(18), self._px(24), self._px(14)),
+        )
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(1, weight=1)
         ttk.Label(header, text="抖音直播监听器", style="Title.TLabel").grid(
@@ -258,10 +388,16 @@ class MonitorGui:
             header,
             text=f"v{monitor.APP_VERSION}  ·  多主播监控",
             style="Subtitle.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ).grid(row=1, column=0, sticky="w", pady=(self._px(3), 0))
 
         status_box = ttk.Frame(header, style="App.TFrame")
-        status_box.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 18))
+        status_box.grid(
+            row=0,
+            column=1,
+            rowspan=2,
+            sticky="e",
+            padx=(self._px(16), self._px(18)),
+        )
         self.status_dot = tk.Label(
             status_box,
             text="●",
@@ -269,7 +405,9 @@ class MonitorGui:
             bg=COLORS["canvas"],
             font=("Segoe UI", 12),
         )
-        self.status_dot.grid(row=0, column=0, rowspan=2, padx=(0, 7))
+        self.status_dot.grid(
+            row=0, column=0, rowspan=2, padx=(0, self._px(7))
+        )
         ttk.Label(status_box, textvariable=self.global_status_var, style="Subtitle.TLabel").grid(
             row=0, column=1, sticky="e"
         )
@@ -287,16 +425,34 @@ class MonitorGui:
         self.start_button.grid(row=0, column=2, rowspan=2, sticky="e")
 
         paned = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
-        paned.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 14))
+        paned.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=self._px(20),
+            pady=(0, self._px(14)),
+        )
 
-        sidebar = ttk.Frame(paned, style="Sidebar.TFrame", padding=14, width=350)
-        content = ttk.Frame(paned, style="Surface.TFrame", padding=14)
+        sidebar_width = 280 if self.compact_layout else 350
+        sidebar = ttk.Frame(
+            paned,
+            style="Sidebar.TFrame",
+            padding=self._px(14),
+            width=self._px(sidebar_width),
+        )
+        content = ttk.Frame(
+            paned, style="Surface.TFrame", padding=self._px(14)
+        )
         paned.add(sidebar, weight=1)
         paned.add(content, weight=2)
         self._build_sidebar(sidebar)
         self._build_content(content)
 
-        footer = ttk.Frame(self.root, style="App.TFrame", padding=(22, 0, 22, 12))
+        footer = ttk.Frame(
+            self.root,
+            style="App.TFrame",
+            padding=(self._px(22), 0, self._px(22), self._px(12)),
+        )
         footer.grid(row=2, column=0, sticky="ew")
         footer.grid_columnconfigure(0, weight=1)
         ttk.Label(
@@ -314,7 +470,7 @@ class MonitorGui:
         parent.grid_rowconfigure(1, weight=1)
         parent.grid_columnconfigure(0, weight=1)
         title_row = ttk.Frame(parent, style="Sidebar.TFrame")
-        title_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        title_row.grid(row=0, column=0, sticky="ew", pady=(0, self._px(10)))
         title_row.grid_columnconfigure(0, weight=1)
         ttk.Label(
             title_row,
@@ -336,8 +492,12 @@ class MonitorGui:
         )
         self.streamer_tree.heading("status", text="状态")
         self.streamer_tree.heading("name", text="主播")
-        self.streamer_tree.column("status", width=76, minwidth=70, stretch=False)
-        self.streamer_tree.column("name", width=220, minwidth=140, stretch=True)
+        self.streamer_tree.column(
+            "status", width=self._px(76), minwidth=self._px(70), stretch=False
+        )
+        self.streamer_tree.column(
+            "name", width=self._px(220), minwidth=self._px(120), stretch=True
+        )
         self.streamer_tree.grid(row=1, column=0, sticky="nsew")
         self.streamer_tree.bind("<<TreeviewSelect>>", self._on_streamer_selected)
         sidebar_scroll = ttk.Scrollbar(
@@ -347,34 +507,48 @@ class MonitorGui:
         self.streamer_tree.configure(yscrollcommand=sidebar_scroll.set)
 
         actions = ttk.Frame(parent, style="Sidebar.TFrame")
-        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(self._px(12), 0),
+        )
         actions.grid_columnconfigure((0, 1), weight=1)
         self.new_button = ttk.Button(
             actions, text="新增主播", style="Action.TButton", command=self._new_streamer
         )
-        self.new_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.new_button.grid(
+            row=0, column=0, sticky="ew", padx=(0, self._px(5))
+        )
         self.remove_button = ttk.Button(
             actions,
             text="删除",
             style="Action.TButton",
             command=self._remove_selected_streamer,
         )
-        self.remove_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.remove_button.grid(
+            row=0, column=1, sticky="ew", padx=(self._px(5), 0)
+        )
 
     def _build_content(self, parent: ttk.Frame) -> None:
         parent.grid_rowconfigure(0, weight=1)
         parent.grid_columnconfigure(0, weight=1)
         self.notebook = ttk.Notebook(parent)
         self.notebook.grid(row=0, column=0, sticky="nsew")
-        status_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=16)
-        detail_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=16)
-        settings_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=16)
+        status_tab = ttk.Frame(
+            self.notebook, style="Surface.TFrame", padding=self._px(16)
+        )
+        detail_tab = ttk.Frame(
+            self.notebook, style="Surface.TFrame", padding=self._px(16)
+        )
+        settings_tab = ttk.Frame(self.notebook, style="Surface.TFrame")
         self.notebook.add(status_tab, text="运行状态")
         self.notebook.add(detail_tab, text="主播详情")
         self.notebook.add(settings_tab, text="监控设置")
         self._build_status_tab(status_tab)
         self._build_detail_tab(detail_tab)
-        self._build_settings_tab(settings_tab)
+        self._build_scrollable_settings_tab(settings_tab)
 
     def _build_status_tab(self, parent: ttk.Frame) -> None:
         parent.grid_rowconfigure(2, weight=1)
@@ -386,7 +560,12 @@ class MonitorGui:
             parent,
             text="每个主播独立检测，单个任务异常不会中断其他任务。",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(self._px(4), self._px(12)),
+        )
         self.status_tree = ttk.Treeview(
             parent,
             columns=("status", "name", "last_check", "detail"),
@@ -399,14 +578,24 @@ class MonitorGui:
             ("detail", "详情"),
         ):
             self.status_tree.heading(column, text=label)
-        self.status_tree.column("status", width=82, stretch=False)
-        self.status_tree.column("name", width=150, minwidth=110)
-        self.status_tree.column("last_check", width=112, stretch=False)
-        self.status_tree.column("detail", width=250, minwidth=160)
+        self.status_tree.column("status", width=self._px(82), stretch=False)
+        self.status_tree.column(
+            "name", width=self._px(150), minwidth=self._px(110)
+        )
+        self.status_tree.column("last_check", width=self._px(112), stretch=False)
+        self.status_tree.column(
+            "detail", width=self._px(250), minwidth=self._px(140)
+        )
         self.status_tree.grid(row=2, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.status_tree.yview)
         scroll.grid(row=2, column=1, sticky="ns")
-        self.status_tree.configure(yscrollcommand=scroll.set)
+        horizontal_scroll = ttk.Scrollbar(
+            parent, orient=tk.HORIZONTAL, command=self.status_tree.xview
+        )
+        horizontal_scroll.grid(row=3, column=0, sticky="ew")
+        self.status_tree.configure(
+            yscrollcommand=scroll.set, xscrollcommand=horizontal_scroll.set
+        )
         self.status_tree.tag_configure("live", foreground=COLORS["success"])
         self.status_tree.tag_configure("error", foreground=COLORS["danger"])
         self.status_tree.tag_configure("suspended", foreground=COLORS["warning"])
@@ -420,28 +609,66 @@ class MonitorGui:
             parent,
             text="选择左侧任务后编辑，或点击“新增主播”清空表单。",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 18))
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(self._px(4), self._px(18)),
+        )
         form = ttk.LabelFrame(
-            parent, text="任务配置", style="Surface.TLabelframe", padding=16
+            parent,
+            text="任务配置",
+            style="Surface.TLabelframe",
+            padding=self._px(16),
         )
         form.grid(row=2, column=0, sticky="ew")
         form.grid_columnconfigure(1, weight=1)
-        ttk.Label(form, text="本地 ID").grid(row=0, column=0, sticky="w", pady=7)
-        ttk.Entry(form, textvariable=self.streamer_id_var, state="readonly").grid(
-            row=0, column=1, sticky="ew", padx=(14, 0), pady=7
+        ttk.Label(form, text="本地 ID").grid(
+            row=0, column=0, sticky="w", pady=self._px(7)
         )
-        ttk.Label(form, text="显示名称").grid(row=1, column=0, sticky="w", pady=7)
+        ttk.Entry(form, textvariable=self.streamer_id_var, state="readonly").grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(self._px(14), 0),
+            pady=self._px(7),
+        )
+        ttk.Label(form, text="显示名称").grid(
+            row=1, column=0, sticky="w", pady=self._px(7)
+        )
         self.label_entry = ttk.Entry(form, textvariable=self.streamer_label_var)
-        self.label_entry.grid(row=1, column=1, sticky="ew", padx=(14, 0), pady=7)
-        ttk.Label(form, text="抖音链接").grid(row=2, column=0, sticky="w", pady=7)
+        self.label_entry.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(self._px(14), 0),
+            pady=self._px(7),
+        )
+        ttk.Label(form, text="抖音链接").grid(
+            row=2, column=0, sticky="w", pady=self._px(7)
+        )
         self.url_entry = ttk.Entry(form, textvariable=self.streamer_url_var)
-        self.url_entry.grid(row=2, column=1, sticky="ew", padx=(14, 0), pady=7)
+        self.url_entry.grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            padx=(self._px(14), 0),
+            pady=self._px(7),
+        )
         self.enabled_check = ttk.Checkbutton(
             form, text="启用此主播", variable=self.streamer_enabled_var
         )
-        self.enabled_check.grid(row=3, column=1, sticky="w", padx=(14, 0), pady=(8, 4))
+        self.enabled_check.grid(
+            row=3,
+            column=1,
+            sticky="w",
+            padx=(self._px(14), 0),
+            pady=(self._px(8), self._px(4)),
+        )
         action_row = ttk.Frame(parent, style="Surface.TFrame")
-        action_row.grid(row=3, column=0, sticky="e", pady=(16, 0))
+        action_row.grid(
+            row=3, column=0, sticky="e", pady=(self._px(16), 0)
+        )
         self.save_streamer_button = ttk.Button(
             action_row,
             text="保存主播",
@@ -449,6 +676,60 @@ class MonitorGui:
             command=self._save_streamer,
         )
         self.save_streamer_button.grid(row=0, column=0)
+
+    def _build_scrollable_settings_tab(self, parent: ttk.Frame) -> None:
+        """Keep all settings reachable on short or heavily scaled displays."""
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+        self.settings_canvas = tk.Canvas(
+            parent,
+            background=COLORS["surface"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        settings_scroll = ttk.Scrollbar(
+            parent, orient=tk.VERTICAL, command=self.settings_canvas.yview
+        )
+        self.settings_canvas.configure(yscrollcommand=settings_scroll.set)
+        self.settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scroll.grid(row=0, column=1, sticky="ns")
+
+        inner = ttk.Frame(
+            self.settings_canvas,
+            style="Surface.TFrame",
+            padding=self._px(16),
+        )
+        inner_window = self.settings_canvas.create_window(
+            (0, 0), window=inner, anchor="nw"
+        )
+        inner.bind(
+            "<Configure>",
+            lambda _event: self.settings_canvas.configure(
+                scrollregion=self.settings_canvas.bbox("all")
+            ),
+        )
+        self.settings_canvas.bind(
+            "<Configure>",
+            lambda event: self.settings_canvas.itemconfigure(
+                inner_window, width=event.width
+            ),
+        )
+        self._build_settings_tab(inner)
+
+        def bind_mousewheel(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", self._scroll_settings, add="+")
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        bind_mousewheel(inner)
+
+    def _scroll_settings(self, event: tk.Event) -> str | None:
+        bounds = self.settings_canvas.bbox("all")
+        if bounds and bounds[3] > self.settings_canvas.winfo_height():
+            direction = -1 if event.delta > 0 else 1
+            self.settings_canvas.yview_scroll(direction, "units")
+            return "break"
+        return None
 
     def _build_settings_tab(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -459,17 +740,27 @@ class MonitorGui:
             parent,
             text="保存后在下一次启动监控时生效。推送地址仅保存在本机。",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 14))
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(self._px(4), self._px(14)),
+        )
 
         push_frame = ttk.LabelFrame(
-            parent, text="Server酱³ 推送", style="Surface.TLabelframe", padding=14
+            parent,
+            text="Server酱³ 推送",
+            style="Surface.TLabelframe",
+            padding=self._px(14),
         )
         push_frame.grid(row=2, column=0, sticky="ew")
         push_frame.grid_columnconfigure(0, weight=1)
         self.push_entry = ttk.Entry(
             push_frame, textvariable=self.push_url_var, show="●"
         )
-        self.push_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.push_entry.grid(
+            row=0, column=0, sticky="ew", padx=(0, self._px(10))
+        )
         self.reveal_check = ttk.Checkbutton(
             push_frame,
             text="显示",
@@ -483,49 +774,82 @@ class MonitorGui:
             style="Action.TButton",
             command=self._test_push,
         )
-        self.test_push_button.grid(row=0, column=2, padx=(10, 0))
+        self.test_push_button.grid(
+            row=0, column=2, padx=(self._px(10), 0)
+        )
 
         timing = ttk.LabelFrame(
-            parent, text="检测与提醒", style="Surface.TLabelframe", padding=14
+            parent,
+            text="检测与提醒",
+            style="Surface.TLabelframe",
+            padding=self._px(14),
         )
-        timing.grid(row=3, column=0, sticky="ew", pady=(14, 0))
-        timing.grid_columnconfigure((1, 3), weight=1)
+        timing.grid(row=3, column=0, sticky="ew", pady=(self._px(14), 0))
+        timing.grid_columnconfigure(1, weight=1)
+        if not self.compact_layout:
+            timing.grid_columnconfigure(3, weight=1)
         self.setting_inputs = []
-        fields = (
-            ("检测间隔（秒）", self.check_interval_var, 0, 0),
-            ("重复提醒间隔（秒）", self.repeat_interval_var, 0, 2),
-            ("最多重复提醒", self.max_repeat_var, 1, 0),
-            ("并发检测数", self.max_concurrent_var, 1, 2),
-        )
+        if self.compact_layout:
+            fields = (
+                ("检测间隔（秒）", self.check_interval_var, 0, 0),
+                ("重复提醒间隔（秒）", self.repeat_interval_var, 1, 0),
+                ("最多重复提醒", self.max_repeat_var, 2, 0),
+                ("并发检测数", self.max_concurrent_var, 3, 0),
+            )
+        else:
+            fields = (
+                ("检测间隔（秒）", self.check_interval_var, 0, 0),
+                ("重复提醒间隔（秒）", self.repeat_interval_var, 0, 2),
+                ("最多重复提醒", self.max_repeat_var, 1, 0),
+                ("并发检测数", self.max_concurrent_var, 1, 2),
+            )
         for label, variable, row, column in fields:
             ttk.Label(timing, text=label).grid(
-                row=row, column=column, sticky="w", pady=7, padx=(0, 10)
+                row=row,
+                column=column,
+                sticky="w",
+                pady=self._px(7),
+                padx=(0, self._px(10)),
             )
             entry = ttk.Entry(timing, textvariable=variable, width=12)
-            entry.grid(row=row, column=column + 1, sticky="ew", pady=7, padx=(0, 20))
+            entry.grid(
+                row=row,
+                column=column + 1,
+                sticky="ew",
+                pady=self._px(7),
+                padx=(0, self._px(20)),
+            )
             self.setting_inputs.append(entry)
 
         options = ttk.Frame(parent, style="Surface.TFrame")
-        options.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        options.grid(row=4, column=0, sticky="ew", pady=(self._px(16), 0))
         self.notify_end_check = ttk.Checkbutton(
             options, text="下播时通知", variable=self.notify_end_var
         )
-        self.notify_end_check.grid(row=0, column=0, sticky="w", pady=4)
+        self.notify_end_check.grid(
+            row=0, column=0, sticky="w", pady=self._px(4)
+        )
         self.startup_check = ttk.Checkbutton(
             options, text="启动时发送汇总通知", variable=self.startup_notify_var
         )
-        self.startup_check.grid(row=1, column=0, sticky="w", pady=4)
+        self.startup_check.grid(
+            row=1, column=0, sticky="w", pady=self._px(4)
+        )
         self.daily_check = ttk.Checkbutton(
             options, text="启用每日亲密度提醒", variable=self.daily_reminder_var
         )
-        self.daily_check.grid(row=2, column=0, sticky="w", pady=4)
+        self.daily_check.grid(
+            row=2, column=0, sticky="w", pady=self._px(4)
+        )
         self.save_settings_button = ttk.Button(
             parent,
             text="保存设置",
             style="Primary.TButton",
             command=self._save_settings,
         )
-        self.save_settings_button.grid(row=5, column=0, sticky="e", pady=(16, 0))
+        self.save_settings_button.grid(
+            row=5, column=0, sticky="e", pady=(self._px(16), 0)
+        )
 
     def _load_settings_into_form(self) -> None:
         self.push_url_var.set(self.config.get("push_url", ""))
@@ -939,17 +1263,12 @@ def run_gui(config_path: Path | None = None, debug: bool = False) -> None:
     root = tk.Tk()
     root.withdraw()
     try:
-        MonitorGui(root, config_path or monitor.DEFAULT_CONFIG, debug=debug)
+        app = MonitorGui(root, config_path or monitor.DEFAULT_CONFIG, debug=debug)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         messagebox.showerror("无法启动程序", str(exc), parent=root)
         root.destroy()
         return
-    root.update_idletasks()
-    width = max(root.winfo_width(), 1080)
-    height = max(root.winfo_height(), 700)
-    x = max(0, (root.winfo_screenwidth() - width) // 2)
-    y = max(0, (root.winfo_screenheight() - height) // 2)
-    root.geometry(f"{width}x{height}+{x}+{y}")
+    app.show_window()
     root.deiconify()
     root.mainloop()
 
