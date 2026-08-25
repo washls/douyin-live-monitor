@@ -82,6 +82,9 @@ _MAX_HTML_CACHE_SIZE = 3
 _POOL_CONNECTIONS = 2
 _POOL_MAXSIZE = 2
 
+# Avoid rebuilding a persistently rejected session on every polling round.
+_AUTH_REFRESH_COOLDOWN_SECONDS = 60.0
+
 # Default browser-like headers
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -105,6 +108,11 @@ DEFAULT_HEADERS = {
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
 }
+
+
+def compact_log_preview(value: Any, limit: int = 240) -> str:
+    """Return a bounded single-line preview for persistent and GUI logs."""
+    return " ".join(str(value or "").split())[:limit].rstrip()
 
 # ===== Path Helpers (supports PyInstaller frozen exe) =====
 
@@ -144,27 +152,14 @@ class DouyinClient:
     def __init__(
         self, headers: Optional[Dict[str, str]] = None, debug: bool = False
     ):
-        self.session = requests.Session()
-        self.session.headers.update(headers or DEFAULT_HEADERS)
-        # Disable system proxy — on some Windows machines, stray proxy settings
-        # (e.g. HTTP_PROXY env var, IE proxy config) cause connection refused
-        # errors even when no proxy is actually running.
-        self.session.trust_env = False
-        self.session.proxies = {"http": None, "https": None}
-
-        # Shrink the connection pool — we hit at most 2 hosts concurrently
-        # (douyin.com + live.douyin.com).  Default is 10 per host.
-        adapter = HTTPAdapter(
-            pool_connections=_POOL_CONNECTIONS,
-            pool_maxsize=_POOL_MAXSIZE,
-        )
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        self._session_headers = dict(headers or DEFAULT_HEADERS)
+        self.session = self._build_session()
 
         self._cached_sec_uid: Optional[str] = None
         self._cached_room_id: str = ""
         self._cached_user_info: Dict[str, Any] = {}
         self._cookies_initialized = False
+        self._last_auth_refresh_at = float("-inf")
         self._ies_share_url: str = ""
         # Short-link redirects are stable during one monitor run. Caching the
         # target avoids repeated HEAD requests on every polling round.
@@ -175,6 +170,49 @@ class DouyinClient:
         if self.debug:
             os.makedirs(DEBUG_DIR, exist_ok=True)
             logger.info(f"[DEBUG] 调试输出目录: {DEBUG_DIR}")
+
+    def _build_session(self) -> requests.Session:
+        """Create one isolated, bounded HTTP session for this streamer."""
+        session = requests.Session()
+        session.headers.update(self._session_headers)
+        # Disable system proxy — on some Windows machines, stray proxy settings
+        # (e.g. HTTP_PROXY env var, IE proxy config) cause connection refused
+        # errors even when no proxy is actually running.
+        session.trust_env = False
+        session.proxies = {"http": None, "https": None}
+
+        # Shrink the connection pool — we hit at most 2 hosts concurrently
+        # (douyin.com + live.douyin.com).  Default is 10 per host.
+        adapter = HTTPAdapter(
+            pool_connections=_POOL_CONNECTIONS,
+            pool_maxsize=_POOL_MAXSIZE,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _refresh_auth_session(self) -> bool:
+        """Rebuild only this streamer's rejected session, with a cooldown."""
+        now = time.monotonic()
+        elapsed = now - self._last_auth_refresh_at
+        if elapsed < _AUTH_REFRESH_COOLDOWN_SECONDS:
+            logger.warning(
+                "[API检测] 会话刚刷新过，跳过重复刷新 "
+                f"(cooldown={_AUTH_REFRESH_COOLDOWN_SECONDS:.0f}s)"
+            )
+            return False
+
+        self._last_auth_refresh_at = now
+        previous_session = self.session
+        self.session = self._build_session()
+        self._cookies_initialized = False
+        try:
+            previous_session.close()
+        except (AttributeError, OSError):
+            pass
+        logger.info("[API检测] 空响应，正在重建当前主播会话")
+        self._ensure_cookies()
+        return True
 
     def _dump_debug(self, name: str, content: str, is_json: bool = False) -> None:
         """Save raw response to disk for debugging."""
@@ -212,14 +250,14 @@ class DouyinClient:
             del self._profile_html_cache[oldest]
         self._profile_html_cache[url] = html
 
-    def _ensure_cookies(self) -> None:
+    def _ensure_cookies(self) -> bool:
         """Obtain initial cookies by visiting Douyin and live.douyin.com.
 
         The ttwid cookie from live.douyin.com is ESSENTIAL for API requests.
         Without it, the API returns empty responses even with valid a_bogus.
         """
         if self._cookies_initialized:
-            return
+            return "ttwid" in self.session.cookies
 
         try:
             logger.info("获取初始 Cookie...")
@@ -263,9 +301,11 @@ class DouyinClient:
                 )
 
             self._cookies_initialized = True
+            return "ttwid" in self.session.cookies
         except Exception as e:
             logger.warning(f"Cookie 初始化失败: {e}，API 检测可能失效")
             self._cookies_initialized = True  # Don't keep retrying
+            return False
 
     def resolve_short_link(self, short_url: str) -> str:
         """
@@ -321,7 +361,7 @@ class DouyinClient:
             # Save the IES share URL for later use
             if "iesdouyin.com/share/user/" in final_url:
                 self._ies_share_url = final_url
-                logger.info(f"保存IES分享页URL")
+                logger.info("保存IES分享页URL")
 
             return final_url
         except Exception as e:
@@ -573,8 +613,8 @@ class DouyinClient:
                     "[HTML检测] 未能从页面提取任何有效数据，可能页面结构已变更"
                 )
                 # Log a snippet of the page to help diagnose
-                snippet = html[:2000]
-                logger.debug(f"[HTML检测] 页面开头:\n{snippet}")
+                snippet = compact_log_preview(html)
+                logger.debug(f"[HTML检测] 页面开头: {snippet}")
                 self._dump_debug("html_parse_failed", html)
 
             logger.debug(
@@ -714,11 +754,13 @@ class DouyinClient:
             "title": "",
             "nickname": "",
             "method": "api",
+            "determined": False,
+            "error": "",
         }
 
         try:
             # Build API params
-            params = {
+            base_params = {
                 "sec_user_id": sec_uid,
                 "source": "channel_pc_web",
                 "publish_video_strategy_type": "2",
@@ -748,78 +790,61 @@ class DouyinClient:
                 "round_trip_time": "50",
             }
 
-            # Try adding a_bogus signature
-            params_str = "&".join(f"{k}={v}" for k, v in params.items())
-            bogus = self._generate_a_bogus(params_str)
-            if bogus.get("a_bogus"):
-                params["a_bogus"] = bogus["a_bogus"]
-            if bogus.get("msToken"):
-                params["msToken"] = bogus["msToken"]
-
-            # Add msToken to cookies as well
-            if bogus.get("msToken"):
-                self.session.cookies.set(
-                    "msToken", bogus["msToken"], domain=".douyin.com"
-                )
-
             url = "https://www.douyin.com/aweme/v1/web/user/profile/other/"
             logger.debug(f"[API检测] 请求用户信息 API: sec_uid={sec_uid}")
 
-            resp = self.session.get(
-                url,
-                params=params,
-                timeout=15,
-                headers={
-                    "Referer": f"https://www.douyin.com/user/{sec_uid}",
-                    "Accept": "application/json, text/plain, */*",
-                },
-            )
-            resp.raise_for_status()
-            try:
-                data = resp.json()
-            except (json.JSONDecodeError, ValueError):
-                logger.warning(
-                    f"[API检测] 响应非JSON "
-                    f"(status={resp.status_code}, "
-                    f"size={len(resp.text)} bytes)"
-                )
-                self._dump_debug("api_non_json_response", resp.text)
-                # Log first 500 chars to help diagnose
-                logger.debug(
-                    f"[API检测] 响应预览: {resp.text[:500]}"
-                )
-                # Try with a_bogus if not already tried
-                if not bogus.get("a_bogus"):
-                    logger.debug("[API检测] 重试带 a_bogus 签名...")
-                    params_str = "&".join(
-                        f"{k}={v}" for k, v in params.items()
+            data = None
+            for attempt in range(2):
+                params = dict(base_params)
+                params_str = "&".join(f"{k}={v}" for k, v in params.items())
+                bogus = self._generate_a_bogus(params_str)
+                if bogus.get("a_bogus"):
+                    params["a_bogus"] = bogus["a_bogus"]
+                if bogus.get("msToken"):
+                    params["msToken"] = bogus["msToken"]
+                    self.session.cookies.set(
+                        "msToken", bogus["msToken"], domain=".douyin.com"
                     )
-                    bogus2 = self._generate_a_bogus(params_str)
-                    if bogus2.get("a_bogus"):
-                        params["a_bogus"] = bogus2["a_bogus"]
-                        resp2 = self.session.get(
-                            url,
-                            params=params,
-                            timeout=15,
-                            headers={
-                                "Referer": f"https://www.douyin.com/user/{sec_uid}",
-                                "Accept": "application/json, text/plain, */*",
-                            },
-                        )
-                        try:
-                            data = resp2.json()
-                        except (json.JSONDecodeError, ValueError):
-                            logger.warning(
-                                "[API检测] 带签名重试仍返回非JSON"
-                            )
-                            self._dump_debug(
-                                "api_non_json_retry", resp2.text
-                            )
-                            return result
-                    else:
-                        return result
-                else:
+
+                resp = self.session.get(
+                    url,
+                    params=params,
+                    timeout=15,
+                    headers={
+                        "Referer": f"https://www.douyin.com/user/{sec_uid}",
+                        "Accept": "application/json, text/plain, */*",
+                    },
+                )
+                resp.raise_for_status()
+                try:
+                    data = resp.json()
+                    break
+                except (json.JSONDecodeError, ValueError):
+                    response_size = len(resp.text)
+                    logger.warning(
+                        f"[API检测] 响应非JSON "
+                        f"(status={resp.status_code}, size={response_size} bytes)"
+                    )
+                    dump_name = (
+                        "api_non_json_response"
+                        if attempt == 0
+                        else "api_non_json_retry"
+                    )
+                    self._dump_debug(dump_name, resp.text)
+                    preview = compact_log_preview(resp.text, 200)
+                    logger.debug(f"[API检测] 响应预览: {preview}")
+                    if attempt == 0 and self._refresh_auth_session():
+                        continue
+                    result["error"] = (
+                        "profile_api_empty_response"
+                        if response_size == 0
+                        else "profile_api_non_json_response"
+                    )
                     return result
+
+            if data is None:
+                result["error"] = "profile_api_non_json_response"
+                return result
             self._dump_debug("api_response", data, is_json=True)
 
             # Navigate response structure
@@ -827,14 +852,17 @@ class DouyinClient:
             if status_code != 0:
                 error_msg = data.get("status_msg", "Unknown error")
                 logger.warning(f"[API检测] API返回错误: {error_msg}")
+                result["error"] = "profile_api_status_error"
                 return result
 
             user_data = data.get("user", {})
             if not user_data:
                 logger.warning("[API检测] 响应中未找到用户数据")
+                result["error"] = "profile_api_missing_user"
                 return result
 
             # Extract user info
+            result["determined"] = True
             result["nickname"] = user_data.get("nickname", "")
             result["is_live"] = bool(user_data.get("live_status", 0))
 
@@ -1052,7 +1080,7 @@ class DouyinClient:
                 params=params,
                 timeout=15,
                 headers={
-                    "Referer": f"https://live.douyin.com/",
+                    "Referer": "https://live.douyin.com/",
                     "Accept": "application/json, text/plain, */*",
                 },
             )
@@ -1236,7 +1264,7 @@ class DouyinClient:
                 params=params,
                 timeout=15,
                 headers={
-                    "Referer": f"https://live.douyin.com/",
+                    "Referer": "https://live.douyin.com/",
                     "Accept": "application/json, text/plain, */*",
                 },
             )
@@ -1674,9 +1702,15 @@ class DouyinClient:
 
         best_result["methods_tried"] = methods_tried
         best_result["timestamp"] = time.time()
+        if not api_result.get("determined", False):
+            best_result["indeterminate"] = True
+            best_result["error"] = (
+                api_result.get("error") or "profile_api_unavailable"
+            )
         logger.debug(
             f"检测完成: is_live=False, methods_tried={methods_tried}, "
-            f"nickname={best_result.get('nickname', 'N/A')}"
+            f"nickname={best_result.get('nickname', 'N/A')}, "
+            f"indeterminate={best_result.get('indeterminate', False)}"
         )
         return best_result
 

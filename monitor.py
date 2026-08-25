@@ -751,6 +751,9 @@ class DouyinLiveMonitor:
     def check_once(self) -> Dict[str, Any]:
         """Perform a single live status check."""
         result = self.client.check_live(target_url=self.target_url)
+        if result.get("indeterminate"):
+            reason = result.get("error") or "所有检测方法均无法确认状态"
+            raise RuntimeError(f"直播状态暂时无法确认: {reason}")
 
         # Update state
         is_live = result.get("is_live", False)
