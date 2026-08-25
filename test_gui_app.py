@@ -242,10 +242,12 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.settings_canvas.winfo_exists()
 
         stopped_ids = []
+        stop_finished = threading.Event()
 
         class ActiveService:
             def stop_streamer(self, streamer_id):
                 stopped_ids.append(streamer_id)
+                stop_finished.set()
                 return True
 
         app.service = ActiveService()
@@ -262,7 +264,11 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.start_button.cget("text") == "停止全部"
 
         app._stop_selected_streamer()
+        assert stop_finished.wait(timeout=1)
         assert stopped_ids == [first["id"]]
+
+        app._set_running_ui(False)
+        assert str(app.stop_selected_button.cget("state")) == tk.DISABLED
 
         app.service = None
         app.service_thread = None

@@ -101,6 +101,17 @@ class ServerChanNotifier:
         safe_url = re.sub(r"(/send/)[^/?]+", r"\1<redacted>", url)
         logger.info(f"API URL 已设置为: {safe_url}")
 
+    def clone(self) -> "ServerChanNotifier":
+        """Create an independent notifier with the same destination."""
+        cloned = ServerChanNotifier(
+            sendkey=self.sendkey,
+            uid=self.uid,
+            retry_times=self.retry_times,
+            retry_delay=self.retry_delay,
+        )
+        cloned.api_url = self.api_url
+        return cloned
+
     def send(self, title: str, desp: str = "", tags: Optional[str] = None,
              short: Optional[str] = None) -> bool:
         """Send one notification; never replay an ambiguous POST."""

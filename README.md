@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.4.0-orange.svg" alt="Version 1.4.0">
+  <img src="https://img.shields.io/badge/version-1.5.0-orange.svg" alt="Version 1.5.0">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
@@ -13,7 +13,7 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.4.0.exe`，不需要安装 Python。
+Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.5.0.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。程序进入 GUI 后不会保留黑色命令行窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
@@ -21,6 +21,12 @@ Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-m
 4. 点击“开始监控”。任务状态表会持续显示每个主播的检测结果。
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
+
+## v1.5.0
+
+这一版减少了多主播同时直播时的重复提醒。23:57、23:58、23:59 的每日亲密度提醒现在每分钟只发送一条，正文汇总当时所有已确认直播中的主播。运行状态页新增“停止所选主播”，可以结束一个任务而不影响其他主播；顶部按钮改为“停止全部”，两个操作的范围更加清楚。README 也按首次使用、运行控制、排障和开发说明重新整理。
+
+如需回退，可以继续使用 [v1.4.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.4.0)。v1.5.0 没有修改配置结构，也没有不可逆的数据迁移。
 
 ## 主要功能
 
@@ -159,8 +165,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-.\douyin-monitor-v1.4.0.exe --once
-.\douyin-monitor-v1.4.0.exe --list-streamers
+.\douyin-monitor-v1.5.0.exe --once
+.\douyin-monitor-v1.5.0.exe --list-streamers
 ```
 
 ## 日志与排障

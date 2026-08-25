@@ -238,6 +238,7 @@ class MonitorGui:
         self.event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.pending_close = False
         self.testing_push = False
+        self.monitoring_ui_active = False
         self.selected_streamer_id = ""
         self.runtime_by_id: Dict[str, Dict[str, Any]] = {}
         self.streamer_logs = StreamerLogStore(max_lines=MAX_STREAMER_LOG_LINES)
@@ -1040,7 +1041,8 @@ class MonitorGui:
 
     def _update_stop_selected_button(self) -> None:
         running = bool(
-            self.service is not None
+            self.monitoring_ui_active
+            and self.service is not None
             and self.service_thread is not None
             and self.service_thread.is_alive()
         )
@@ -1080,12 +1082,21 @@ class MonitorGui:
             parent=self.root,
         ):
             return
-        if not self.service.stop_streamer(streamer_id):
-            messagebox.showinfo(
-                "停止主播", "该主播尚未开始或已经停止。", parent=self.root
-            )
-            return
         self.stop_selected_button.configure(state=tk.DISABLED)
+
+        def stop_selected() -> None:
+            service = self.service
+            stopped = bool(service and service.stop_streamer(streamer_id))
+            if not stopped:
+                self.event_queue.put(
+                    {"type": "streamer_stop_failed", "streamer_id": streamer_id}
+                )
+
+        threading.Thread(
+            target=stop_selected,
+            name=f"monitor-stop-{streamer_id}",
+            daemon=True,
+        ).start()
 
     def _show_streamer_log(self, streamer_id: str) -> None:
         existing = self.streamer_log_windows.get(streamer_id)
@@ -1345,10 +1356,11 @@ class MonitorGui:
                 check_interval=self.config["check_interval"],
                 max_concurrent_checks=self.config["max_concurrent_checks"],
                 startup_notify=self.config.get("startup_notify", False),
+                on_event=self.event_queue.put,
                 enable_daily_intimacy_reminder=self.config.get(
                     "enable_daily_intimacy_reminder", True
                 ),
-                on_event=self.event_queue.put,
+                service_notifier=monitor._create_notifier(dict(self.config)),
             )
         except (TypeError, ValueError) as exc:
             messagebox.showerror("无法开始监控", str(exc), parent=self.root)
@@ -1380,6 +1392,7 @@ class MonitorGui:
             self.service.stop()
 
     def _set_running_ui(self, running: bool) -> None:
+        self.monitoring_ui_active = bool(running)
         self.start_button.configure(
             text="停止全部" if running else "开始监控",
             command=self._stop_monitoring if running else self._start_monitoring,
@@ -1529,6 +1542,11 @@ class MonitorGui:
             else:
                 detail = event.get("error") or "请检查推送地址和网络连接。"
                 messagebox.showerror("测试推送失败", str(detail), parent=self.root)
+        elif event_type == "streamer_stop_failed":
+            self._update_stop_selected_button()
+            messagebox.showinfo(
+                "停止主播", "该主播尚未开始或已经停止。", parent=self.root
+            )
 
     def _on_close(self) -> None:
         if self.service_thread and self.service_thread.is_alive():

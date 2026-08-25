@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from douyin_client import DouyinClient
-from monitor_service import LiveStatusUnknownError, MonitorService
+from monitor_service import (
+    LiveStatusUnknownError,
+    MonitorCheckCancelled,
+    MonitorService,
+)
 from notifier import ServerChanNotifier
 from streamer_config import (
     add_streamer,
@@ -51,7 +55,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -595,6 +599,7 @@ class DouyinLiveMonitor:
         )
         self.running = True
         self._stop_event = threading.Event()
+        self._check_lock = threading.Lock()
 
     def _resolve_sec_uid(self) -> Optional[str]:
         """Resolve the target user's sec_uid."""
@@ -761,7 +766,22 @@ class DouyinLiveMonitor:
 
     def check_once(self) -> Dict[str, Any]:
         """Perform a single live status check."""
+        check_lock = getattr(self, "_check_lock", None)
+        if check_lock is None:
+            return self._check_once_locked()
+        with check_lock:
+            return self._check_once_locked()
+
+    def _raise_if_stopped(self) -> None:
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None and stop_event.is_set():
+            raise MonitorCheckCancelled("监控任务已停止")
+
+    def _check_once_locked(self) -> Dict[str, Any]:
+        """Run one check inside the per-worker lifecycle boundary."""
+        self._raise_if_stopped()
         result = self.client.check_live(target_url=self.target_url)
+        self._raise_if_stopped()
         if result.get("indeterminate"):
             reason = result.get("error") or "所有检测方法均无法确认状态"
             raise LiveStatusUnknownError(f"直播状态暂时无法确认: {reason}")
@@ -769,6 +789,7 @@ class DouyinLiveMonitor:
         # Update state
         is_live = result.get("is_live", False)
         transition = self.state.transition(is_live, result)
+        self._raise_if_stopped()
 
         # Handle transitions
         if transition == "went_live":
@@ -856,6 +877,9 @@ class DouyinLiveMonitor:
             except KeyboardInterrupt:
                 logger.info("\n收到中断信号，正在退出...")
                 break
+            except MonitorCheckCancelled:
+                logger.info("检测任务已停止，忽略在途结果")
+                break
             except LiveStatusUnknownError as e:
                 logger.warning(f"直播状态暂时无法确认，将继续检测: {e}")
             except Exception as e:
@@ -889,6 +913,14 @@ class DouyinLiveMonitor:
         stop_event = getattr(self, "_stop_event", None)
         if stop_event is not None:
             stop_event.set()
+
+    def stop_and_wait(self) -> None:
+        """Stop this worker and wait for its current check to leave side effects."""
+        self.stop()
+        check_lock = getattr(self, "_check_lock", None)
+        if check_lock is not None:
+            with check_lock:
+                pass
 
     def _start_stop_listener(self) -> None:
         """Listen for a console command that stops continuous monitoring."""
@@ -1216,9 +1248,11 @@ def main():
             check_interval=config.get("check_interval", 30),
             max_concurrent_checks=config.get("max_concurrent_checks", 2),
             startup_notify=config.get("startup_notify", False),
+            on_event=None,
             enable_daily_intimacy_reminder=config.get(
                 "enable_daily_intimacy_reminder", True
             ),
+            service_notifier=_create_notifier(dict(config)),
         )
     except (TypeError, ValueError) as exc:
         logger.error(f"监控参数无效: {exc}")

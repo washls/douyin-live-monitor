@@ -23,6 +23,10 @@ class LiveStatusUnknownError(RuntimeError):
     """The current polling round could not determine live or offline state."""
 
 
+class MonitorCheckCancelled(RuntimeError):
+    """A polling round finished after its monitor had been stopped."""
+
+
 class MonitorService:
     """Coordinate multiple independent monitor workers with bounded concurrency."""
 
@@ -33,8 +37,9 @@ class MonitorService:
         check_interval: int = 30,
         max_concurrent_checks: int = 2,
         startup_notify: bool = False,
-        enable_daily_intimacy_reminder: bool = True,
         on_event: Optional[EventCallback] = None,
+        enable_daily_intimacy_reminder: bool = True,
+        service_notifier: Optional[Any] = None,
     ):
         self.streamers = [dict(entry) for entry in streamers]
         self.worker_factory = worker_factory
@@ -49,6 +54,7 @@ class MonitorService:
             enable_daily_intimacy_reminder
         )
         self.on_event = on_event
+        self._service_notifier = service_notifier
 
         self.running = False
         self._stop_event = threading.Event()
@@ -62,6 +68,9 @@ class MonitorService:
         self._stopped_emitted = False
         self._daily_reminder_date = ""
         self._daily_reminder_minutes_sent: set[int] = set()
+        self._daily_reminder_future: Optional[Future] = None
+        self._daily_reminder_pending: Optional[tuple[str, int]] = None
+        self._notification_executor: Optional[ThreadPoolExecutor] = None
 
         for entry in self.streamers:
             streamer_id = str(entry["id"])
@@ -193,8 +202,7 @@ class MonitorService:
         for streamer_id, worker in self._workers.items():
             runtime = self._runtime[streamer_id]
             names.append(worker.state.streamer_nickname or runtime["label"] or streamer_id)
-        first_worker = next(iter(self._workers.values()))
-        first_worker.notifier.send(
+        self._get_service_notifier().send(
             title="[START] 抖音直播监听器已启动",
             desp=(
                 f"**监控主播数**: {len(names)}\n"
@@ -204,9 +212,68 @@ class MonitorService:
             ),
         )
 
+    def _get_service_notifier(self) -> Any:
+        """Return a notifier reserved for service-level notifications."""
+        if self._service_notifier is not None:
+            return self._service_notifier
+        first_notifier = next(iter(self._workers.values())).notifier
+        clone = getattr(first_notifier, "clone", None)
+        if not callable(clone):
+            raise RuntimeError(
+                "服务级通知需要独立通知器，请传入 service_notifier"
+            )
+        self._service_notifier = clone()
+        return self._service_notifier
+
+    def _send_daily_intimacy_reminder(
+        self,
+        notifier: Any,
+        live_streamers: List[Dict[str, str]],
+        minute: int,
+    ) -> tuple[bool, bool]:
+        logger.info(
+            "[亲密度提醒] 23:%s 汇总 %s 位直播主播",
+            minute,
+            len(live_streamers),
+        )
+        success = notifier.send_daily_intimacy_reminder_for_streamers(
+            streamers=live_streamers,
+            minute=minute,
+        )
+        delivery_unknown = bool(notifier.delivery_unknown)
+        if success:
+            logger.info("[OK] 汇总亲密度提醒已发送 (23:%s)", minute)
+        else:
+            logger.error("[FAIL] 汇总亲密度提醒发送失败 (23:%s)", minute)
+        return success, delivery_unknown
+
+    def _collect_daily_reminder_result(self) -> None:
+        future = self._daily_reminder_future
+        if future is None or not future.done():
+            return
+        pending = self._daily_reminder_pending
+        try:
+            success, delivery_unknown = future.result()
+        except Exception:
+            logger.exception("汇总亲密度提醒发送异常")
+            success, delivery_unknown = False, True
+        if (
+            pending is not None
+            and pending[0] == self._daily_reminder_date
+            and (success or delivery_unknown)
+        ):
+            self._daily_reminder_minutes_sent.add(pending[1])
+        self._daily_reminder_future = None
+        self._daily_reminder_pending = None
+
     def _check_daily_intimacy_reminder(self) -> None:
         """Send one reminder per minute containing every known live streamer."""
+        self._collect_daily_reminder_result()
         if not self.enable_daily_intimacy_reminder or not self._workers:
+            return
+        if self._stop_event.is_set():
+            return
+        if self._daily_reminder_future is not None:
             return
         now = datetime.now()
         minute = now.minute
@@ -232,22 +299,25 @@ class MonitorService:
         if not live_streamers:
             return
 
-        notifier = next(iter(self._workers.values())).notifier
-        logger.info(
-            "[亲密度提醒] 23:%s 汇总 %s 位直播主播",
-            minute,
-            len(live_streamers),
+        notifier = self._get_service_notifier()
+        if self.running and self._notification_executor is not None:
+            self._daily_reminder_pending = (today, minute)
+            self._daily_reminder_future = self._notification_executor.submit(
+                self._send_daily_intimacy_reminder,
+                notifier,
+                live_streamers,
+                minute,
+            )
+            self._daily_reminder_future.add_done_callback(
+                lambda _future: self._wake_event.set()
+            )
+            return
+
+        success, delivery_unknown = self._send_daily_intimacy_reminder(
+            notifier, live_streamers, minute
         )
-        success = notifier.send_daily_intimacy_reminder_for_streamers(
-            streamers=live_streamers,
-            minute=minute,
-        )
-        if success or notifier.delivery_unknown:
+        if success or delivery_unknown:
             self._daily_reminder_minutes_sent.add(minute)
-        if success:
-            logger.info("[OK] 汇总亲密度提醒已发送 (23:%s)", minute)
-        else:
-            logger.error("[FAIL] 汇总亲密度提醒发送失败 (23:%s)", minute)
 
     def check_all_once(self) -> Dict[str, Dict[str, Any]]:
         """Prepare and check every valid streamer once."""
@@ -308,6 +378,10 @@ class MonitorService:
                 max_workers=min(self.max_concurrent_checks, len(worker_ids)),
                 thread_name_prefix="monitor-check",
             )
+            self._notification_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="monitor-notify",
+            )
             print(
                 f"监控已启动，共 {len(worker_ids)} 个主播；"
                 "输入 q 后回车可终止并退出，也可按 Ctrl+C。"
@@ -341,6 +415,11 @@ class MonitorService:
                 executor.shutdown(wait=True, cancel_futures=True)
             self._collect_finished()
             self._executor = None
+            notification_executor = self._notification_executor
+            if notification_executor is not None:
+                notification_executor.shutdown(wait=True, cancel_futures=False)
+            self._collect_daily_reminder_result()
+            self._notification_executor = None
             logger.info("多主播监听器已停止")
         return not failed_all
 
@@ -422,6 +501,10 @@ class MonitorService:
 
     def _record_error(self, streamer_id: str, exc: Exception) -> None:
         message = str(exc)
+        if isinstance(exc, MonitorCheckCancelled):
+            with streamer_log_context(streamer_id):
+                logger.info("主播 %s 的在途检测已取消", streamer_id)
+            return
         if isinstance(exc, LiveStatusUnknownError):
             with self._lock:
                 runtime = self._runtime[streamer_id]
@@ -508,7 +591,11 @@ class MonitorService:
             runtime["suspended"] = True
             runtime["status"] = "stopped"
             runtime["last_error"] = ""
-        run_with_streamer_context(streamer_id, worker.stop)
+        stop_and_wait = getattr(worker, "stop_and_wait", None)
+        if callable(stop_and_wait):
+            run_with_streamer_context(streamer_id, stop_and_wait)
+        else:
+            run_with_streamer_context(streamer_id, worker.stop)
         with streamer_log_context(streamer_id):
             logger.info("主播 %s 已由用户停止，其他主播继续监控", streamer_id)
         self._emit("streamer_stopped", streamer_id)

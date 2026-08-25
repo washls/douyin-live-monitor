@@ -1,6 +1,8 @@
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import threading
+import time
 
 import pytest
 
@@ -179,6 +181,7 @@ def test_worker_logs_receive_the_matching_streamer_context():
 def test_startup_notification_is_aggregated_into_one_post():
     entries = [streamer("one", "主播甲"), streamer("two", "主播乙")]
     workers = {}
+    service_notifier = FakeNotifier()
 
     def factory(entry):
         worker = FakeWorker(entry)
@@ -189,13 +192,14 @@ def test_startup_notification_is_aggregated_into_one_post():
         entries,
         worker_factory=factory,
         startup_notify=True,
+        service_notifier=service_notifier,
     )
     service.prepare_all()
     service._send_startup_notification()
 
-    total_messages = sum(len(worker.notifier.messages) for worker in workers.values())
-    assert total_messages == 1
-    title, body = workers["one"].notifier.messages[0]
+    assert len(service_notifier.messages) == 1
+    assert all(not worker.notifier.messages for worker in workers.values())
+    title, body = service_notifier.messages[0]
     assert "已启动" in title
     assert "主播甲" in body
     assert "主播乙" in body
@@ -208,6 +212,7 @@ def test_daily_intimacy_reminder_is_aggregated_once_per_minute(monkeypatch):
         streamer("offline", "未开播主播"),
     ]
     workers = {}
+    service_notifier = FakeNotifier()
 
     def factory(entry):
         worker = FakeWorker(entry)
@@ -218,6 +223,7 @@ def test_daily_intimacy_reminder_is_aggregated_once_per_minute(monkeypatch):
         entries,
         worker_factory=factory,
         enable_daily_intimacy_reminder=True,
+        service_notifier=service_notifier,
     )
     service.prepare_all()
     service._record_success(
@@ -255,11 +261,7 @@ def test_daily_intimacy_reminder_is_aggregated_once_per_minute(monkeypatch):
     service._check_daily_intimacy_reminder()
     service._check_daily_intimacy_reminder()
 
-    all_daily_messages = [
-        message
-        for worker in workers.values()
-        for message in worker.notifier.daily_messages
-    ]
+    all_daily_messages = service_notifier.daily_messages
     assert len(all_daily_messages) == 1
     live_streamers, minute = all_daily_messages[0]
     assert minute == 57
@@ -288,6 +290,73 @@ def test_daily_intimacy_reminder_respects_disabled_setting(monkeypatch):
     service._check_daily_intimacy_reminder()
 
     assert worker.notifier.daily_messages == []
+
+
+def test_daily_intimacy_reminder_does_not_block_scheduler(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingNotifier(FakeNotifier):
+        def send_daily_intimacy_reminder_for_streamers(self, streamers, minute):
+            started.set()
+            release.wait(timeout=2)
+            return super().send_daily_intimacy_reminder_for_streamers(
+                streamers, minute
+            )
+
+    notifier = BlockingNotifier()
+    worker = FakeWorker(streamer("one", "主播甲"))
+    service = MonitorService(
+        [streamer("one", "主播甲")],
+        worker_factory=lambda _entry: worker,
+        enable_daily_intimacy_reminder=True,
+        service_notifier=notifier,
+    )
+    service.prepare_all()
+    service._record_success(
+        "one", {"nickname": "主播甲", "is_live": True, "method": "api"}
+    )
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime(2026, 8, 26, 23, 57, 10)
+
+    monkeypatch.setattr("monitor_service.datetime", FixedDateTime)
+    service.running = True
+    service._notification_executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        began = time.monotonic()
+        service._check_daily_intimacy_reminder()
+        elapsed = time.monotonic() - began
+
+        assert elapsed < 0.2
+        assert started.wait(timeout=1)
+        service._check_daily_intimacy_reminder()
+        assert worker.notifier.daily_messages == []
+    finally:
+        release.set()
+        service._notification_executor.shutdown(wait=True)
+        service._collect_daily_reminder_result()
+
+    assert len(notifier.daily_messages) == 1
+
+
+def test_monitor_service_keeps_legacy_on_event_positional_argument():
+    events = []
+    service = MonitorService(
+        [streamer("one")],
+        FakeWorker,
+        30,
+        2,
+        False,
+        events.append,
+    )
+
+    service._emit("probe", "one")
+
+    assert events == [{"type": "probe", "streamer_id": "one"}]
+    assert service.enable_daily_intimacy_reminder is True
 
 
 def test_ten_errors_suspend_only_the_failing_worker():

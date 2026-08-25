@@ -13,7 +13,7 @@ from monitor import (
 )
 from notifier import ServerChanNotifier
 from douyin_client import DouyinClient
-from monitor_service import LiveStatusUnknownError
+from monitor_service import LiveStatusUnknownError, MonitorCheckCancelled
 
 
 class MonitorStateTests(unittest.TestCase):
@@ -136,6 +136,64 @@ class NotifierTests(unittest.TestCase):
 
 
 class MonitorControlTests(unittest.TestCase):
+    def test_stop_during_check_prevents_late_notification(self):
+        live_monitor = object.__new__(DouyinLiveMonitor)
+        live_monitor.target_url = "https://www.douyin.com/user/stopping"
+        live_monitor.client = Mock()
+        live_monitor.state = MonitorState()
+        live_monitor.notifier = Mock(delivery_unknown=False)
+        live_monitor.config = {"enable_daily_intimacy_reminder": True}
+        live_monitor.notify_on_end = True
+        live_monitor.running = True
+        live_monitor._stop_event = threading.Event()
+
+        def finish_after_stop(**_kwargs):
+            live_monitor.stop()
+            return {
+                "is_live": True,
+                "nickname": "停止中的主播",
+                "room_id": "room-late",
+                "title": "不应通知",
+            }
+
+        live_monitor.client.check_live.side_effect = finish_after_stop
+
+        with self.assertRaises(MonitorCheckCancelled):
+            live_monitor.check_once()
+
+        live_monitor.notifier.send_live_notification.assert_not_called()
+        self.assertEqual(live_monitor.state.status, MonitorState.UNKNOWN)
+
+    def test_stop_during_transition_prevents_late_notification(self):
+        live_monitor = object.__new__(DouyinLiveMonitor)
+        live_monitor.target_url = "https://www.douyin.com/user/stopping"
+        live_monitor.client = Mock()
+        live_monitor.client.check_live.return_value = {
+            "is_live": True,
+            "nickname": "停止中的主播",
+            "room_id": "room-late",
+            "title": "不应通知",
+        }
+        live_monitor.state = MonitorState()
+        original_transition = live_monitor.state.transition
+
+        def transition_then_stop(is_live, info):
+            transition = original_transition(is_live, info)
+            live_monitor.stop()
+            return transition
+
+        live_monitor.state.transition = Mock(side_effect=transition_then_stop)
+        live_monitor.notifier = Mock(delivery_unknown=False)
+        live_monitor.config = {"enable_daily_intimacy_reminder": True}
+        live_monitor.notify_on_end = True
+        live_monitor.running = True
+        live_monitor._stop_event = threading.Event()
+
+        with self.assertRaises(MonitorCheckCancelled):
+            live_monitor.check_once()
+
+        live_monitor.notifier.send_live_notification.assert_not_called()
+
     def test_indeterminate_check_then_live_notifies_once(self):
         live_monitor = object.__new__(DouyinLiveMonitor)
         live_monitor.target_url = "https://www.douyin.com/user/recovering"
