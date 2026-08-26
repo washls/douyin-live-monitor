@@ -2,6 +2,7 @@ import logging
 import threading
 
 from streamer_logging import (
+    RedactingFormatter,
     StreamerLogHandler,
     StreamerLogStore,
     compact_log_line,
@@ -75,3 +76,16 @@ def test_log_lines_redact_credentials_and_request_tokens():
     assert "private-signature" not in line
     assert "private-cookie" not in line
     assert line.count("<redacted>") == 4
+
+
+def test_redacting_formatter_protects_console_and_file_messages():
+    secret = "formatter-secret"
+    record = logging.LogRecord(
+        "test", logging.ERROR, __file__, 1,
+        f"failed https://1.push.ft07.com/send/{secret}.send", (), None,
+    )
+
+    rendered = RedactingFormatter("%(levelname)s %(message)s").format(record)
+
+    assert secret not in rendered
+    assert "<redacted>" in rendered

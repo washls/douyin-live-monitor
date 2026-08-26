@@ -14,14 +14,16 @@ Detection methods (tried in order):
 """
 
 import json
+import ipaddress
 import logging
 import os
 import re
+import socket
 import sys
 import time
 from datetime import datetime
 from typing import Optional, Dict, Any
-from urllib.parse import unquote, urlparse, parse_qs
+from urllib.parse import unquote, urljoin, urlparse, parse_qs
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -84,6 +86,8 @@ _POOL_MAXSIZE = 2
 
 # Avoid rebuilding a persistently rejected session on every polling round.
 _AUTH_REFRESH_COOLDOWN_SECONDS = 60.0
+_MAX_REDIRECTS = 5
+_ALLOWED_REDIRECT_DOMAINS = ("douyin.com", "iesdouyin.com", "amemv.com")
 
 # Default browser-like headers
 DEFAULT_HEADERS = {
@@ -214,6 +218,41 @@ class DouyinClient:
         self._ensure_cookies()
         return True
 
+    def close(self) -> None:
+        """Release pooled connections owned by this client."""
+        session = getattr(self, "session", None)
+        if session is not None:
+            try:
+                session.close()
+            finally:
+                self.session = None
+
+    @staticmethod
+    def _validate_redirect_target(url: str) -> str:
+        """Reject redirect targets that could escape trusted public HTTPS hosts."""
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme != "https":
+            raise ValueError("抖音链接重定向必须使用 HTTPS")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("抖音链接不能包含账号凭据")
+        if parsed.port not in (None, 443):
+            raise ValueError("抖音链接重定向只能使用标准 HTTPS 端口")
+        if not any(
+            hostname == domain or hostname.endswith(f".{domain}")
+            for domain in _ALLOWED_REDIRECT_DOMAINS
+        ):
+            raise ValueError("抖音链接重定向到了不受信任的域名")
+        try:
+            addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError("无法验证抖音链接的公网地址") from exc
+        for address in {item[4][0] for item in addresses}:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+            if not ip.is_global:
+                raise ValueError("抖音链接不能指向非公网地址")
+        return parsed.geturl()
+
     def _dump_debug(self, name: str, content: str, is_json: bool = False) -> None:
         """Save raw response to disk for debugging."""
         if not self.debug:
@@ -270,9 +309,11 @@ class DouyinClient:
                 allow_redirects=True,
             )
             resp.raise_for_status()
+            cookie_names = sorted(self.session.cookies.keys())
             logger.debug(
-                f"live.douyin.com cookies: "
-                f"{dict(self.session.cookies)}"
+                "Cookie names=%s, ttwid=%s",
+                cookie_names,
+                "present" if "ttwid" in self.session.cookies else "absent",
             )
 
             # Step 2: Also visit douyin.com for any additional cookies
@@ -303,7 +344,9 @@ class DouyinClient:
             self._cookies_initialized = True
             return "ttwid" in self.session.cookies
         except Exception as e:
-            logger.warning(f"Cookie 初始化失败: {e}，API 检测可能失效")
+            logger.warning(
+                "Cookie 初始化失败 (%s)，API 检测可能失效", type(e).__name__
+            )
             self._cookies_initialized = True  # Don't keep retrying
             return False
 
@@ -329,15 +372,30 @@ class DouyinClient:
                 self._ies_share_url = cached_url
             logger.debug("short link redirect reused from cache")
             return cached_url
-        logger.info(f"解析短链接: {short_url}")
+        if str(short_url).startswith("http://"):
+            short_url = "https://" + str(short_url)[len("http://"):]
+        logger.info("解析短链接")
 
         try:
-            resp = self.session.head(
-                short_url,
-                timeout=15,
-                allow_redirects=True,
-            )
-            final_url = resp.url
+            final_url = self._validate_redirect_target(short_url)
+            for redirect_count in range(_MAX_REDIRECTS + 1):
+                resp = self.session.head(
+                    final_url,
+                    timeout=15,
+                    allow_redirects=False,
+                )
+                if getattr(resp, "is_redirect", False) is not True:
+                    break
+                if redirect_count >= _MAX_REDIRECTS:
+                    raise ValueError("抖音链接重定向次数过多")
+                location = resp.headers.get("Location", "")
+                if not location:
+                    raise ValueError("抖音链接重定向缺少目标地址")
+                final_url = self._validate_redirect_target(
+                    urljoin(final_url, location)
+                )
+            else:  # pragma: no cover - loop always exits or raises
+                raise ValueError("抖音链接重定向次数过多")
             self._resolved_url_cache[short_url] = final_url
             logger.info(f"解析结果: {final_url[:150]}...")
 
@@ -1566,12 +1624,18 @@ class DouyinClient:
             elif nickname and ies_is_live:
                 is_live = True
             else:
-                # API unreachable — webcast share link suggests live,
-                # but log a warning since this may be a false positive
-                logger.warning(
-                    "IES API 不可用，无法验证直播状态；基于分享链接假设正在直播"
-                )
-                is_live = True
+                logger.warning("IES API 不可用，直播分享链接状态无法确认")
+                return {
+                    "is_live": False,
+                    "indeterminate": True,
+                    "room_id": self._cached_room_id,
+                    "title": "",
+                    "nickname": "",
+                    "method": "link_unverified",
+                    "methods_tried": ["link_direct", "ies_api"],
+                    "timestamp": time.time(),
+                    "error": "直播分享链接无法明确验证",
+                }
 
             result = {
                 "is_live": is_live,

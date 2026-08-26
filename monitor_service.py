@@ -40,6 +40,7 @@ class MonitorService:
         on_event: Optional[EventCallback] = None,
         enable_daily_intimacy_reminder: bool = True,
         service_notifier: Optional[Any] = None,
+        enable_console_stop: bool = False,
     ):
         self.streamers = [dict(entry) for entry in streamers]
         self.worker_factory = worker_factory
@@ -55,6 +56,9 @@ class MonitorService:
         )
         self.on_event = on_event
         self._service_notifier = service_notifier
+        if not isinstance(enable_console_stop, bool):
+            raise ValueError("enable_console_stop 必须是布尔值")
+        self.enable_console_stop = enable_console_stop
 
         self.running = False
         self._stop_event = threading.Event()
@@ -354,7 +358,8 @@ class MonitorService:
         self._stopped_emitted = False
         self._stop_event.clear()
         self._wake_event.clear()
-        self._start_stop_listener()
+        if self.enable_console_stop:
+            self._start_stop_listener()
         self.prepare_all()
         if not self._workers:
             logger.error("没有可运行的主播监控任务")
@@ -420,6 +425,7 @@ class MonitorService:
                 notification_executor.shutdown(wait=True, cancel_futures=False)
             self._collect_daily_reminder_result()
             self._notification_executor = None
+            self.close()
             logger.info("多主播监听器已停止")
         return not failed_all
 
@@ -601,6 +607,16 @@ class MonitorService:
         self._emit("streamer_stopped", streamer_id)
         self._wake_event.set()
         return True
+
+    def close(self) -> None:
+        """Stop workers and release their network resources."""
+        self.stop()
+        with self._lock:
+            workers = list(self._workers.items())
+        for streamer_id, worker in workers:
+            close = getattr(worker, "close", None)
+            if callable(close):
+                run_with_streamer_context(streamer_id, close)
 
     def _start_stop_listener(self) -> None:
         stdin = getattr(sys, "stdin", None)

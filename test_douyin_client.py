@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import requests
+import pytest
 
 import douyin_client
 from douyin_client import DouyinClient, compact_log_preview
@@ -16,11 +17,14 @@ class FakeResponse:
         text: str = "",
         payload: Any = None,
         url: str = "https://www.douyin.com/",
+        headers: dict[str, str] | None = None,
     ):
         self.status_code = status_code
         self.text = text
         self._payload = payload
         self.url = url
+        self.headers = headers or {}
+        self.is_redirect = status_code in {301, 302, 303, 307, 308}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -184,3 +188,47 @@ def test_unavailable_primary_api_does_not_become_confirmed_offline(monkeypatch):
     assert result["is_live"] is False
     assert result["indeterminate"] is True
     assert result["error"] == "profile_api_empty_response"
+
+
+def test_unverified_share_link_is_indeterminate(monkeypatch):
+    client = DouyinClient()
+    monkeypatch.setattr(client, "_ensure_cookies", lambda: True)
+    def resolve(_url):
+        client._cached_room_id = "123"
+        return "https://webcast.amemv.com/reflow/123"
+
+    monkeypatch.setattr(client, "resolve_short_link", resolve)
+    monkeypatch.setattr(client, "extract_sec_uid", lambda _url: "sec-test")
+    monkeypatch.setattr(
+        client,
+        "check_live_by_iesdouyin_api",
+        lambda _uid: {"is_live": False, "nickname": ""},
+    )
+
+    result = client.check_live(target_url="https://v.douyin.com/a/")
+
+    assert result["is_live"] is False
+    assert result["indeterminate"] is True
+    assert result["method"] == "link_unverified"
+
+
+def test_redirect_rejects_private_or_untrusted_targets(monkeypatch):
+    monkeypatch.setattr(
+        douyin_client.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [(None, None, None, None, ("127.0.0.1", 443))],
+    )
+    with pytest.raises(ValueError, match="非公网"):
+        DouyinClient._validate_redirect_target("https://v.douyin.com/a/")
+    with pytest.raises(ValueError, match="不受信任"):
+        DouyinClient._validate_redirect_target("https://example.com/a/")
+
+
+def test_client_close_releases_session():
+    client = DouyinClient()
+    session = client.session
+
+    client.close()
+
+    assert client.session is None
+    assert session is not None

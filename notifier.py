@@ -93,7 +93,7 @@ class ServerChanNotifier:
         )
         if match:
             return {"uid": match.group(1), "sendkey": match.group(2)}
-        raise ValueError(f"无法解析推送 URL 格式: {url}")
+        raise ValueError("无法解析推送 URL 格式")
 
     def set_api_url(self, url: str) -> None:
         """Override the API URL without exposing credentials in logs."""
@@ -153,13 +153,13 @@ class ServerChanNotifier:
             status_code = e.response.status_code if e.response is not None else 0
             if status_code >= 500:
                 self.delivery_unknown = True
-            logger.warning(f"HTTP 错误 ({status_code})，不重试: {e}")
+            logger.warning("通知 HTTP 错误 (%s)，不重试", status_code)
         except (requests.Timeout, requests.ConnectionError) as e:
             self.delivery_unknown = True
-            logger.warning(f"通知传输结果未知，不重试: {e}")
+            logger.warning("通知传输结果未知，不重试 (%s)", type(e).__name__)
         except Exception as e:
             self.delivery_unknown = True
-            logger.warning(f"通知发送异常，不重试: {e}")
+            logger.warning("通知发送异常，不重试 (%s)", type(e).__name__)
         return False
 
     def send_live_notification(

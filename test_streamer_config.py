@@ -5,6 +5,7 @@ import pytest
 from streamer_config import (
     add_streamer,
     migrate_legacy_streamer,
+    normalize_app_config,
     normalize_streamers,
     remove_streamer,
     save_config_atomic,
@@ -132,3 +133,39 @@ def test_atomic_save_writes_valid_json_and_leaves_no_temp_file(tmp_path):
 
     assert json.loads(config_path.read_text(encoding="utf-8")) == config
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_app_config_normalizes_numeric_strings_and_http_urls():
+    normalized = normalize_app_config({
+        "check_interval": "60",
+        "repeat_notify_interval": "120",
+        "max_repeat_notifications": "4",
+        "max_concurrent_checks": "3",
+        "notify_on_stream_end": True,
+        "startup_notify": False,
+        "enable_daily_intimacy_reminder": True,
+        "streamers": [{"id": "one", "url": "http://v.douyin.com/a/"}],
+    })
+
+    assert normalized["check_interval"] == 60
+    assert normalized["streamers"][0]["url"] == "https://v.douyin.com/a/"
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_app_config_rejects_non_boolean_flags(value):
+    with pytest.raises(ValueError, match="必须是布尔值"):
+        normalize_app_config({"startup_notify": value})
+
+
+def test_posix_config_permissions_are_private(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr("streamer_config._IS_POSIX", True)
+    chmod_calls = []
+    monkeypatch.setattr(
+        "streamer_config.os.chmod",
+        lambda path, mode: chmod_calls.append((path, mode)),
+    )
+
+    save_config_atomic(config_path, {"streamers": []})
+
+    assert chmod_calls == [(config_path, 0o600)]

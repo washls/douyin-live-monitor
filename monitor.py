@@ -39,7 +39,9 @@ from streamer_config import (
     save_config_atomic,
     set_streamer_enabled,
     validate_streamer_url,
+    normalize_app_config,
 )
+from streamer_logging import RedactingFormatter
 
 # ===== Path Helpers (supports PyInstaller frozen exe) =====
 
@@ -94,7 +96,7 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if verbose else logging.WARNING)
     console.setFormatter(
-        logging.Formatter(
+        RedactingFormatter(
             "%(asctime)s  %(message)s",
             datefmt="%H:%M:%S",
         )
@@ -111,7 +113,7 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
-        logging.Formatter(
+        RedactingFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
@@ -306,7 +308,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    return config
+    return normalize_app_config(config)
 
 
 def _default_config() -> Dict[str, Any]:
@@ -921,6 +923,13 @@ class DouyinLiveMonitor:
         if check_lock is not None:
             with check_lock:
                 pass
+        self.close()
+
+    def close(self) -> None:
+        """Release this worker's HTTP resources after in-flight work ends."""
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     def _start_stop_listener(self) -> None:
         """Listen for a console command that stops continuous monitoring."""
@@ -1253,6 +1262,7 @@ def main():
                 "enable_daily_intimacy_reminder", True
             ),
             service_notifier=_create_notifier(dict(config)),
+            enable_console_stop=True,
         )
     except (TypeError, ValueError) as exc:
         logger.error(f"监控参数无效: {exc}")
@@ -1285,6 +1295,8 @@ def main():
         logger.error(f"程序异常: {e}", exc_info=True)
         _pause_if_frozen()
         sys.exit(1)
+    finally:
+        service.close()
 
     # Normal exit - pause for frozen exe so user can see output
     _pause_if_frozen()

@@ -44,6 +44,7 @@ class FakeWorker:
         self.state = FakeState(entry.get("label") or entry["id"])
         self.notifier = FakeNotifier()
         self.stopped = False
+        self.closed = False
 
     def prepare(self):
         return self.sec_uid
@@ -55,6 +56,32 @@ class FakeWorker:
 
     def stop(self):
         self.stopped = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_console_stop_listener_is_opt_in(monkeypatch):
+    calls = []
+    service = MonitorService([], worker_factory=lambda entry: FakeWorker(entry))
+    monkeypatch.setattr(service, "_start_stop_listener", lambda: calls.append(True))
+
+    assert service.run() is False
+    assert calls == []
+
+
+def test_service_close_releases_prepared_workers():
+    created = []
+    service = MonitorService(
+        [streamer("one")],
+        worker_factory=lambda entry: created.append(FakeWorker(entry)) or created[-1],
+    )
+    service.prepare_all()
+
+    service.close()
+
+    assert created[0].stopped is True
+    assert created[0].closed is True
 
 
 def streamer(streamer_id, label=""):

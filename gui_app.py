@@ -21,6 +21,7 @@ from notifier import ServerChanNotifier
 from streamer_config import (
     add_streamer,
     enabled_streamers,
+    normalize_app_config,
     remove_streamer,
     save_config_atomic,
     update_streamer,
@@ -193,21 +194,16 @@ def compact_ui_text(value: Any, limit: int) -> str:
 
 def validate_gui_settings(values: Mapping[str, Any]) -> Dict[str, Any]:
     """Validate and normalize settings collected from form controls."""
-    ranges = {
-        "check_interval": (1, 86400, "检测间隔"),
-        "repeat_notify_interval": (1, 86400, "重复提醒间隔"),
-        "max_repeat_notifications": (0, 100, "最多重复提醒"),
-        "max_concurrent_checks": (1, 8, "并发检测数"),
+    validated = normalize_app_config(values)
+    normalized = {
+        key: validated[key]
+        for key in (
+            "check_interval",
+            "repeat_notify_interval",
+            "max_repeat_notifications",
+            "max_concurrent_checks",
+        )
     }
-    normalized: Dict[str, Any] = {}
-    for key, (minimum, maximum, label) in ranges.items():
-        try:
-            number = int(str(values.get(key, "")).strip())
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{label}必须是整数") from exc
-        if number < minimum or number > maximum:
-            raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
-        normalized[key] = number
 
     push_url = str(values.get("push_url", "") or "").strip()
     if push_url:
@@ -220,7 +216,7 @@ def validate_gui_settings(values: Mapping[str, Any]) -> Dict[str, Any]:
         "startup_notify",
         "enable_daily_intimacy_reminder",
     ):
-        normalized[key] = bool(values.get(key, False))
+        normalized[key] = validated[key]
     return normalized
 
 

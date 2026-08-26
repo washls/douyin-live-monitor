@@ -39,6 +39,13 @@ def compact_log_line(value: Any, limit: int = 400) -> str:
     return " ".join(redact_log_secrets(value).split())[:limit].rstrip()
 
 
+class RedactingFormatter(logging.Formatter):
+    """Format a record and redact secrets from the final rendered line."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_log_secrets(super().format(record))
+
+
 @contextmanager
 def streamer_log_context(streamer_id: str) -> Iterator[None]:
     """Attach a streamer id to every log emitted in this execution context."""

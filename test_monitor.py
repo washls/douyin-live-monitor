@@ -65,6 +65,14 @@ class NotifierTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ServerChanNotifier._parse_push_url(invalid)
 
+    def test_invalid_push_url_error_does_not_echo_secret(self):
+        secret = "must-not-leak"
+        with self.assertRaises(ValueError) as captured:
+            ServerChanNotifier._parse_push_url(
+                f"https://example.com/send/{secret}.send"
+            )
+        self.assertNotIn(secret, str(captured.exception))
+
     def test_serverchan_configuration_uses_the_same_url_validation(self):
         self.assertTrue(
             is_serverchan_configured(
@@ -100,6 +108,16 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(notifier.delivery_unknown)
         self.assertEqual(post.call_count, 1)
 
+    def test_transport_exception_log_does_not_echo_push_url(self):
+        secret = "must-not-leak"
+        notifier = ServerChanNotifier(sendkey="key", uid="uid")
+        notifier.api_url = f"https://1.push.ft07.com/send/{secret}.send"
+        error = requests.Timeout(notifier.api_url)
+        with self.assertLogs("notifier", level="WARNING") as captured:
+            with patch("notifier.requests.post", side_effect=error):
+                self.assertFalse(notifier.send("title"))
+        self.assertNotIn(secret, "\n".join(captured.output))
+
     def test_unexpected_send_error_is_not_retried(self):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
         with patch("notifier.requests.post", side_effect=RuntimeError("network failure")) as post:
@@ -121,18 +139,27 @@ class NotifierTests(unittest.TestCase):
 
     def test_short_link_redirect_is_cached(self):
         client = DouyinClient()
-        response = Mock(url="https://www.douyin.com/user/sec_uid_1")
-        client.session.head = Mock(return_value=response)
+        redirect = Mock(
+            is_redirect=True,
+            headers={"Location": "https://www.douyin.com/user/sec_uid_1"},
+        )
+        response = Mock(
+            is_redirect=False,
+            url="https://www.douyin.com/user/sec_uid_1",
+        )
+        client.session.head = Mock(side_effect=[redirect, response])
 
-        self.assertEqual(
-            client.resolve_short_link("https://v.douyin.com/example/"),
-            response.url,
-        )
-        self.assertEqual(
-            client.resolve_short_link("https://v.douyin.com/example/"),
-            response.url,
-        )
-        self.assertEqual(client.session.head.call_count, 1)
+        public_dns = [(None, None, None, None, ("8.8.8.8", 443))]
+        with patch("douyin_client.socket.getaddrinfo", return_value=public_dns):
+            self.assertEqual(
+                client.resolve_short_link("https://v.douyin.com/example/"),
+                response.url,
+            )
+            self.assertEqual(
+                client.resolve_short_link("https://v.douyin.com/example/"),
+                response.url,
+            )
+        self.assertEqual(client.session.head.call_count, 2)
 
 
 class MonitorControlTests(unittest.TestCase):

@@ -17,6 +17,18 @@ MAX_STREAMERS = 100
 MAX_URL_LENGTH = 2048
 MAX_LABEL_LENGTH = 80
 STREAMER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_IS_POSIX = os.name == "posix"
+NUMERIC_CONFIG_FIELDS = {
+    "check_interval": (30, 1, 86400, "检测间隔"),
+    "repeat_notify_interval": (600, 1, 86400, "重复提醒间隔"),
+    "max_repeat_notifications": (3, 0, 100, "最多重复提醒"),
+    "max_concurrent_checks": (2, 1, 8, "并发检测数"),
+}
+BOOLEAN_CONFIG_FIELDS = {
+    "notify_on_stream_end": True,
+    "startup_notify": False,
+    "enable_daily_intimacy_reminder": True,
+}
 
 
 def validate_streamer_url(url: str) -> str:
@@ -36,7 +48,39 @@ def validate_streamer_url(url: str) -> str:
         for domain in allowed_hosts
     ):
         raise ValueError("该链接不是可识别的抖音链接")
+    if parsed.port not in (None, 80, 443):
+        raise ValueError("主播链接只能使用标准端口")
+    if parsed.scheme == "http":
+        parsed = parsed._replace(scheme="https", netloc=parsed.netloc.replace(":80", ""))
+        value = parsed.geturl()
     return value
+
+
+def normalize_app_config(mapping: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a validated application config with normalized scalar values."""
+    if not isinstance(mapping, Mapping):
+        raise ValueError("配置根节点必须是对象")
+    config = dict(mapping)
+    for key, (default, minimum, maximum, label) in NUMERIC_CONFIG_FIELDS.items():
+        raw = config.get(key, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"{label}必须是整数")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}必须是整数") from exc
+        if str(raw).strip() != str(value) and not isinstance(raw, int):
+            raise ValueError(f"{label}必须是整数")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
+        config[key] = value
+    for key, default in BOOLEAN_CONFIG_FIELDS.items():
+        value = config.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} 必须是布尔值")
+        config[key] = value
+    normalize_streamers(config)
+    return config
 
 
 def make_streamer(url: str, label: str = "") -> Dict[str, Any]:
@@ -155,6 +199,8 @@ def save_config_atomic(config_path: Path, config: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, config_path)
+        if _IS_POSIX:
+            os.chmod(config_path, 0o600)
     finally:
         try:
             temp_path.unlink(missing_ok=True)
