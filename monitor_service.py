@@ -91,6 +91,7 @@ class MonitorService:
                 "last_error": "",
                 "check_count": 0,
                 "consecutive_errors": 0,
+                "consecutive_unknowns": 0,
                 "suspended": False,
                 "stopped_by_user": False,
             }
@@ -456,12 +457,13 @@ class MonitorService:
                 continue
             del self._futures[future]
             collected = True
+            delay = float(self.check_interval)
             try:
                 result = future.result()
                 self._record_success(streamer_id, result)
             except Exception as exc:
-                self._record_error(streamer_id, exc)
-            self._next_due[streamer_id] = time.monotonic() + self.check_interval
+                delay = self._record_error(streamer_id, exc)
+            self._next_due[streamer_id] = time.monotonic() + delay
         if collected:
             self._check_daily_intimacy_reminder()
 
@@ -489,6 +491,7 @@ class MonitorService:
             runtime["last_error"] = ""
             runtime["check_count"] += 1
             runtime["consecutive_errors"] = 0
+            runtime["consecutive_unknowns"] = 0
             count = runtime["check_count"]
         icon = "🔴" if is_live else "⚫"
         state_text = "直播中" if is_live else "未开播"
@@ -505,20 +508,26 @@ class MonitorService:
             print(line)
         self._emit("status", streamer_id, result=dict(result))
 
-    def _record_error(self, streamer_id: str, exc: Exception) -> None:
+    def _record_error(self, streamer_id: str, exc: Exception) -> float:
         message = str(exc)
         if isinstance(exc, MonitorCheckCancelled):
             with streamer_log_context(streamer_id):
                 logger.info("主播 %s 的在途检测已取消", streamer_id)
-            return
+            return float(self.check_interval)
         if isinstance(exc, LiveStatusUnknownError):
             with self._lock:
                 runtime = self._runtime[streamer_id]
                 if runtime["stopped_by_user"]:
-                    return
+                    return float(self.check_interval)
+                runtime["consecutive_unknowns"] += 1
+                unknown_count = runtime["consecutive_unknowns"]
                 runtime["last_error"] = message
                 runtime["status"] = "error"
                 count = runtime["consecutive_errors"]
+            delay = min(
+                60.0 * (2 ** min(unknown_count - 1, 3)),
+                float(max(300, self.check_interval)),
+            )
             with streamer_log_context(streamer_id):
                 logger.warning("主播 %s 状态暂时无法确认: %s", streamer_id, message)
             self._emit(
@@ -527,13 +536,15 @@ class MonitorService:
                 error=message,
                 count=count,
                 transient=True,
+                retry_in=delay,
             )
-            return
+            return delay
         with self._lock:
             runtime = self._runtime[streamer_id]
             if runtime["stopped_by_user"]:
-                return
+                return float(self.check_interval)
             runtime["consecutive_errors"] += 1
+            runtime["consecutive_unknowns"] = 0
             count = runtime["consecutive_errors"]
             runtime["last_error"] = message
             runtime["status"] = "error"
@@ -553,6 +564,7 @@ class MonitorService:
             self._emit("suspended", streamer_id, error=message)
         else:
             self._emit("error", streamer_id, error=message, count=count)
+        return float(self.check_interval)
 
     def _has_runnable_workers(self) -> bool:
         return any(

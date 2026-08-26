@@ -84,6 +84,26 @@ def test_service_close_releases_prepared_workers():
     assert created[0].closed is True
 
 
+def test_unknown_backoff_sequence_and_success_reset():
+    service = MonitorService(
+        [streamer("one")],
+        worker_factory=lambda entry: FakeWorker(entry),
+        check_interval=30,
+    )
+    service.prepare_all()
+
+    delays = [
+        service._record_error("one", LiveStatusUnknownError("unknown"))
+        for _ in range(5)
+    ]
+    service._record_success(
+        "one", {"nickname": "one", "is_live": False, "method": "test"}
+    )
+
+    assert delays == [60.0, 120.0, 240.0, 300.0, 300.0]
+    assert service.snapshot()[0]["consecutive_unknowns"] == 0
+
+
 def streamer(streamer_id, label=""):
     return {
         "id": streamer_id,

@@ -21,7 +21,9 @@ import re
 import socket
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Optional, Dict, Any
 from urllib.parse import unquote, urljoin, urlparse, parse_qs
 
@@ -88,6 +90,27 @@ _POOL_MAXSIZE = 2
 _AUTH_REFRESH_COOLDOWN_SECONDS = 60.0
 _MAX_REDIRECTS = 5
 _ALLOWED_REDIRECT_DOMAINS = ("douyin.com", "iesdouyin.com", "amemv.com")
+_FULL_CHECK_INTERVAL_SECONDS = 300.0
+_FULL_CHECK_EVERY_OFFLINE_ROUNDS = 10
+_FULL_CHECK_BUDGET_SECONDS = 45.0
+
+
+class LiveDecision(Enum):
+    """Internal tri-state decision for one detection source."""
+
+    LIVE = "live"
+    OFFLINE = "offline"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class DetectionEvidence:
+    """Normalized evidence emitted by one detection strategy."""
+
+    decision: LiveDecision
+    method: str
+    result: Dict[str, Any]
+    reason: str = ""
 
 # Default browser-like headers
 DEFAULT_HEADERS = {
@@ -169,6 +192,10 @@ class DouyinClient:
         # target avoids repeated HEAD requests on every polling round.
         self._resolved_url_cache: Dict[str, str] = {}
         self._profile_html_cache: Dict[str, str] = {}
+        self._profile_final_url_cache: Dict[str, str] = {}
+        self._dual_offline_rounds = 0
+        self._last_full_check_at = float("-inf")
+        self._monotonic = time.monotonic
         self.debug = debug
 
         if self.debug:
@@ -288,6 +315,70 @@ class DouyinClient:
             oldest = next(iter(self._profile_html_cache))
             del self._profile_html_cache[oldest]
         self._profile_html_cache[url] = html
+
+    def _get_profile_page(self, sec_uid: str) -> tuple[str, str, bool]:
+        """Fetch a profile once per polling round and classify its safety."""
+        url = f"https://www.douyin.com/user/{sec_uid}"
+        if url not in self._profile_html_cache:
+            resp = self.session.get(
+                url,
+                timeout=15,
+                allow_redirects=True,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            resp.raise_for_status()
+            self._cache_profile_html(url, resp.text)
+            self._profile_final_url_cache[url] = resp.url
+        html = self._profile_html_cache[url]
+        final_url = self._profile_final_url_cache.get(url, url)
+        lower_url = final_url.lower()
+        lower_sample = html[:20000].lower()
+        trustworthy = (
+            len(html) >= 5000
+            and "verify" not in lower_url
+            and "captcha" not in lower_url
+            and "captcha" not in lower_sample
+        )
+        room_ids = set(_RE_ROOM_ID_LIVE.findall(html)) | set(
+            _RE_ROOM_ID_REFLOW.findall(html)
+        )
+        if len(room_ids) > 1:
+            trustworthy = False
+        render_match = _RE_RENDER_DATA.search(html)
+        if render_match:
+            try:
+                json.loads(unquote(render_match.group(1)))
+            except (json.JSONDecodeError, TypeError):
+                trustworthy = False
+        return html, final_url, trustworthy
+
+    @staticmethod
+    def _evidence(result: Dict[str, Any]) -> DetectionEvidence:
+        """Normalize a strategy's legacy dictionary into tri-state evidence."""
+        method = str(result.get("method") or "unknown")
+        if result.get("is_live") is True:
+            decision = LiveDecision.LIVE
+        elif result.get("determined") is True:
+            decision = LiveDecision.OFFLINE
+        else:
+            decision = LiveDecision.UNKNOWN
+        return DetectionEvidence(
+            decision=decision,
+            method=method,
+            result=result,
+            reason=str(result.get("error") or ""),
+        )
+
+    @staticmethod
+    def _finish_result(
+        result: Dict[str, Any], methods_tried: list[str]
+    ) -> Dict[str, Any]:
+        finished = dict(result)
+        finished["methods_tried"] = list(methods_tried)
+        finished["timestamp"] = time.time()
+        return finished
 
     def _ensure_cookies(self) -> bool:
         """Obtain initial cookies by visiting Douyin and live.douyin.com.
@@ -493,22 +584,8 @@ class DouyinClient:
         }
 
         try:
-            url = f"https://www.douyin.com/user/{sec_uid}"
-            logger.debug(f"[HTML检测] 访问用户主页: {url}")
-
-            # Reuse cached profile HTML if another method already fetched it
-            if url in self._profile_html_cache:
-                logger.debug("[HTML检测] 使用缓存的用户主页 HTML")
-                html = self._profile_html_cache[url]
-                final_url = url
-            else:
-                resp = self.session.get(url, timeout=15, allow_redirects=True)
-                resp.raise_for_status()
-                html = resp.text
-                final_url = resp.url
-                # Don't cache captcha/error pages — they'd poison future checks
-                if "verify" not in final_url.lower() and "captcha" not in final_url.lower() and len(html) >= 5000:
-                    self._cache_profile_html(url, html)
+            logger.debug("[HTML检测] 访问用户主页")
+            html, final_url, trustworthy = self._get_profile_page(sec_uid)
 
             logger.debug(f"[HTML检测] 最终URL: {final_url}")
             logger.debug(f"[HTML检测] 页面大小: {len(html)} bytes")
@@ -522,6 +599,10 @@ class DouyinClient:
                     f"[HTML检测] 页面内容过短 ({len(html)} bytes)，可能是反爬页面"
                 )
                 self._dump_debug("html_short_response", html)
+            if not trustworthy:
+                result["determined"] = False
+                result["error"] = "profile_page_untrusted"
+                return result
 
             # === Approach 1: RENDER_DATA (SSR embedded JSON) ===
             render_match = _RE_RENDER_DATA.search(html)
@@ -1296,6 +1377,7 @@ class DouyinClient:
             "title": "",
             "nickname": "",
             "method": "webcast_info_by_user",
+            "determined": False,
         }
 
         try:
@@ -1333,6 +1415,7 @@ class DouyinClient:
                     self._dump_debug("webcast_info_by_user", data, is_json=True)
 
                     if isinstance(data, dict):
+                        result["determined"] = True
                         room_data = data.get("data", {}) or data
                         if isinstance(room_data, dict):
                             # Get room info
@@ -1371,6 +1454,7 @@ class DouyinClient:
 
             elif resp.status_code == 404:
                 logger.debug("[Webcast info_by_user] 用户未开播或无直播间")
+                result["determined"] = True
             else:
                 logger.debug(
                     f"[Webcast info_by_user] HTTP {resp.status_code}"
@@ -1410,27 +1494,12 @@ class DouyinClient:
         }
 
         try:
-            url = f"https://www.douyin.com/user/{sec_uid}"
-            logger.debug(f"[Profile直播链接检测] 访问: {url}")
-
-            # Reuse cached profile HTML if another method already fetched it
-            if url in self._profile_html_cache:
-                logger.debug("[Profile直播链接检测] 使用缓存的用户主页 HTML")
-                html = self._profile_html_cache[url]
-            else:
-                resp = self.session.get(
-                    url,
-                    timeout=15,
-                    allow_redirects=True,
-                    headers={
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    },
-                )
-                resp.raise_for_status()
-                html = resp.text
-                # Don't cache captcha/error pages
-                if "verify" not in resp.url.lower() and "captcha" not in resp.url.lower() and len(html) >= 5000:
-                    self._cache_profile_html(url, html)
+            logger.debug("[Profile直播链接检测] 访问用户主页")
+            html, _final_url, trustworthy = self._get_profile_page(sec_uid)
+            if not trustworthy:
+                result["determined"] = False
+                result["error"] = "profile_page_untrusted"
+                return result
 
             # Look for live room URL patterns in the HTML
             live_room_matches = _RE_ROOM_ID_LIVE.findall(html)
@@ -1439,6 +1508,10 @@ class DouyinClient:
 
             all_room_ids = set(live_room_matches + webcast_matches)
 
+            if len(all_room_ids) > 1:
+                result["determined"] = False
+                result["error"] = "profile_multiple_rooms"
+                return result
             if all_room_ids:
                 # Use the first found room_id
                 room_id = list(all_room_ids)[0]
@@ -1563,6 +1636,7 @@ class DouyinClient:
         # Share HTML between strategies in this check only; never reuse a
         # previous polling round's page and its stale live status.
         self._profile_html_cache.clear()
+        self._profile_final_url_cache.clear()
 
         self._ensure_cookies()
 
@@ -1652,131 +1726,92 @@ class DouyinClient:
             )
             return result
 
-        # Collect results from all methods
         best_result: Dict[str, Any] = {
             "is_live": False,
             "room_id": "",
             "title": "",
             "nickname": "",
             "method": "combined",
-            "timestamp": time.time(),
         }
+        methods_tried: list[str] = []
 
-        methods_tried = []
-        total_methods = "8"
+        primary = self._evidence(self.check_live_by_api(sec_uid))
+        methods_tried.append(primary.method)
+        self._merge_best_result(best_result, primary.result)
+        if primary.decision is LiveDecision.LIVE:
+            return self._finish_result(primary.result, methods_tried)
 
-        # ---- Method 1: Douyin API (most reliable, now with Python a_bogus) ----
-        logger.debug(f"--- [1/{total_methods}] Douyin API检测 ---")
-        api_result = self.check_live_by_api(sec_uid)
-        methods_tried.append("api")
-        if not api_result.get("room_id") and self._cached_room_id:
-            api_result["room_id"] = self._cached_room_id
-        self._merge_best_result(best_result, api_result)
-        if api_result["is_live"]:
-            logger.debug("Douyin API确认直播中!")
-            api_result["methods_tried"] = methods_tried
-            api_result["timestamp"] = time.time()
-            return api_result
-
-        # ---- Method 2: Webcast info_by_user ----
-        logger.debug(f"--- [2/{total_methods}] Webcast info_by_user检测 ---")
-        wc_info_result = self.check_live_by_webcast_info_by_user(sec_uid)
-        methods_tried.append("webcast_info_by_user")
-        self._merge_best_result(best_result, wc_info_result)
-        if wc_info_result["is_live"]:
-            logger.debug("Webcast info_by_user确认直播中!")
-            wc_info_result["methods_tried"] = methods_tried
-            wc_info_result["timestamp"] = time.time()
-            return wc_info_result
-
-        # ---- Method 3: Profile live link extraction ----
-        logger.debug(f"--- [3/{total_methods}] Profile直播链接检测 ---")
-        profile_link_result = self.check_live_by_profile_live_link(sec_uid)
-        methods_tried.append("profile_live_link")
-        self._merge_best_result(best_result, profile_link_result)
-        if profile_link_result["is_live"]:
-            logger.debug("Profile直播链接确认直播中!")
-            profile_link_result["methods_tried"] = methods_tried
-            profile_link_result["timestamp"] = time.time()
-            return profile_link_result
-
-        # ---- Method 4: HTML page parsing ----
-        logger.debug(f"--- [4/{total_methods}] HTML页面检测 ---")
-        html_result = self.check_live_by_html(sec_uid)
-        methods_tried.append("html")
-        self._merge_best_result(best_result, html_result)
-        if html_result["is_live"]:
-            logger.debug("HTML检测确认直播中!")
-            html_result["methods_tried"] = methods_tried
-            html_result["timestamp"] = time.time()
-            return html_result
-
-        # ---- Method 5: IES API ----
-        logger.debug(f"--- [5/{total_methods}] IES API检测 ---")
-        ies_api_result = self.check_live_by_iesdouyin_api(sec_uid)
-        methods_tried.append("ies_api")
-        self._merge_best_result(best_result, ies_api_result)
-        if ies_api_result["is_live"]:
-            logger.debug("IES API确认直播中!")
-            ies_api_result["methods_tried"] = methods_tried
-            ies_api_result["timestamp"] = time.time()
-            return ies_api_result
-
-        # ---- Method 6: Webcast API (original) ----
-        logger.debug(f"--- [6/{total_methods}] Webcast API检测 ---")
-        webcast_result = self.check_live_by_webcast_api(sec_uid)
-        methods_tried.append("webcast_api")
-        self._merge_best_result(best_result, webcast_result)
-        if webcast_result["is_live"]:
-            logger.debug("Webcast API确认直播中!")
-            webcast_result["methods_tried"] = methods_tried
-            webcast_result["timestamp"] = time.time()
-            return webcast_result
-
-        # ---- Method 7: IES share page ----
-        logger.debug(f"--- [7/{total_methods}] IES分享页检测 ---")
-        ies_share_result = self.check_live_by_iesdouyin_share_page(sec_uid)
-        methods_tried.append("ies_share")
-        self._merge_best_result(best_result, ies_share_result)
-        if ies_share_result["is_live"]:
-            logger.debug("IES分享页确认直播中!")
-            ies_share_result["methods_tried"] = methods_tried
-            ies_share_result["timestamp"] = time.time()
-            return ies_share_result
-
-        # ---- Method 8: Live room page (if room_id known) ----
-        room_id = (
-            best_result.get("room_id")
-            or wc_info_result.get("room_id")
-            or profile_link_result.get("room_id")
-            or html_result.get("room_id")
-            or ies_api_result.get("room_id")
-            or self._cached_room_id
+        secondary = self._evidence(
+            self.check_live_by_webcast_info_by_user(sec_uid)
         )
-        if room_id and str(room_id) != "0":
-            logger.debug(f"--- [8/{total_methods}] 直播间页面检测 (room_id={room_id}) ---")
-            room_result = self.check_live_by_room_page(room_id)
+        methods_tried.append(secondary.method)
+        self._merge_best_result(best_result, secondary.result)
+        if secondary.decision is LiveDecision.LIVE:
+            return self._finish_result(secondary.result, methods_tried)
+
+        dual_offline = (
+            primary.decision is LiveDecision.OFFLINE
+            and secondary.decision is LiveDecision.OFFLINE
+        )
+        now = self._monotonic()
+        if dual_offline:
+            self._dual_offline_rounds += 1
+            full_due = (
+                self._dual_offline_rounds >= _FULL_CHECK_EVERY_OFFLINE_ROUNDS
+                or now - self._last_full_check_at >= _FULL_CHECK_INTERVAL_SECONDS
+            )
+            if not full_due:
+                best_result["method"] = "dual_source"
+                best_result["determined"] = True
+                return self._finish_result(best_result, methods_tried)
+            self._dual_offline_rounds = 0
+        else:
+            self._dual_offline_rounds = 0
+
+        full_started = self._monotonic()
+        self._last_full_check_at = full_started
+        strategies = (
+            ("profile_live_link", self.check_live_by_profile_live_link),
+            ("html", self.check_live_by_html),
+            ("ies_api", self.check_live_by_iesdouyin_api),
+            ("webcast_api", self.check_live_by_webcast_api),
+            ("ies_share", self.check_live_by_iesdouyin_share_page),
+        )
+        budget_exhausted = False
+        for strategy_name, strategy in strategies:
+            if self._monotonic() - full_started >= _FULL_CHECK_BUDGET_SECONDS:
+                budget_exhausted = True
+                break
+            result = strategy(sec_uid)
+            methods_tried.append(strategy_name)
+            self._merge_best_result(best_result, result)
+            if result.get("is_live") is True:
+                return self._finish_result(result, methods_tried)
+
+        room_id = best_result.get("room_id") or self._cached_room_id
+        if (
+            not budget_exhausted
+            and room_id
+            and str(room_id) != "0"
+            and self._monotonic() - full_started < _FULL_CHECK_BUDGET_SECONDS
+        ):
+            room_result = self.check_live_by_room_page(str(room_id))
             methods_tried.append("room_page")
             self._merge_best_result(best_result, room_result)
-            if room_result["is_live"]:
-                logger.debug("直播间页面确认直播中!")
-                room_result["methods_tried"] = methods_tried
-                room_result["timestamp"] = time.time()
-                return room_result
+            if room_result.get("is_live") is True:
+                return self._finish_result(room_result, methods_tried)
 
-        best_result["methods_tried"] = methods_tried
-        best_result["timestamp"] = time.time()
-        if not api_result.get("determined", False):
+        if dual_offline:
+            best_result["method"] = "full_check"
+            best_result["determined"] = True
+        else:
             best_result["indeterminate"] = True
             best_result["error"] = (
-                api_result.get("error") or "profile_api_unavailable"
+                "full_check_budget_exhausted"
+                if budget_exhausted
+                else primary.reason or secondary.reason or "status_conflict"
             )
-        logger.debug(
-            f"检测完成: is_live=False, methods_tried={methods_tried}, "
-            f"nickname={best_result.get('nickname', 'N/A')}, "
-            f"indeterminate={best_result.get('indeterminate', False)}"
-        )
-        return best_result
+        return self._finish_result(best_result, methods_tried)
 
     @staticmethod
     def _merge_best_result(best: Dict[str, Any], new: Dict[str, Any]) -> None:

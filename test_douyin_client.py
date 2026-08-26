@@ -232,3 +232,114 @@ def test_client_close_releases_session():
 
     assert client.session is None
     assert session is not None
+
+
+def _offline(method):
+    return {
+        "is_live": False,
+        "room_id": "",
+        "title": "",
+        "nickname": "主播",
+        "method": method,
+        "determined": True,
+    }
+
+
+def _configure_detection_stubs(monkeypatch, client, calls):
+    monkeypatch.setattr(client, "_ensure_cookies", lambda: True)
+    for name, method in (
+        ("check_live_by_api", "api"),
+        ("check_live_by_webcast_info_by_user", "webcast_info_by_user"),
+        ("check_live_by_profile_live_link", "profile_live_link"),
+        ("check_live_by_html", "html"),
+        ("check_live_by_iesdouyin_api", "ies_api"),
+        ("check_live_by_webcast_api", "webcast_api"),
+        ("check_live_by_iesdouyin_share_page", "ies_share"),
+    ):
+        monkeypatch.setattr(
+            client,
+            name,
+            lambda _uid, method=method: calls.append(method) or _offline(method),
+        )
+
+
+def test_dual_offline_short_circuits_ordinary_poll(monkeypatch):
+    client = DouyinClient()
+    calls = []
+    _configure_detection_stubs(monkeypatch, client, calls)
+    client._last_full_check_at = 100.0
+    client._monotonic = lambda: 101.0
+
+    result = client.check_live(sec_uid="sec-test")
+
+    assert result["method"] == "dual_source"
+    assert calls == ["api", "webcast_info_by_user"]
+
+
+def test_every_tenth_dual_offline_poll_runs_full_chain(monkeypatch):
+    client = DouyinClient()
+    calls = []
+    _configure_detection_stubs(monkeypatch, client, calls)
+    client._last_full_check_at = 100.0
+    client._monotonic = lambda: 101.0
+
+    for _ in range(10):
+        result = client.check_live(sec_uid="sec-test")
+
+    assert result["method"] == "full_check"
+    assert calls.count("profile_live_link") == 1
+    assert calls.count("api") == 10
+
+
+def test_full_chain_budget_stops_launching_later_strategies(monkeypatch):
+    client = DouyinClient()
+    calls = []
+    _configure_detection_stubs(monkeypatch, client, calls)
+    monkeypatch.setattr(
+        client,
+        "check_live_by_api",
+        lambda _uid: calls.append("api") or {
+            **_offline("api"), "determined": False, "error": "unavailable"
+        },
+    )
+    ticks = iter([0.0, 0.0, 0.0, 46.0])
+    client._monotonic = lambda: next(ticks)
+
+    result = client.check_live(sec_uid="sec-test")
+
+    assert result["indeterminate"] is True
+    assert result["error"] == "full_check_budget_exhausted"
+    assert calls == ["api", "webcast_info_by_user", "profile_live_link"]
+
+
+def test_profile_page_is_fetched_once_and_captcha_is_not_decisive(monkeypatch):
+    client = DouyinClient()
+    response = FakeResponse(
+        text=("直播中 " * 1000),
+        url="https://www.douyin.com/verify/captcha",
+    )
+    client.session.get = lambda *_args, **_kwargs: response
+
+    profile = client.check_live_by_profile_live_link("sec-test")
+    html = client.check_live_by_html("sec-test")
+
+    assert profile["is_live"] is False
+    assert html["is_live"] is False
+    assert profile["determined"] is False
+    assert len(client._profile_html_cache) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<script id=\"RENDER_DATA\">{broken</script>" + "x" * 6000,
+        "live.douyin.com/111 live.douyin.com/222 " + "x" * 6000,
+    ],
+)
+def test_malformed_or_multi_room_profile_is_not_decisive(body):
+    client = DouyinClient()
+    response = FakeResponse(text=body, url="https://www.douyin.com/user/test")
+    client.session.get = lambda *_args, **_kwargs: response
+
+    assert client.check_live_by_profile_live_link("test")["is_live"] is False
+    assert client.check_live_by_html("test")["is_live"] is False
