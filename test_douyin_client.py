@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import requests
 import pytest
@@ -17,7 +17,7 @@ class FakeResponse:
         text: str = "",
         payload: Any = None,
         url: str = "https://www.douyin.com/",
-        headers: dict[str, str] | None = None,
+        headers: Optional[dict[str, str]] = None,
     ):
         self.status_code = status_code
         self.text = text
@@ -287,7 +287,8 @@ def test_every_tenth_dual_offline_poll_runs_full_chain(monkeypatch):
         result = client.check_live(sec_uid="sec-test")
 
     assert result["method"] == "full_check"
-    assert calls.count("profile_live_link") == 1
+    assert calls.count("profile_live_link") == 0
+    assert calls.count("html") == 1
     assert calls.count("api") == 10
 
 
@@ -309,7 +310,7 @@ def test_full_chain_budget_stops_launching_later_strategies(monkeypatch):
 
     assert result["indeterminate"] is True
     assert result["error"] == "full_check_budget_exhausted"
-    assert calls == ["api", "webcast_info_by_user", "profile_live_link"]
+    assert calls == ["api", "webcast_info_by_user", "html"]
 
 
 def test_profile_page_is_fetched_once_and_captcha_is_not_decisive(monkeypatch):
@@ -343,3 +344,13 @@ def test_malformed_or_multi_room_profile_is_not_decisive(body):
 
     assert client.check_live_by_profile_live_link("test")["is_live"] is False
     assert client.check_live_by_html("test")["is_live"] is False
+
+
+def test_empty_webcast_json_is_unknown():
+    client = DouyinClient()
+    client.session.get = lambda *_args, **_kwargs: FakeResponse(payload={})
+
+    result = client.check_live_by_webcast_info_by_user("sec-test")
+
+    assert result["is_live"] is False
+    assert result["determined"] is False

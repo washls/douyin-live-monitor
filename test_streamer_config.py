@@ -135,6 +135,21 @@ def test_atomic_save_writes_valid_json_and_leaves_no_temp_file(tmp_path):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_atomic_save_creates_private_temp_file(tmp_path, monkeypatch):
+    original_open = __import__("os").open
+    modes = []
+
+    def recording_open(path, flags, mode):
+        modes.append(mode)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr("streamer_config.os.open", recording_open)
+
+    save_config_atomic(tmp_path / "config.json", {"streamers": []})
+
+    assert modes == [0o600]
+
+
 def test_app_config_normalizes_numeric_strings_and_http_urls():
     normalized = normalize_app_config({
         "check_interval": "60",

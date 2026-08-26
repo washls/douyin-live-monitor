@@ -13,9 +13,14 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional, Union
 
 import monitor
+from application import (
+    create_monitor_service,
+    create_notifier,
+    load_streamer_entries,
+)
 from monitor_service import MonitorService
 from notifier import ServerChanNotifier
 from streamer_config import (
@@ -228,9 +233,11 @@ class MonitorGui:
         self.config_path = Path(config_path)
         self.debug = debug
         self.config = monitor.load_config(self.config_path)
-        self.entries = monitor._load_streamer_entries(self.config_path, self.config)
-        self.service: MonitorService | None = None
-        self.service_thread: threading.Thread | None = None
+        self.entries = load_streamer_entries(
+            self.config_path, self.config, monitor.load_monitor_state()
+        )
+        self.service: Optional[MonitorService] = None
+        self.service_thread: Optional[threading.Thread] = None
         self.event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.pending_close = False
         self.testing_push = False
@@ -241,7 +248,7 @@ class MonitorGui:
         self.streamer_log_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
             maxsize=MAX_PENDING_LOG_EVENTS
         )
-        self.streamer_log_handler: StreamerLogHandler | None = None
+        self.streamer_log_handler: Optional[StreamerLogHandler] = None
         self.streamer_log_windows: Dict[str, Dict[str, Any]] = {}
 
         self._configure_window()
@@ -270,7 +277,7 @@ class MonitorGui:
         self._app_icon = self._create_app_icon()
         self.root.iconphoto(True, self._app_icon)
 
-    def _px(self, value: int | float) -> int:
+    def _px(self, value: Union[int, float]) -> int:
         """Scale fixed visual dimensions while preserving compact density."""
         return max(1, round(float(value) * self.display_scale * self.layout_density))
 
@@ -772,7 +779,7 @@ class MonitorGui:
 
         bind_mousewheel(inner)
 
-    def _scroll_settings(self, event: tk.Event) -> str | None:
+    def _scroll_settings(self, event: tk.Event) -> Optional[str]:
         bounds = self.settings_canvas.bbox("all")
         if bounds and bounds[3] > self.settings_canvas.winfo_height():
             direction = -1 if event.delta > 0 else 1
@@ -1337,26 +1344,12 @@ class MonitorGui:
                 self.push_entry.focus_set()
                 return
 
-        def worker_factory(entry: Mapping[str, Any]):
-            return monitor.DouyinLiveMonitor(
-                dict(self.config),
-                target_url=entry["url"],
-                debug=self.debug,
-                daily_reminder_managed_externally=True,
-            )
-
         try:
-            self.service = MonitorService(
+            self.service = create_monitor_service(
+                self.config,
                 active_entries,
-                worker_factory=worker_factory,
-                check_interval=self.config["check_interval"],
-                max_concurrent_checks=self.config["max_concurrent_checks"],
-                startup_notify=self.config.get("startup_notify", False),
+                debug=self.debug,
                 on_event=self.event_queue.put,
-                enable_daily_intimacy_reminder=self.config.get(
-                    "enable_daily_intimacy_reminder", True
-                ),
-                service_notifier=monitor._create_notifier(dict(self.config)),
             )
         except (TypeError, ValueError) as exc:
             messagebox.showerror("无法开始监控", str(exc), parent=self.root)
@@ -1438,7 +1431,7 @@ class MonitorGui:
 
         def verify() -> None:
             try:
-                success = monitor._create_notifier(dict(self.config)).verify_connection()
+                success = create_notifier(self.config).verify_connection()
                 self.event_queue.put({"type": "push_test", "success": success})
             except Exception as exc:
                 self.event_queue.put(
@@ -1561,8 +1554,9 @@ class MonitorGui:
         self.root.destroy()
 
 
-def run_gui(config_path: Path | None = None, debug: bool = False) -> None:
+def run_gui(config_path: Optional[Path] = None, debug: bool = False) -> None:
     """Create and run the desktop application."""
+    monitor.setup_logging(verbose=debug)
     enable_windows_high_dpi()
     root = tk.Tk()
     root.withdraw()

@@ -21,7 +21,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Callable, Optional
 
 from douyin_client import DouyinClient
 from monitor_service import (
@@ -29,12 +29,12 @@ from monitor_service import (
     MonitorCheckCancelled,
     MonitorService,
 )
+from monitor_types import StreamerStatus, WorkerPreparation
 from notifier import ServerChanNotifier
 from streamer_config import (
     add_streamer,
     enabled_streamers,
-    migrate_legacy_streamer,
-    normalize_streamers,
+    ensure_private_config_permissions,
     remove_streamer,
     save_config_atomic,
     set_streamer_enabled,
@@ -57,7 +57,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -129,7 +129,7 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     return logging.getLogger("douyin_monitor")
 
 
-logger = setup_logging()
+logger = logging.getLogger("douyin_monitor")
 
 
 # ── Tiny helper: print to terminal AND write to log in one call ──
@@ -154,10 +154,11 @@ class MonitorState:
     OFFLINE = "offline"
     LIVE = "live"
 
-    def __init__(self):
+    def __init__(self, clock: Optional[Callable[[], float]] = None):
+        self._clock = clock or (lambda: time.time())
         self.status = self.UNKNOWN
         self.last_live_start: Optional[float] = None
-        self.last_status_change: float = time.time()
+        self.last_status_change: float = self._clock()
         self.streamer_nickname: str = ""
         self.stream_room_id: str = ""
         self.stream_title: str = ""
@@ -206,8 +207,8 @@ class MonitorState:
             # Transition: OFFLINE/UNKNOWN -> LIVE
             logger.info(f"状态变更: {self.status} -> LIVE")
             self.status = self.LIVE
-            self.last_live_start = time.time()
-            self.last_status_change = time.time()
+            self.last_live_start = self._clock()
+            self.last_status_change = self._clock()
             self.notification_sent = False
             self.repeat_notify_count = 0
             self.last_repeat_notify_time = 0.0
@@ -229,14 +230,14 @@ class MonitorState:
                 f"状态变更: LIVE -> OFFLINE (直播时长: {duration})"
             )
             self.status = self.OFFLINE
-            self.last_status_change = time.time()
+            self.last_status_change = self._clock()
             return "went_offline"
 
     def _format_duration(self) -> str:
         """Format the current live duration as a human-readable string."""
         if not self.last_live_start:
             return ""
-        secs = int(time.time() - self.last_live_start)
+        secs = int(self._clock() - self.last_live_start)
         hours, remainder = divmod(secs, 3600)
         mins, secs = divmod(remainder, 60)
         parts = []
@@ -257,7 +258,7 @@ class MonitorState:
     def mark_first_notification_sent(self) -> None:
         """Commit the first-live notification only after a successful send."""
         self.notification_sent = True
-        self.last_repeat_notify_time = time.time()
+        self.last_repeat_notify_time = self._clock()
 
     def should_notify_repeat(self) -> bool:
         """Check if we should send a REPEAT notification while still live.
@@ -269,10 +270,10 @@ class MonitorState:
             return False
         if self.repeat_notify_count >= self.max_repeat_notifications:
             return False
-        if time.time() - self.last_repeat_notify_time < self.repeat_notify_interval:
+        if self._clock() - self.last_repeat_notify_time < self.repeat_notify_interval:
             return False
         self.repeat_notify_count += 1
-        self.last_repeat_notify_time = time.time()
+        self.last_repeat_notify_time = self._clock()
         logger.info(
             f"重复推送 ({self.repeat_notify_count}/"
             f"{self.max_repeat_notifications})"
@@ -308,7 +309,12 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    return normalize_app_config(config)
+    normalized = normalize_app_config(config)
+    if normalized != config:
+        save_config_atomic(config_path, normalized)
+    else:
+        ensure_private_config_permissions(config_path)
+    return normalized
 
 
 def _default_config() -> Dict[str, Any]:
@@ -342,12 +348,10 @@ def _pause_if_frozen() -> None:
 
 
 def _create_notifier(config: Dict[str, Any]) -> ServerChanNotifier:
-    """Create a ServerChanNotifier from a configuration dict."""
-    return ServerChanNotifier(
-        sendkey=config.get("sendkey", ""),
-        uid=config.get("push_uid"),
-        push_url=config.get("push_url"),
-    )
+    """Compatibility wrapper for the public application assembly helper."""
+    from application import create_notifier
+
+    return create_notifier(config)
 
 
 def is_serverchan_configured(config: Dict[str, Any]) -> bool:
@@ -566,6 +570,10 @@ def prompt_target_url() -> str:
 # ===== Main Monitor =====
 
 
+class MonitorConfigurationError(ValueError):
+    """The supplied configuration cannot create a monitor worker."""
+
+
 class DouyinLiveMonitor:
     """Main monitor that orchestrates detection and notification."""
 
@@ -575,6 +583,9 @@ class DouyinLiveMonitor:
         target_url: str = "",
         debug: bool = False,
         daily_reminder_managed_externally: bool = False,
+        client: Optional[DouyinClient] = None,
+        notifier: Optional[ServerChanNotifier] = None,
+        clock: Optional[Callable[[], float]] = None,
     ):
         self.config = config
         self.target_url = target_url or config.get("target_url", "")
@@ -585,14 +596,17 @@ class DouyinLiveMonitor:
         )
 
         if not self.target_url:
-            logger.error("未设置目标主播链接")
-            sys.exit(1)
+            raise MonitorConfigurationError("未设置目标主播链接")
+        try:
+            self.target_url = validate_streamer_url(str(self.target_url))
+        except ValueError as exc:
+            raise MonitorConfigurationError(str(exc)) from exc
 
         # Initialize components
-        self.client = DouyinClient(debug=debug)
-        self.notifier = _create_notifier(config)
+        self.client = client or DouyinClient(debug=debug)
+        self.notifier = notifier or _create_notifier(config)
 
-        self.state = MonitorState()
+        self.state = MonitorState(clock=clock)
         self.state.repeat_notify_interval = config.get(
             "repeat_notify_interval", 600
         )
@@ -628,9 +642,14 @@ class DouyinLiveMonitor:
             logger.error(f"解析用户失败: {e}")
             return None
 
-    def prepare(self) -> Optional[str]:
+    def prepare(self) -> WorkerPreparation:
         """Resolve the target before scheduled checks begin."""
-        return self._resolve_sec_uid()
+        sec_uid = self._resolve_sec_uid() or ""
+        return WorkerPreparation(
+            sec_uid=sec_uid,
+            nickname=self.state.streamer_nickname,
+            status=StreamerStatus(self.state.status),
+        )
 
     def _handle_live_detected(self, info: Dict[str, Any]) -> None:
         """Handle when streamer goes live (first detection)."""
@@ -809,105 +828,25 @@ class DouyinLiveMonitor:
         return result
 
     def run(self) -> None:
-        """Main monitoring loop."""
-        logger.info("=" * 50)
-        logger.info("抖音直播监听器 启动")
-        logger.info(f"目标: {self.target_url}")
-        logger.info(f"检测间隔: {self.check_interval}s")
-        logger.info(f"日志文件: {LOG_FILE}")
-        logger.info("=" * 50)
-
-        # Resolve the target user
-        sec_uid = self._resolve_sec_uid()
-        if not sec_uid:
-            logger.error("无法解析目标用户，退出")
-            sys.exit(1)
-
-        # Save monitor state for next run
-        save_monitor_state(self.target_url, self.state.streamer_nickname)
-
-        # Send startup notification (optional test)
-        startup_notify = self.config.get("startup_notify", False)
-        if startup_notify:
-            self.notifier.send(
-                title="[START] 抖音直播监听器已启动",
-                desp=(
-                    f"**监控目标**: {self.state.streamer_nickname}\n"
-                    f"**检测间隔**: {self.check_interval}s\n"
-                    f"**启动时间**: "
-                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                ),
-            )
-
-        logger.info(f"开始监控: {self.state.get_summary()}")
-
-        self._start_stop_listener()
-        print("监控已启动，输入 q 后回车可终止并退出；也可按 Ctrl+C。")
-
-        check_count = 0
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-
-        while self.running:
-            next_check = time.time() + self.check_interval
-
-            try:
-                check_count += 1
-
-                result = self.check_once()
-                is_live = result.get("is_live", False)
-                method = result.get("method", "unknown")
-
-                # --- compact one-line status to terminal + full log ---
-                nick = self.state.streamer_nickname or "?"
-                now = datetime.now().strftime("%m-%d %H:%M")
-                if is_live:
-                    title = (result.get("title") or "")[:30]
-                    line = f"🔴 {now}  #{check_count}  {nick} 直播中 | {method}"
-                    if title:
-                        line += f" | {title}"
-                    logger.info(line)
-                    print(line)
-                else:
-                    line = f"⚫ {now}  #{check_count}  {nick} 未开播 | {method}"
-                    logger.info(line)
-                    if check_count % 10 == 1:
-                        print(line)
-
-                consecutive_errors = 0  # Reset error counter on success
-
-            except KeyboardInterrupt:
-                logger.info("\n收到中断信号，正在退出...")
-                break
-            except MonitorCheckCancelled:
-                logger.info("检测任务已停止，忽略在途结果")
-                break
-            except LiveStatusUnknownError as e:
-                logger.warning(f"直播状态暂时无法确认，将继续检测: {e}")
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(
-                    f"检测异常 (连续错误 {consecutive_errors}/"
-                    f"{max_consecutive_errors}): {e}",
-                    exc_info=True,
-                )
-                # Errors always visible on terminal (WARNING+)
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error(
-                        f"连续错误达到 {max_consecutive_errors} 次，退出"
-                    )
-                    break
-
-            # Wait until the next scheduled check (compensates for check duration)
-            if self.running:
-                sleep_time = next_check - time.time()
-                if sleep_time > 0:
-                    try:
-                        self._stop_event.wait(sleep_time)
-                    except KeyboardInterrupt:
-                        break
-
-        logger.info("监听器已停止")
+        """Delegate the legacy single-worker API to ``MonitorService``."""
+        service = MonitorService(
+            [{
+                "id": "legacy-single",
+                "url": self.target_url,
+                "label": self.state.streamer_nickname,
+                "enabled": True,
+            }],
+            worker_factory=lambda _entry: self,
+            check_interval=self.check_interval,
+            max_concurrent_checks=1,
+            startup_notify=self.config.get("startup_notify", False),
+            enable_daily_intimacy_reminder=self.config.get(
+                "enable_daily_intimacy_reminder", True
+            ),
+            service_notifier=self.notifier.clone(),
+            enable_console_stop=True,
+        )
+        service.run()
 
     def stop(self) -> None:
         """Signal the monitor to stop."""
@@ -931,55 +870,16 @@ class DouyinLiveMonitor:
         if callable(close):
             close()
 
-    def _start_stop_listener(self) -> None:
-        """Listen for a console command that stops continuous monitoring."""
-        stdin = getattr(sys, "stdin", None)
-        if stdin is None or not hasattr(stdin, "isatty") or not stdin.isatty():
-            return
-
-        def listen() -> None:
-            while self.running:
-                try:
-                    command = input().strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    return
-                if command in {"q", "quit", "exit", "stop", "退出"}:
-                    print("正在停止监控...")
-                    self.stop()
-                    return
-                if command:
-                    print("未知命令；输入 q 后回车退出。")
-
-        threading.Thread(
-            target=listen,
-            name="monitor-stop-listener",
-            daemon=True,
-        ).start()
-
-
 # ===== CLI Entry Point =====
 
 
 def _load_streamer_entries(
     config_path: Path, config: Dict[str, Any]
 ) -> list[Dict[str, Any]]:
-    """Validate v1.2 config and import the legacy single target once."""
-    legacy_state = load_monitor_state()
-    entries, normalized = normalize_streamers(config)
-    changed = normalized
-    migrated = False
-    if not entries and legacy_state.get("target_url"):
-        try:
-            migrated = migrate_legacy_streamer(config, legacy_state)
-            entries, normalized = normalize_streamers(config)
-            changed = changed or migrated or normalized
-        except ValueError as exc:
-            logger.warning(f"旧版主播记录无效，已跳过迁移: {exc}")
-    if changed:
-        save_config_atomic(config_path, config)
-    if migrated:
-        logger.info("已将上次监控的主播迁移到多主播配置")
-    return entries
+    """Compatibility wrapper for the public application assembly helper."""
+    from application import load_streamer_entries
+
+    return load_streamer_entries(config_path, config, load_monitor_state())
 
 
 def _print_streamers(entries: list[Dict[str, Any]]) -> None:
@@ -1094,6 +994,13 @@ def _print_once_results(
 
 
 def main():
+    setup_logging()
+    from application import (
+        create_monitor_service,
+        create_notifier,
+        load_streamer_entries,
+    )
+
     parser = argparse.ArgumentParser(
         description="抖音直播监听器 - 检测开播并通过Server酱³推送通知",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1198,7 +1105,9 @@ def main():
     config_path = Path(args.config)
     try:
         config = load_config(config_path)
-        entries = _load_streamer_entries(config_path, config)
+        entries = load_streamer_entries(
+            config_path, config, load_monitor_state()
+        )
         if _handle_streamer_command(args, config_path, config, entries):
             return
     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -1216,7 +1125,7 @@ def main():
             )
             _pause_if_frozen()
             sys.exit(1)
-        notifier = _create_notifier(config)
+        notifier = create_notifier(config)
         logger.info("测试 Server酱³ 连接...")
         if notifier.verify_connection():
             logger.info("[OK] Server酱³ 连接测试成功!")
@@ -1242,26 +1151,11 @@ def main():
         _pause_if_frozen()
         sys.exit(1)
 
-    def worker_factory(entry: Dict[str, Any]) -> DouyinLiveMonitor:
-        return DouyinLiveMonitor(
-            dict(config),
-            target_url=entry["url"],
-            debug=args.debug,
-            daily_reminder_managed_externally=True,
-        )
-
     try:
-        service = MonitorService(
+        service = create_monitor_service(
+            config,
             active_entries,
-            worker_factory=worker_factory,
-            check_interval=config.get("check_interval", 30),
-            max_concurrent_checks=config.get("max_concurrent_checks", 2),
-            startup_notify=config.get("startup_notify", False),
-            on_event=None,
-            enable_daily_intimacy_reminder=config.get(
-                "enable_daily_intimacy_reminder", True
-            ),
-            service_notifier=_create_notifier(dict(config)),
+            debug=args.debug,
             enable_console_stop=True,
         )
     except (TypeError, ValueError) as exc:

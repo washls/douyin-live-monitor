@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import Mock, patch
 import requests
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from monitor import (
     DouyinLiveMonitor,
@@ -13,7 +15,7 @@ from monitor import (
 )
 from notifier import ServerChanNotifier
 from douyin_client import DouyinClient
-from monitor_service import LiveStatusUnknownError, MonitorCheckCancelled
+from monitor_service import MonitorCheckCancelled
 
 
 class MonitorStateTests(unittest.TestCase):
@@ -260,34 +262,27 @@ class MonitorControlTests(unittest.TestCase):
 
         live_monitor.notifier.send_live_notification.assert_called_once()
 
-    def test_run_keeps_polling_after_many_unknown_results(self):
+    def test_run_delegates_to_single_worker_service(self):
         live_monitor = object.__new__(DouyinLiveMonitor)
         live_monitor.target_url = "https://www.douyin.com/user/recovering"
-        live_monitor.check_interval = 1
-        live_monitor.config = {"startup_notify": False}
+        live_monitor.check_interval = 30
+        live_monitor.config = {
+            "startup_notify": False,
+            "enable_daily_intimacy_reminder": True,
+        }
         live_monitor.state = MonitorState()
         live_monitor.state.streamer_nickname = "恢复主播"
         live_monitor.notifier = Mock()
-        live_monitor.running = True
-        live_monitor._stop_event = Mock()
-        live_monitor._resolve_sec_uid = Mock(return_value="sec-recovering")
-        live_monitor._start_stop_listener = Mock()
-        call_count = 0
+        live_monitor.notifier.clone.return_value = Mock()
 
-        def check_once():
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 12:
-                raise LiveStatusUnknownError("profile_api_empty_response")
-            live_monitor.running = False
-            return {"is_live": True, "method": "api", "title": ""}
-
-        live_monitor.check_once = check_once
-
-        with patch("monitor.save_monitor_state"):
+        with patch("monitor.MonitorService") as service_class:
             live_monitor.run()
 
-        self.assertEqual(call_count, 13)
+        service_class.return_value.run.assert_called_once_with()
+        args, kwargs = service_class.call_args
+        self.assertEqual(len(args[0]), 1)
+        self.assertIs(kwargs["worker_factory"](args[0][0]), live_monitor)
+        self.assertTrue(kwargs["enable_console_stop"])
 
     def test_windows_console_is_reconfigured_without_being_closed(self):
         stream = Mock()
@@ -339,10 +334,12 @@ class MonitorControlTests(unittest.TestCase):
         }
         legacy = {"target_url": "https://v.douyin.com/old/"}
 
-        with patch("monitor.load_monitor_state", return_value=legacy), patch(
-            "monitor.logger.info"
-        ) as log_info:
-            entries = _load_streamer_entries(Mock(), config)
+        with TemporaryDirectory() as temp_dir, patch(
+            "monitor.load_monitor_state", return_value=legacy
+        ), patch("application.logger.info") as log_info:
+            entries = _load_streamer_entries(
+                Path(temp_dir) / "config.json", config
+            )
 
         self.assertEqual(len(entries), 1)
         self.assertFalse(
@@ -353,10 +350,12 @@ class MonitorControlTests(unittest.TestCase):
         config = {"streamers": [], "max_concurrent_checks": 2}
         legacy = {"target_url": "https://example.com/not-douyin"}
 
-        with patch("monitor.load_monitor_state", return_value=legacy), patch(
-            "monitor.logger.warning"
-        ) as log_warning:
-            entries = _load_streamer_entries(Mock(), config)
+        with TemporaryDirectory() as temp_dir, patch(
+            "monitor.load_monitor_state", return_value=legacy
+        ), patch("application.logger.warning") as log_warning:
+            entries = _load_streamer_entries(
+                Path(temp_dir) / "config.json", config
+            )
 
         self.assertEqual(entries, [])
         self.assertTrue(log_warning.called)

@@ -1,0 +1,38 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Tests with coverage
+        run: |
+          python -m coverage run -m pytest -q
+          python -m coverage report
+      - name: Ruff
+        run: python -m ruff check .
+      - name: Compile production modules
+        run: >-
+          python -m py_compile abogus.py application.py douyin_client.py
+          gui_app.py gui_entry.py monitor.py monitor_service.py monitor_types.py
+          notifier.py streamer_config.py streamer_logging.py
+      - name: Build Windows executable
+        if: matrix.python-version == '3.12'
+        run: python -m PyInstaller --clean --noconfirm douyin-monitor.spec

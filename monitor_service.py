@@ -10,13 +10,19 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
+from monitor_types import (
+    MonitorEvent,
+    StreamerSnapshot,
+    StreamerStatus,
+    WorkerPreparation,
+)
 from streamer_logging import run_with_streamer_context, streamer_log_context
 
 
 logger = logging.getLogger(__name__)
 
 WorkerFactory = Callable[[Mapping[str, Any]], Any]
-EventCallback = Callable[[Dict[str, Any]], None]
+EventCallback = Callable[[MonitorEvent], None]
 
 
 class LiveStatusUnknownError(RuntimeError):
@@ -99,16 +105,24 @@ class MonitorService:
     def _emit(self, event_type: str, streamer_id: str = "", **data: Any) -> None:
         if self.on_event is None:
             return
-        event = {"type": event_type, "streamer_id": streamer_id, **data}
+        event = MonitorEvent.create(event_type, streamer_id, **data)
         try:
             self.on_event(event)
         except Exception:
             logger.exception("监控事件回调异常")
 
-    def snapshot(self) -> List[Dict[str, Any]]:
-        """Return a thread-safe copy of current per-streamer status."""
+    def snapshot(self) -> List[StreamerSnapshot]:
+        """Return immutable thread-safe per-streamer snapshots."""
         with self._lock:
-            return [dict(self._runtime[str(entry["id"])]) for entry in self.streamers]
+            snapshots = []
+            for entry in self.streamers:
+                runtime = dict(self._runtime[str(entry["id"])])
+                try:
+                    runtime["status"] = StreamerStatus(runtime["status"])
+                except ValueError:
+                    runtime["status"] = StreamerStatus.UNKNOWN
+                snapshots.append(StreamerSnapshot(**runtime))
+            return snapshots
 
     @staticmethod
     def initial_offsets(count: int, check_interval: int) -> List[float]:
@@ -151,14 +165,26 @@ class MonitorService:
                 for future in as_completed(futures):
                     streamer_id = futures[future]
                     try:
-                        sec_uid = future.result()
+                        prepared = future.result()
+                        if isinstance(prepared, WorkerPreparation):
+                            sec_uid = prepared.sec_uid
+                            preparation = prepared
+                        else:
+                            sec_uid = str(prepared or "")
+                            preparation = WorkerPreparation(sec_uid=sec_uid)
                         if not sec_uid:
                             raise RuntimeError("无法解析主播")
                         prepared_sec_uids[streamer_id] = str(sec_uid)
+                        with self._lock:
+                            runtime = self._runtime[streamer_id]
+                            runtime["nickname"] = (
+                                preparation.nickname or runtime["label"]
+                            )
+                            runtime["status"] = preparation.status.value
                     except Exception as exc:
                         self._mark_prepare_error(streamer_id, exc)
-                        run_with_streamer_context(
-                            streamer_id, candidates[streamer_id].stop
+                        self._close_candidate(
+                            streamer_id, candidates[streamer_id]
                         )
 
         seen_sec_uids: Dict[str, str] = {}
@@ -171,23 +197,31 @@ class MonitorService:
             if duplicate_of:
                 message = f"与主播 {duplicate_of} 指向同一账号，已跳过"
                 self._mark_prepare_error(streamer_id, RuntimeError(message))
-                run_with_streamer_context(
-                    streamer_id, candidates[streamer_id].stop
-                )
+                self._close_candidate(streamer_id, candidates[streamer_id])
                 continue
             seen_sec_uids[sec_uid] = streamer_id
             worker = candidates[streamer_id]
-            nickname = worker.state.streamer_nickname or entry.get("label", "")
             with self._lock:
                 self._workers[streamer_id] = worker
                 runtime = self._runtime[streamer_id]
-                runtime["nickname"] = nickname
-                runtime["status"] = worker.state.status
                 runtime["last_error"] = ""
+                nickname = runtime["nickname"]
             self._emit("prepared", streamer_id, nickname=nickname)
 
         with self._lock:
             return list(self._workers)
+
+    @staticmethod
+    def _close_candidate(streamer_id: str, worker: Any) -> None:
+        """Release a worker rejected during preparation."""
+        stop_and_wait = getattr(worker, "stop_and_wait", None)
+        if callable(stop_and_wait):
+            run_with_streamer_context(streamer_id, stop_and_wait)
+            return
+        run_with_streamer_context(streamer_id, worker.stop)
+        close = getattr(worker, "close", None)
+        if callable(close):
+            run_with_streamer_context(streamer_id, close)
 
     def _mark_prepare_error(self, streamer_id: str, exc: Exception) -> None:
         message = str(exc)
@@ -204,9 +238,9 @@ class MonitorService:
         if not self.startup_notify or not self._workers:
             return
         names = []
-        for streamer_id, worker in self._workers.items():
+        for streamer_id in self._workers:
             runtime = self._runtime[streamer_id]
-            names.append(worker.state.streamer_nickname or runtime["label"] or streamer_id)
+            names.append(runtime["nickname"] or runtime["label"] or streamer_id)
         self._get_service_notifier().send(
             title="[START] 抖音直播监听器已启动",
             desp=(
@@ -468,11 +502,9 @@ class MonitorService:
             self._check_daily_intimacy_reminder()
 
     def _record_success(self, streamer_id: str, result: Mapping[str, Any]) -> None:
-        worker = self._workers[streamer_id]
         now_text = datetime.now().strftime("%m-%d %H:%M")
         nickname = (
             result.get("nickname")
-            or worker.state.streamer_nickname
             or self._runtime[streamer_id]["label"]
             or streamer_id
         )
@@ -525,7 +557,12 @@ class MonitorService:
                 runtime["status"] = "error"
                 count = runtime["consecutive_errors"]
             delay = min(
-                60.0 * (2 ** min(unknown_count - 1, 3)),
+                max(
+                    float(self.check_interval),
+                    (60.0, 120.0, 240.0, 300.0)[
+                        min(unknown_count - 1, 3)
+                    ],
+                ),
                 float(max(300, self.check_interval)),
             )
             with streamer_log_context(streamer_id):
@@ -626,6 +663,10 @@ class MonitorService:
         with self._lock:
             workers = list(self._workers.items())
         for streamer_id, worker in workers:
+            stop_and_wait = getattr(worker, "stop_and_wait", None)
+            if callable(stop_and_wait):
+                run_with_streamer_context(streamer_id, stop_and_wait)
+                continue
             close = getattr(worker, "close", None)
             if callable(close):
                 run_with_streamer_context(streamer_id, close)

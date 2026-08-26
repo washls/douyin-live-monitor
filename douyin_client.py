@@ -141,19 +141,6 @@ def compact_log_preview(value: Any, limit: int = 240) -> str:
     """Return a bounded single-line preview for persistent and GUI logs."""
     return " ".join(str(value or "").split())[:limit].rstrip()
 
-# ===== Path Helpers (supports PyInstaller frozen exe) =====
-
-def _get_bundle_dir() -> str:
-    """Get the directory containing bundled assets (x-bogus.js, etc.).
-
-    When frozen by PyInstaller, assets are in sys._MEIPASS.
-    When running as script, it's the script's directory.
-    """
-    if getattr(sys, 'frozen', False):
-        return sys._MEIPASS  # type: ignore[attr-defined]
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 def _get_runtime_dir() -> str:
     """Get the directory for runtime writable files (debug_dumps, etc.).
 
@@ -165,11 +152,8 @@ def _get_runtime_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-# Base directories
-BUNDLE_DIR = _get_bundle_dir()       # Read-only bundled assets
-RUNTIME_DIR = _get_runtime_dir()     # Writable runtime files
-
-X_BOGUS_JS = os.path.join(BUNDLE_DIR, "x-bogus.js")
+# Runtime writable directory
+RUNTIME_DIR = _get_runtime_dir()
 DEBUG_DIR = os.path.join(RUNTIME_DIR, "debug_dumps")
 
 
@@ -1415,7 +1399,11 @@ class DouyinClient:
                     self._dump_debug("webcast_info_by_user", data, is_json=True)
 
                     if isinstance(data, dict):
-                        result["determined"] = True
+                        recognized = "data" in data or any(
+                            key in data
+                            for key in ("room", "room_id", "id_str", "status")
+                        )
+                        result["determined"] = recognized
                         room_data = data.get("data", {}) or data
                         if isinstance(room_data, dict):
                             # Get room info
@@ -1771,7 +1759,6 @@ class DouyinClient:
         full_started = self._monotonic()
         self._last_full_check_at = full_started
         strategies = (
-            ("profile_live_link", self.check_live_by_profile_live_link),
             ("html", self.check_live_by_html),
             ("ies_api", self.check_live_by_iesdouyin_api),
             ("webcast_api", self.check_live_by_webcast_api),

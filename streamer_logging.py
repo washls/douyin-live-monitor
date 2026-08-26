@@ -10,6 +10,8 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Callable, Deque, Dict, Iterator, List
 
+from monitor_types import MonitorEvent
+
 
 CURRENT_STREAMER_ID: ContextVar[str] = ContextVar(
     "current_streamer_id", default=""
@@ -67,7 +69,7 @@ def run_with_streamer_context(
 class StreamerLogHandler(logging.Handler):
     """Forward contextual log records to the GUI event queue."""
 
-    def __init__(self, callback: Callable[[Dict[str, Any]], None]):
+    def __init__(self, callback: Callable[[MonitorEvent], None]):
         super().__init__(level=logging.DEBUG)
         self.callback = callback
 
@@ -79,11 +81,11 @@ class StreamerLogHandler(logging.Handler):
             timestamp = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
             message = compact_log_line(record.getMessage())
             self.callback(
-                {
-                    "type": "log",
-                    "streamer_id": streamer_id,
-                    "message": f"{timestamp} [{record.levelname}] {message}",
-                }
+                MonitorEvent.create(
+                    "log",
+                    streamer_id,
+                    message=f"{timestamp} [{record.levelname}] {message}",
+                )
             )
         except Exception:
             self.handleError(record)

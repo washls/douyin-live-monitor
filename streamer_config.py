@@ -193,19 +193,31 @@ def save_config_atomic(config_path: Path, config: Mapping[str, Any]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = config_path.with_name(f".{config_path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        descriptor = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8", newline="\n"
+        ) as handle:
             json.dump(config, handle, ensure_ascii=False, indent=4)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, config_path)
-        if _IS_POSIX:
-            os.chmod(config_path, 0o600)
+        ensure_private_config_permissions(config_path)
     finally:
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def ensure_private_config_permissions(config_path: Path) -> None:
+    """Restrict POSIX configuration files while preserving Windows ACLs."""
+    if _IS_POSIX:
+        os.chmod(Path(config_path), 0o600)
 
 
 def add_streamer(

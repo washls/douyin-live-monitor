@@ -22,7 +22,7 @@ echo    Python ✓
 :: Install Python dependencies
 echo.
 echo [2/2] 安装 Python 依赖...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo [错误] 依赖安装失败
     pause

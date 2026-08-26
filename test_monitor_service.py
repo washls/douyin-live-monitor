@@ -104,6 +104,22 @@ def test_unknown_backoff_sequence_and_success_reset():
     assert service.snapshot()[0]["consecutive_unknowns"] == 0
 
 
+def test_unknown_backoff_never_polls_faster_than_long_normal_interval():
+    service = MonitorService(
+        [streamer("one")],
+        worker_factory=lambda entry: FakeWorker(entry),
+        check_interval=600,
+    )
+    service.prepare_all()
+
+    delays = [
+        service._record_error("one", LiveStatusUnknownError("unknown"))
+        for _ in range(5)
+    ]
+
+    assert delays == [600.0] * 5
+
+
 def streamer(streamer_id, label=""):
     return {
         "id": streamer_id,
@@ -115,10 +131,13 @@ def streamer(streamer_id, label=""):
 
 def test_duplicate_resolved_user_is_suspended():
     entries = [streamer("one"), streamer("two")]
+    created = {}
 
     service = MonitorService(
         entries,
-        worker_factory=lambda entry: FakeWorker(entry, sec_uid="same-user"),
+        worker_factory=lambda entry: created.setdefault(
+            entry["id"], FakeWorker(entry, sec_uid="same-user")
+        ),
     )
 
     assert service.prepare_all() == ["one"]
@@ -126,6 +145,7 @@ def test_duplicate_resolved_user_is_suspended():
     assert snapshot["one"]["suspended"] is False
     assert snapshot["two"]["suspended"] is True
     assert "指向同一账号" in snapshot["two"]["last_error"]
+    assert created["two"].closed is True
 
 
 def test_one_worker_failure_does_not_block_other_worker():
@@ -400,9 +420,10 @@ def test_monitor_service_keeps_legacy_on_event_positional_argument():
         events.append,
     )
 
-    service._emit("probe", "one")
+    service._emit("prepared", "one")
 
-    assert events == [{"type": "probe", "streamer_id": "one"}]
+    assert events[0]["type"] == "prepared"
+    assert events[0]["streamer_id"] == "one"
     assert service.enable_daily_intimacy_reminder is True
 
 
@@ -587,9 +608,12 @@ def test_scheduler_checks_all_workers_and_stops_from_event():
 
 
 def test_run_reports_failure_when_no_worker_can_prepare():
+    created = []
+
     def factory(entry):
         worker = FakeWorker(entry)
         worker.prepare = lambda: None
+        created.append(worker)
         return worker
 
     service = MonitorService(
@@ -598,3 +622,4 @@ def test_run_reports_failure_when_no_worker_can_prepare():
     )
 
     assert service.run() is False
+    assert created[0].closed is True

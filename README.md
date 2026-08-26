@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.5.0-orange.svg" alt="Version 1.5.0">
+  <img src="https://img.shields.io/badge/version-1.5.1-orange.svg" alt="Version 1.5.1">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
@@ -13,7 +13,7 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.5.0.exe`，不需要安装 Python。
+Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.5.1.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。程序进入 GUI 后不会保留黑色命令行窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
@@ -22,13 +22,13 @@ Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-m
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.5.0
+## v1.5.1
 
-这一版减少了多主播同时直播时的重复提醒。23:57、23:58、23:59 的每日亲密度提醒现在每分钟只发送一条，正文汇总当时所有已确认直播中的主播。运行状态页新增“停止所选主播”，可以结束一个任务而不影响其他主播；顶部按钮改为“停止全部”，两个操作的范围更加清楚。README 也按首次使用、运行控制、排障和开发说明重新整理。
+这一版集中修复安全、误报和长期运行资源占用问题。日志现在统一脱敏，不再输出推送密钥或 Cookie 内容；旧 HTTP 抖音链接会自动升级为 HTTPS，短链接重定向仅允许可信公网目标。无法验证的直播分享链接会保持“未知”，不会触发开播通知。
 
-这一版还修复了停止最后一个主播时的事件顺序竞态，确保迟到的单任务事件不会把“监控已停止”覆盖为运行中状态。
+普通离线轮询只需主接口和 Webcast 双源确认，每 10 轮或最长 5 分钟执行一次完整巡检。未知结果使用渐进退避，检测策略按 45 秒启动预算依次执行，减少接口请求、线程和连接占用。CLI 与 GUI 现在共用同一配置校验、应用装配和调度实现。
 
-如需回退，可以继续使用 [v1.4.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.4.0)。v1.5.0 没有修改配置结构，也没有不可逆的数据迁移。
+如需回退，可以继续使用 [v1.5.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.5.0)。v1.5.1 保持原配置字段兼容，没有不可逆的数据迁移。
 
 ## 主要功能
 
@@ -36,6 +36,8 @@ Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后
 - 自动识别开播、持续直播、切换直播间和下播，并按设置发送通知。
 - 默认最多同时检测 2 个主播，检测任务错峰执行，适合长时间运行。
 - 主接口暂时返回空响应时会刷新该主播会话并重试，不会直接误判为下播。
+- 双源确认离线后降低普通轮询请求量，同时保留周期性完整巡检。
+- 未知状态采用渐进退避；明确结果会立即恢复正常检测间隔。
 - 推送请求遇到超时或连接中断时不会自动重复提交，减少服务端已接收后再次推送的风险。
 - 详细日志自动轮转，单个主播的本次运行日志可以在 GUI 中单独查看。
 - 支持 Windows 图形界面，也保留完整命令行模式。
@@ -122,7 +124,7 @@ Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后
 ```bash
 git clone https://github.com/washls/douyin-live-monitor.git
 cd douyin-live-monitor
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python gui_entry.py
 ```
 
@@ -167,8 +169,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-.\douyin-monitor-v1.5.0.exe --once
-.\douyin-monitor-v1.5.0.exe --list-streamers
+.\douyin-monitor-v1.5.1.exe --once
+.\douyin-monitor-v1.5.1.exe --list-streamers
 ```
 
 ## 日志与排障
@@ -217,11 +219,13 @@ python -m ruff check .
 python -m PyInstaller --clean --noconfirm douyin-monitor.spec
 ```
 
+开发与 CI 依赖固定在 `requirements-dev.txt`。Windows CI 会在 Python 3.9 和 3.12 上运行测试、覆盖率报告、Ruff 和编译检查，并在 Python 3.12 上验证 PyInstaller 构建；覆盖率当前仅报告，不设置全局阈值。
+
 正式 Windows EXE 使用 `douyin-monitor.spec` 构建。发布前应同时验证 GUI 双击启动、命令行参数、版本输出和关键监控流程。
 
 ## 检测方式
 
-程序会按可用性依次尝试抖音用户接口、Webcast 接口、用户主页内嵌数据、IES 分享页和直播间页面。某一种方法失败时会继续尝试其他方法；只有得到明确结果时才更新为“直播中”或“未开播”。
+程序先使用抖音用户接口和 Webcast 接口双源确认。直播会立即返回；双源明确离线时结束普通轮询；未知、冲突或周期巡检到期时，才按顺序尝试用户主页、IES 分享页和直播间页面。只有得到明确结果时才更新为“直播中”或“未开播”。
 
 检测依赖平台公开页面和接口行为，平台变更可能导致暂时不可用。遇到问题时请提供脱敏日志和可复现时间段，便于定位具体检测链路。
 

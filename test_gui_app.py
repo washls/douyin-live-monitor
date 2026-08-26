@@ -180,9 +180,8 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
     config_path = tmp_path / "config.json"
     save_config_atomic(config_path, config)
     monkeypatch.setattr(
-        monitor,
-        "_load_streamer_entries",
-        lambda _path, loaded: list(loaded["streamers"]),
+        "gui_app.load_streamer_entries",
+        lambda _path, loaded, _legacy: list(loaded["streamers"]),
     )
     monkeypatch.setattr("gui_app.messagebox.askyesno", lambda *args, **kwargs: True)
     finished = threading.Event()
@@ -222,7 +221,12 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
                 }
             ]
 
-    monkeypatch.setattr("gui_app.MonitorService", FakeService)
+    monkeypatch.setattr(
+        "gui_app.create_monitor_service",
+        lambda _config, entries, **kwargs: FakeService(
+            entries, kwargs["on_event"]
+        ),
+    )
 
     try:
         app = MonitorGui(root, config_path)
