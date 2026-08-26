@@ -57,7 +57,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -92,15 +92,17 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     root.setLevel(logging.DEBUG)
 
     # --- console handler ------------------------------------------------
-    _configure_console_output(sys.stdout)
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG if verbose else logging.WARNING)
-    console.setFormatter(
-        RedactingFormatter(
-            "%(asctime)s  %(message)s",
-            datefmt="%H:%M:%S",
+    console = None
+    if sys.stdout is not None:
+        _configure_console_output(sys.stdout)
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(logging.DEBUG if verbose else logging.WARNING)
+        console.setFormatter(
+            RedactingFormatter(
+                "%(asctime)s  %(message)s",
+                datefmt="%H:%M:%S",
+            )
         )
-    )
 
     # --- file handler --------------------------------------------------
     # Keep verbose diagnostics available without allowing monitor.log to grow
@@ -119,7 +121,8 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
         )
     )
 
-    root.addHandler(console)
+    if console is not None:
+        root.addHandler(console)
     root.addHandler(file_handler)
 
     # urllib3 DEBUG output includes full request URLs. Push URLs contain the

@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.5.1-orange.svg" alt="Version 1.5.1">
+  <img src="https://img.shields.io/badge/version-1.5.2-orange.svg" alt="Version 1.5.2">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
@@ -13,22 +13,22 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.5.1.exe`，不需要安装 Python。
+Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.5.2.exe`，不需要安装 Python。
 
-1. 双击 EXE 打开图形界面。程序进入 GUI 后不会保留黑色命令行窗口。
+1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
 3. 点击“新增主播”，填写主播主页链接和便于识别的名称。
 4. 点击“开始监控”。任务状态表会持续显示每个主播的检测结果。
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.5.1
+## v1.5.2
 
-这一版集中修复安全、误报和长期运行资源占用问题。日志现在统一脱敏，不再输出推送密钥或 Cookie 内容；旧 HTTP 抖音链接会自动升级为 HTTPS，短链接重定向仅允许可信公网目标。无法验证的直播分享链接会保持“未知”，不会触发开播通知。
+这一版修复 Windows 11 双击 EXE 后任务栏仍保留终端窗口的问题。正式 EXE 现在使用原生 Windows GUI 子系统，默认启动不会再创建 Windows Terminal 窗口；传入命令行参数时，程序才会按需连接已有终端或创建控制台，现有 CLI 功能保持可用。
 
-普通离线轮询只需主接口和 Webcast 双源确认，每 10 轮或最长 5 分钟执行一次完整巡检。未知结果使用渐进退避，检测策略按 45 秒启动预算依次执行，减少接口请求、线程和连接占用。CLI 与 GUI 现在共用同一配置校验、应用装配和调度实现。
+v1.5.2 保持 v1.5.1 的安全、误报和长期运行资源优化，也保持原配置字段与命令行参数兼容，没有不可逆的数据迁移。
 
-如需回退，可以继续使用 [v1.5.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.5.0)。v1.5.1 保持原配置字段兼容，没有不可逆的数据迁移。
+如需回退，可以继续使用 [v1.5.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.5.1)。
 
 ## 主要功能
 
@@ -169,9 +169,11 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-.\douyin-monitor-v1.5.1.exe --once
-.\douyin-monitor-v1.5.1.exe --list-streamers
+Start-Process -FilePath .\douyin-monitor-v1.5.2.exe -ArgumentList '--once' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.5.2.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
 ```
+
+正式 EXE 使用 Windows GUI 子系统，PowerShell 直接执行时不会自动等待。使用上面的 `Start-Process` 写法可以让命令行输出留在当前终端，并等待任务结束后再返回提示符。
 
 ## 日志与排障
 
@@ -190,7 +192,7 @@ python monitor.py --version
 
 #### 双击 EXE 后仍看到命令行窗口
 
-请确认下载的是当前 Release 中的正式 EXE。默认双击会进入 GUI 并隐藏程序自建的控制台；从已有终端带参数启动时，命令行窗口会保留，这是预期行为。
+请确认下载的是 v1.5.2 或更高版本的正式 EXE。默认双击只会创建 GUI 窗口；从已有终端带参数启动时，程序会连接该终端以显示命令行输出，这是预期行为。
 
 #### 推送测试失败
 
