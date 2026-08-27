@@ -42,12 +42,13 @@ class FakePystray:
     Icon = FakeIcon
 
 
-def test_tray_image_uses_the_existing_blue_and_red_identity():
+def test_tray_image_uses_the_shared_transparent_artwork():
     image = create_tray_image()
 
     assert image.size == (64, 64)
-    assert image.getpixel((8, 8))[:3] == (0, 103, 192)
-    assert image.getpixel((32, 32))[:3] == (196, 43, 28)
+    assert image.mode == "RGBA"
+    assert image.getpixel((0, 0))[3] == 0
+    assert image.getbbox() is not None
 
 
 def test_tray_menu_order_dynamic_state_and_callbacks():

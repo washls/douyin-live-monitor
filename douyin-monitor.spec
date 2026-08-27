@@ -5,7 +5,10 @@ a = Analysis(
     ['gui_entry.py'],
     pathex=[],
     binaries=[],
-    datas=[('THIRD_PARTY_NOTICES.md', '.')],
+    datas=[
+        ('THIRD_PARTY_NOTICES.md', '.'),
+        ('assets/app_icon.png', 'assets'),
+    ],
     hiddenimports=['abogus', 'pystray._win32'],
     hookspath=[],
     hooksconfig={},
@@ -22,7 +25,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='douyin-monitor-v1.6.0',
+    name='douyin-monitor-v1.6.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -36,4 +39,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     manifest='windows-dpi.manifest',
+    icon='assets/app_icon.ico',
 )

@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.6.0-orange.svg" alt="Version 1.6.0">
+  <img src="https://img.shields.io/badge/version-1.6.1-orange.svg" alt="Version 1.6.1">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
@@ -13,7 +13,7 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.6.0.exe`，不需要安装 Python。
+Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.6.1.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
@@ -23,13 +23,13 @@ Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-m
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.6.0
+## v1.6.1
 
-这一版增加 Windows 任务栏托盘。关闭窗口时可以直接退出，也可以只隐藏主窗口，让监控继续在后台运行。托盘菜单可以打开主窗口、开始或停止监控，并显示当前在线主播数量。
+这一版统一更新了程序图标。窗口标题栏、Windows 任务栏、任务栏托盘和 EXE 文件现在使用同一张透明背景插画，并针对不同系统图标尺寸提供清晰的缩放资源。
 
-“Windows 开机自启”启用后，程序会在登录系统时静默进入托盘，并自动监控所有已启用主播。GUI、持续命令行监控和单次检测共用单实例保护，不会同时创建两套监控任务。
+监控、通知、托盘驻留和开机自启行为均未改变，现有配置可以直接继续使用。
 
-旧配置默认仍按关闭窗口时退出处理，没有不可逆的数据迁移。如需回退，请先在 v1.6.0 中关闭开机自启，再使用 [v1.5.2](https://github.com/washls/douyin-live-monitor/releases/tag/v1.5.2)。
+本次没有配置迁移。如需回退，可以直接使用 [v1.6.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.6.0)。
 
 ## 主要功能
 
@@ -183,8 +183,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-Start-Process -FilePath .\douyin-monitor-v1.6.0.exe -ArgumentList '--once' -NoNewWindow -Wait
-Start-Process -FilePath .\douyin-monitor-v1.6.0.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.6.1.exe -ArgumentList '--once' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.6.1.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
 ```
 
 正式 EXE 使用 Windows GUI 子系统，PowerShell 直接执行时不会自动等待。使用上面的 `Start-Process` 写法可以让命令行输出留在当前终端，并等待任务结束后再返回提示符。

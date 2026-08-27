@@ -16,6 +16,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, Mapping, Optional, Union
 
 import monitor
+from app_icon import get_app_icon_path
 from application import (
     create_monitor_service,
     create_notifier,
@@ -391,26 +392,8 @@ class MonitorGui:
         )
 
     def _create_app_icon(self) -> tk.PhotoImage:
-        """Create a small flat live-status mark without an external asset."""
-        size = max(32, self._px(32))
-        icon = tk.PhotoImage(width=size, height=size)
-        blue = COLORS["accent"]
-        white = "#ffffff"
-        red = COLORS["danger"]
-        for y in range(size):
-            source_y = (y + 0.5) * 32 / size
-            if 3 <= source_y < 29:
-                for x in range(size):
-                    source_x = (x + 0.5) * 32 / size
-                    if 3 <= source_x < 29:
-                        color = blue
-                        distance = (source_x - 16) ** 2 + (source_y - 16) ** 2
-                        if 31 <= distance <= 46:
-                            color = white
-                        elif distance <= 8:
-                            color = red
-                        icon.put(color, (x, y))
-        return icon
+        """Load the shared application artwork for Tk windows and taskbar."""
+        return tk.PhotoImage(file=str(get_app_icon_path()))
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)

@@ -6,23 +6,15 @@ import sys
 import threading
 from typing import Any, Callable, Dict, Optional
 
+from app_icon import load_app_icon
+
 
 TRAY_SIZE = 64
 
 
-def create_tray_image(image_module: Any = None, draw_module: Any = None) -> Any:
-    """Create the blue live-status mark used by the Tk and tray icons."""
-    if image_module is None or draw_module is None:
-        from PIL import Image, ImageDraw
-
-        image_module = Image
-        draw_module = ImageDraw
-    image = image_module.new("RGBA", (TRAY_SIZE, TRAY_SIZE), (0, 0, 0, 0))
-    draw = draw_module.Draw(image)
-    draw.rounded_rectangle((6, 6, 58, 58), radius=7, fill="#0067c0")
-    draw.ellipse((21, 21, 43, 43), fill="#ffffff")
-    draw.ellipse((27, 27, 37, 37), fill="#c42b1c")
-    return image
+def create_tray_image(image_module: Any = None) -> Any:
+    """Load the shared application artwork at the Windows tray size."""
+    return load_app_icon(image_module=image_module, size=TRAY_SIZE)
 
 
 class TrayController:
