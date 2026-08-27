@@ -9,5 +9,6 @@
     "startup_notify": false,
     "enable_daily_intimacy_reminder": true,
     "max_concurrent_checks": 2,
+    "close_action": "exit",
     "streamers": []
 }

@@ -32,6 +32,15 @@ from streamer_config import (
     update_streamer,
 )
 from streamer_logging import StreamerLogHandler, StreamerLogStore
+from tray_controller import TrayController
+from windows_integration import (
+    IS_WINDOWS,
+    WindowsInstanceGuard,
+    get_autostart_snapshot,
+    is_autostart_enabled,
+    restore_autostart_value,
+    set_autostart_enabled,
+)
 
 
 COLORS = {
@@ -62,9 +71,16 @@ STATUS_TEXT = {
     "stopped": "已停止",
 }
 
+CLOSE_ACTION_LABELS = {
+    "exit": "退出主程序",
+    "hide_to_tray": "隐藏到任务栏托盘",
+}
+CLOSE_ACTION_VALUES = {label: value for value, label in CLOSE_ACTION_LABELS.items()}
+
 BASE_DPI = 96
 BASE_WINDOW_SIZE = (1080, 700)
 BASE_MIN_WINDOW_SIZE = (900, 600)
+TRAY_READY_TIMEOUT_MS = 5000
 
 
 class _MonitorInfo(ctypes.Structure):
@@ -222,16 +238,28 @@ def validate_gui_settings(values: Mapping[str, Any]) -> Dict[str, Any]:
         "enable_daily_intimacy_reminder",
     ):
         normalized[key] = validated[key]
+    normalized["close_action"] = validated["close_action"]
     return normalized
 
 
 class MonitorGui:
     """Windows-oriented light desktop interface."""
 
-    def __init__(self, root: tk.Tk, config_path: Path, debug: bool = False):
+    def __init__(
+        self,
+        root: tk.Tk,
+        config_path: Path,
+        debug: bool = False,
+        autostart: bool = False,
+        instance_guard: Optional[WindowsInstanceGuard] = None,
+        tray_factory: Any = TrayController,
+    ):
         self.root = root
         self.config_path = Path(config_path)
         self.debug = debug
+        self.autostart_requested = bool(autostart)
+        self.instance_guard = instance_guard
+        self.tray_factory = tray_factory
         self.config = monitor.load_config(self.config_path)
         self.entries = load_streamer_entries(
             self.config_path, self.config, monitor.load_monitor_state()
@@ -240,6 +268,8 @@ class MonitorGui:
         self.service_thread: Optional[threading.Thread] = None
         self.event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.pending_close = False
+        self.exiting = False
+        self.runtime_closed = False
         self.testing_push = False
         self.monitoring_ui_active = False
         self.selected_streamer_id = ""
@@ -250,6 +280,11 @@ class MonitorGui:
         )
         self.streamer_log_handler: Optional[StreamerLogHandler] = None
         self.streamer_log_windows: Dict[str, Dict[str, Any]] = {}
+        self.tray_controller: Optional[TrayController] = None
+        self.tray_available = False
+        self.tray_error = ""
+        self.tray_failure_reported = False
+        self.tray_disabled_for_session = False
 
         self._configure_window()
         self._configure_styles()
@@ -259,6 +294,7 @@ class MonitorGui:
         self._load_settings_into_form()
         self._set_global_status("stopped", "监控未启动")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._start_tray()
         self.root.after(200, self._drain_events)
 
     def _configure_window(self) -> None:
@@ -298,6 +334,61 @@ class MonitorGui:
         y = work_y + max(0, (work_height - height) // 2)
         self.root.minsize(metrics["min_width"], metrics["min_height"])
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _restore_window(self) -> None:
+        """Restore and focus the existing Tk window from the tray or mutex event."""
+        self.show_window()
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _start_tray(self) -> None:
+        if not IS_WINDOWS:
+            self.tray_error = "任务栏托盘仅支持 Windows"
+            return
+        try:
+            self.tray_controller = self.tray_factory(self.event_queue.put)
+            if not self.tray_controller.start():
+                self.tray_error = "无法启动任务栏托盘"
+                self.event_queue.put(
+                    {"type": "tray_failed", "error": self.tray_error}
+                )
+            else:
+                self.root.after(
+                    TRAY_READY_TIMEOUT_MS, self._check_tray_ready
+                )
+        except Exception as exc:
+            self.tray_error = str(exc)
+            self.event_queue.put({"type": "tray_failed", "error": str(exc)})
+
+    def _sync_tray_state(self) -> None:
+        if self.tray_controller is None or self.tray_disabled_for_session:
+            return
+        live_count = 0
+        if self.monitoring_ui_active:
+            live_count = sum(
+                item.get("status") == "live" for item in self.runtime_by_id.values()
+            )
+        self.tray_controller.update_state(self.monitoring_ui_active, live_count)
+
+    def _check_tray_ready(self) -> None:
+        if (
+            self.tray_available
+            or self.tray_disabled_for_session
+            or self.exiting
+            or self.runtime_closed
+        ):
+            return
+        self.tray_disabled_for_session = True
+        if self.tray_controller is not None:
+            self.tray_controller.stop(wait=False)
+        self.event_queue.put(
+            {
+                "type": "tray_failed",
+                "error": "任务栏托盘初始化超时",
+            }
+        )
 
     def _create_app_icon(self) -> tk.PhotoImage:
         """Create a small flat live-status mark without an external asset."""
@@ -386,6 +477,8 @@ class MonitorGui:
         self.notify_end_var = tk.BooleanVar()
         self.startup_notify_var = tk.BooleanVar()
         self.daily_reminder_var = tk.BooleanVar()
+        self.close_action_var = tk.StringVar()
+        self.autostart_var = tk.BooleanVar(value=False)
 
     def _build_layout(self) -> None:
         self.root.grid_rowconfigure(1, weight=1)
@@ -479,7 +572,7 @@ class MonitorGui:
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             footer,
-            text="关闭窗口前会先停止监控",
+            text="关闭窗口行为可在监控设置中选择",
             style="Subtitle.TLabel",
         ).grid(row=0, column=1, sticky="e")
 
@@ -794,7 +887,7 @@ class MonitorGui:
         )
         ttk.Label(
             parent,
-            text="保存后在下一次启动监控时生效。推送地址仅保存在本机。",
+            text="监控参数下次启动监控时生效，窗口与系统设置保存后立即生效。",
             style="Muted.TLabel",
         ).grid(
             row=1,
@@ -897,6 +990,51 @@ class MonitorGui:
         self.daily_check.grid(
             row=2, column=0, sticky="w", pady=self._px(4)
         )
+
+        system_frame = ttk.LabelFrame(
+            parent,
+            text="窗口与系统",
+            style="Surface.TLabelframe",
+            padding=self._px(14),
+        )
+        system_frame.grid(row=5, column=0, sticky="ew", pady=(self._px(14), 0))
+        system_frame.grid_columnconfigure(1, weight=1)
+        ttk.Label(system_frame, text="关闭窗口时").grid(
+            row=0, column=0, sticky="w", pady=self._px(6)
+        )
+        self.close_action_combo = ttk.Combobox(
+            system_frame,
+            textvariable=self.close_action_var,
+            values=tuple(CLOSE_ACTION_LABELS.values()),
+            state="readonly" if IS_WINDOWS else tk.DISABLED,
+            width=22,
+        )
+        self.close_action_combo.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(self._px(14), 0),
+            pady=self._px(6),
+        )
+        self.autostart_check = ttk.Checkbutton(
+            system_frame,
+            text="Windows 开机自启",
+            variable=self.autostart_var,
+            state=tk.NORMAL if IS_WINDOWS else tk.DISABLED,
+        )
+        self.autostart_check.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(self._px(7), self._px(2)),
+        )
+        ttk.Label(
+            system_frame,
+            text="登录 Windows 后静默进入托盘，并自动监控所有已启用主播。",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
         self.save_settings_button = ttk.Button(
             parent,
             text="保存设置",
@@ -904,7 +1042,7 @@ class MonitorGui:
             command=self._save_settings,
         )
         self.save_settings_button.grid(
-            row=5, column=0, sticky="e", pady=(self._px(16), 0)
+            row=6, column=0, sticky="e", pady=(self._px(16), 0)
         )
 
     def _load_settings_into_form(self) -> None:
@@ -924,6 +1062,13 @@ class MonitorGui:
         self.daily_reminder_var.set(
             self.config.get("enable_daily_intimacy_reminder", True)
         )
+        close_action = self.config.get("close_action", "exit")
+        self.close_action_var.set(CLOSE_ACTION_LABELS.get(close_action, "退出主程序"))
+        if IS_WINDOWS:
+            try:
+                self.autostart_var.set(is_autostart_enabled(self.config_path))
+            except (OSError, ValueError):
+                self.autostart_var.set(False)
 
     def _settings_values(self) -> Dict[str, Any]:
         return {
@@ -937,18 +1082,65 @@ class MonitorGui:
             "notify_on_stream_end": self.notify_end_var.get(),
             "startup_notify": self.startup_notify_var.get(),
             "enable_daily_intimacy_reminder": self.daily_reminder_var.get(),
+            "close_action": CLOSE_ACTION_VALUES.get(
+                self.close_action_var.get(), ""
+            ),
         }
 
-    def _save_settings(self, show_success: bool = True) -> bool:
+    def _save_settings(
+        self, show_success: bool = True, include_system: bool = True
+    ) -> bool:
+        previous_config = dict(self.config)
+        previous_autostart = None
+        registry_touched = False
         try:
-            normalized = validate_gui_settings(self._settings_values())
+            values = self._settings_values()
+            apply_system_settings = include_system and IS_WINDOWS
+            if not apply_system_settings:
+                values["close_action"] = self.config.get("close_action", "exit")
+            normalized = validate_gui_settings(values)
+            if (
+                apply_system_settings
+                and normalized["close_action"] == "hide_to_tray"
+                and not self.tray_available
+            ):
+                raise ValueError("任务栏托盘当前不可用，无法启用隐藏到托盘")
+            if (
+                apply_system_settings
+                and self.autostart_var.get()
+                and not self.tray_available
+            ):
+                raise ValueError("任务栏托盘当前不可用，无法启用静默开机自启")
+            if apply_system_settings:
+                previous_autostart = get_autostart_snapshot()
+                registry_touched = True
+                set_autostart_enabled(self.autostart_var.get(), self.config_path)
             self.config.update(normalized)
             save_config_atomic(self.config_path, self.config)
         except (OSError, ValueError) as exc:
+            self.config.clear()
+            self.config.update(previous_config)
+            rollback_error = ""
+            if IS_WINDOWS and registry_touched:
+                try:
+                    restore_autostart_value(previous_autostart)
+                except OSError as rollback_exc:
+                    rollback_error = f"\n恢复 Windows 自启设置也失败: {rollback_exc}"
             messagebox.showerror("无法保存设置", str(exc), parent=self.root)
+            if rollback_error:
+                messagebox.showerror(
+                    "无法恢复自启设置", rollback_error.strip(), parent=self.root
+                )
             return False
         if show_success:
-            self._set_global_status("stopped", "设置已保存")
+            if self.monitoring_ui_active:
+                messagebox.showinfo(
+                    "设置已保存",
+                    "窗口与系统设置已生效，监控参数将在下次启动时生效。",
+                    parent=self.root,
+                )
+            else:
+                self._set_global_status("stopped", "设置已保存")
         return True
 
     def _toggle_push_url_visibility(self) -> None:
@@ -1319,30 +1511,36 @@ class MonitorGui:
         self._refresh_streamer_views()
         self._set_global_status("stopped", "主播已删除")
 
-    def _start_monitoring(self) -> None:
+    def _start_monitoring(self, silent: bool = False) -> bool:
         if self.service_thread and self.service_thread.is_alive():
             self._stop_monitoring()
-            return
-        if not self._save_settings(show_success=False):
-            return
+            return False
+        if not self._save_settings(show_success=False, include_system=False):
+            return False
         self.entries = list(self.config.get("streamers", []))
         active_entries = enabled_streamers(self.entries)
         if not active_entries:
-            messagebox.showwarning(
-                "无法开始监控", "请至少添加并启用一个主播。", parent=self.root
-            )
-            return
+            if silent:
+                self._set_global_status("stopped", "没有已启用的主播")
+            else:
+                self._restore_window()
+                messagebox.showwarning(
+                    "无法开始监控", "请至少添加并启用一个主播。", parent=self.root
+                )
+            return False
         if not monitor.is_serverchan_configured(self.config):
-            proceed = messagebox.askyesno(
-                "尚未配置推送",
-                "当前没有有效的 Server酱³ 推送地址。\n"
-                "可以继续检测，但不会收到手机通知。\n\n仍然开始监控吗？",
-                parent=self.root,
-            )
-            if not proceed:
-                self.notebook.select(2)
-                self.push_entry.focus_set()
-                return
+            if not silent:
+                self._restore_window()
+                proceed = messagebox.askyesno(
+                    "尚未配置推送",
+                    "当前没有有效的 Server酱³ 推送地址。\n"
+                    "可以继续检测，但不会收到手机通知。\n\n仍然开始监控吗？",
+                    parent=self.root,
+                )
+                if not proceed:
+                    self.notebook.select(2)
+                    self.push_entry.focus_set()
+                    return False
 
         try:
             self.service = create_monitor_service(
@@ -1352,8 +1550,10 @@ class MonitorGui:
                 on_event=self.event_queue.put,
             )
         except (TypeError, ValueError) as exc:
+            if silent:
+                self._restore_window()
             messagebox.showerror("无法开始监控", str(exc), parent=self.root)
-            return
+            return False
         self.streamer_logs.clear()
         self.streamer_log_queue = queue.Queue(maxsize=MAX_PENDING_LOG_EVENTS)
         for streamer_id in list(self.streamer_log_windows):
@@ -1373,6 +1573,7 @@ class MonitorGui:
             target=run_service, name="monitor-gui-service", daemon=True
         )
         self.service_thread.start()
+        return True
 
     def _stop_monitoring(self) -> None:
         if self.service is not None:
@@ -1401,11 +1602,11 @@ class MonitorGui:
             self.notify_end_check,
             self.startup_check,
             self.daily_check,
-            self.save_settings_button,
             *self.setting_inputs,
         ):
             widget.configure(state=edit_state)
         self._update_stop_selected_button()
+        self._sync_tray_state()
 
     def _set_global_status(self, state: str, detail: str) -> None:
         self.global_status_var.set(status_text(state))
@@ -1419,7 +1620,9 @@ class MonitorGui:
         self.status_dot.configure(fg=color)
 
     def _test_push(self) -> None:
-        if self.testing_push or not self._save_settings(show_success=False):
+        if self.testing_push or not self._save_settings(
+            show_success=False, include_system=False
+        ):
             return
         if not monitor.is_serverchan_configured(self.config):
             messagebox.showwarning(
@@ -1441,6 +1644,15 @@ class MonitorGui:
         threading.Thread(target=verify, name="monitor-push-test", daemon=True).start()
 
     def _drain_events(self) -> None:
+        if self.instance_guard is not None:
+            try:
+                if self.instance_guard.activation_requested():
+                    self._restore_window()
+            except OSError as exc:
+                self.instance_guard = None
+                messagebox.showerror(
+                    "无法响应重复启动", str(exc), parent=self.root
+                )
         try:
             while True:
                 event = self.event_queue.get_nowait()
@@ -1455,7 +1667,7 @@ class MonitorGui:
             self._handle_event(event)
         if self.pending_close:
             if not self.service_thread or not self.service_thread.is_alive():
-                self.root.destroy()
+                self._finish_exit()
                 return
         delay = 200 if (
             self.testing_push
@@ -1466,7 +1678,42 @@ class MonitorGui:
 
     def _handle_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("type")
-        if event_type == "log":
+        if event_type == "tray_ready":
+            if self.tray_disabled_for_session:
+                if self.tray_controller is not None:
+                    self.tray_controller.stop(wait=False)
+                return
+            self.tray_available = True
+            self.tray_error = ""
+            self._sync_tray_state()
+            if self.autostart_requested:
+                self.autostart_requested = False
+                self._start_monitoring(silent=True)
+        elif event_type == "tray_failed":
+            self.tray_available = False
+            self.tray_disabled_for_session = True
+            self.tray_error = str(event.get("error") or "未知错误")
+            if self.tray_controller is not None:
+                self.tray_controller.stop(wait=False)
+            if not self.exiting:
+                self._restore_window()
+            if not self.tray_failure_reported and not self.exiting:
+                self.tray_failure_reported = True
+                messagebox.showerror(
+                    "任务栏托盘不可用",
+                    "程序已恢复主窗口，本次运行关闭窗口时将直接退出。\n\n"
+                    f"详细信息: {self.tray_error}",
+                    parent=self.root,
+                )
+        elif event_type == "tray_open":
+            self._restore_window()
+        elif event_type == "tray_start":
+            self._start_monitoring()
+        elif event_type == "tray_stop":
+            self._stop_monitoring()
+        elif event_type == "tray_exit":
+            self._request_exit(restore_before_prompt=True)
+        elif event_type == "log":
             streamer_id = str(event.get("streamer_id") or "")
             if streamer_id:
                 self._append_streamer_log(streamer_id, event.get("message", ""))
@@ -1499,6 +1746,7 @@ class MonitorGui:
                 f"{runnable} 个任务运行，{live} 个直播中",
             )
             self._update_stop_selected_button()
+            self._sync_tray_state()
         elif event_type == "service_finished":
             self._detach_streamer_log_handler()
             self._set_running_ui(False)
@@ -1506,6 +1754,7 @@ class MonitorGui:
                 self.runtime_by_id = {}
                 self._refresh_streamer_views()
                 self._set_global_status("stopped", "监控已停止")
+                self._sync_tray_state()
             else:
                 self._set_global_status("error", "没有可继续运行的主播任务")
             self.service = None
@@ -1539,36 +1788,94 @@ class MonitorGui:
                 "停止主播", "该主播尚未开始或已经停止。", parent=self.root
             )
 
-    def _on_close(self) -> None:
-        if self.service_thread and self.service_thread.is_alive():
+    def _request_exit(self, restore_before_prompt: bool = False) -> None:
+        if self.pending_close or self.runtime_closed:
+            return
+        service_running = bool(
+            self.service_thread and self.service_thread.is_alive()
+        )
+        if service_running:
+            if restore_before_prompt:
+                self._restore_window()
             if not messagebox.askyesno(
                 "退出程序",
                 "监控仍在运行。确定停止全部任务并退出吗？",
                 parent=self.root,
             ):
                 return
+        self.exiting = True
+        if service_running:
             self.pending_close = True
             self._stop_monitoring()
             return
+        self._finish_exit()
+
+    def _finish_exit(self) -> None:
+        if self.runtime_closed:
+            return
+        self.runtime_closed = True
         self._detach_streamer_log_handler()
+        if self.tray_controller is not None:
+            self.tray_controller.stop()
         self.root.destroy()
 
+    def shutdown_after_mainloop(self) -> None:
+        """Release background integrations if Tk exits unexpectedly."""
+        if self.runtime_closed:
+            return
+        self.runtime_closed = True
+        self._detach_streamer_log_handler()
+        if self.service is not None:
+            self.service.stop()
+        if (
+            self.service_thread is not None
+            and self.service_thread is not threading.current_thread()
+        ):
+            self.service_thread.join()
+        if self.tray_controller is not None:
+            self.tray_controller.stop()
 
-def run_gui(config_path: Optional[Path] = None, debug: bool = False) -> None:
+    def _on_close(self) -> None:
+        if (
+            self.config.get("close_action", "exit") == "hide_to_tray"
+            and self.tray_available
+            and not self.exiting
+        ):
+            self.root.withdraw()
+            return
+        self._request_exit()
+
+
+def run_gui(
+    config_path: Optional[Path] = None,
+    debug: bool = False,
+    autostart: bool = False,
+    instance_guard: Optional[WindowsInstanceGuard] = None,
+) -> None:
     """Create and run the desktop application."""
     monitor.setup_logging(verbose=debug)
     enable_windows_high_dpi()
     root = tk.Tk()
     root.withdraw()
     try:
-        app = MonitorGui(root, config_path or monitor.DEFAULT_CONFIG, debug=debug)
+        app = MonitorGui(
+            root,
+            config_path or monitor.DEFAULT_CONFIG,
+            debug=debug,
+            autostart=autostart,
+            instance_guard=instance_guard,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         messagebox.showerror("无法启动程序", str(exc), parent=root)
         root.destroy()
         return
     app.show_window()
-    root.deiconify()
-    root.mainloop()
+    if not autostart:
+        root.deiconify()
+    try:
+        root.mainloop()
+    finally:
+        app.shutdown_after_mainloop()
 
 
 if __name__ == "__main__":

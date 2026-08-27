@@ -10,6 +10,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 import monitor
+from windows_integration import WindowsInstanceGuard, show_windows_warning
 
 if sys.platform == "win32":
     import msvcrt
@@ -194,18 +195,43 @@ def _prepare_frozen_cli_console() -> bool:
 
 
 def main() -> None:
-    if not sys.argv[1:] or "--gui" in sys.argv[1:]:
+    if (
+        not sys.argv[1:]
+        or "--gui" in sys.argv[1:]
+        or "--autostart" in sys.argv[1:]
+    ):
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--gui", action="store_true")
         parser.add_argument("--config", default=str(monitor.DEFAULT_CONFIG))
         parser.add_argument("--debug", action="store_true")
+        parser.add_argument("--autostart", action="store_true")
         args, unknown = parser.parse_known_args()
         if unknown:
             _prepare_frozen_cli_console()
             parser.error(f"GUI 模式不支持参数: {' '.join(unknown)}")
         from gui_app import run_gui
 
-        run_gui(Path(args.config), debug=args.debug)
+        try:
+            instance_guard, existing_owner = WindowsInstanceGuard.acquire_gui()
+        except OSError as exc:
+            show_windows_warning("无法启动程序", str(exc))
+            return
+        if instance_guard is None:
+            if existing_owner == "cli":
+                show_windows_warning(
+                    "程序已在运行",
+                    "已有命令行监控实例正在运行，请先停止该实例。",
+                )
+            return
+        try:
+            run_gui(
+                Path(args.config),
+                debug=args.debug,
+                autostart=args.autostart,
+                instance_guard=instance_guard,
+            )
+        finally:
+            instance_guard.close()
         return
     _prepare_frozen_cli_console()
     monitor.main()

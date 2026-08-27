@@ -57,7 +57,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.6.0"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -333,6 +333,7 @@ def _default_config() -> Dict[str, Any]:
         "startup_notify": False,
         "enable_daily_intimacy_reminder": True,
         "max_concurrent_checks": 2,
+        "close_action": "exit",
         "streamers": [],
     }
 
@@ -1003,6 +1004,7 @@ def main():
         create_notifier,
         load_streamer_entries,
     )
+    from windows_integration import WindowsInstanceGuard
 
     parser = argparse.ArgumentParser(
         description="抖音直播监听器 - 检测开播并通过Server酱³推送通知",
@@ -1106,97 +1108,120 @@ def main():
                 h.setLevel(logging.ERROR)
 
     config_path = Path(args.config)
-    try:
-        config = load_config(config_path)
-        entries = load_streamer_entries(
-            config_path, config, load_monitor_state()
-        )
-        if _handle_streamer_command(args, config_path, config, entries):
-            return
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        logger.error(f"配置处理失败: {exc}")
-        _pause_if_frozen()
-        sys.exit(2)
+    non_monitor_operation = bool(
+        args.test
+        or args.list_streamers
+        or args.add_streamer
+        or args.remove_streamer
+        or args.enable_streamer
+        or args.disable_streamer
+    )
+    instance_guard = None
+    if not non_monitor_operation:
+        try:
+            instance_guard = WindowsInstanceGuard.acquire_monitor()
+        except OSError as exc:
+            logger.error(f"无法创建单实例锁: {exc}")
+            sys.exit(3)
+        if instance_guard is None:
+            logger.error("已有监控实例正在运行，请先停止现有实例")
+            sys.exit(3)
 
-    if args.test:
+    try:
+        try:
+            config = load_config(config_path)
+            entries = load_streamer_entries(
+                config_path, config, load_monitor_state()
+            )
+            if _handle_streamer_command(args, config_path, config, entries):
+                return
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            logger.error(f"配置处理失败: {exc}")
+            _pause_if_frozen()
+            sys.exit(2)
+
+        if args.test:
+            if not is_serverchan_configured(config):
+                logger.error(
+                    "Server酱³ 尚未配置!\n"
+                    "请先运行 python monitor.py 进行配置，"
+                    "或在 config.json 中手动填入推送 URL。\n"
+                    "获取方式: 访问 https://sc3.ft07.com 微信扫码登录"
+                )
+                _pause_if_frozen()
+                sys.exit(1)
+            notifier = create_notifier(config)
+            logger.info("测试 Server酱³ 连接...")
+            if notifier.verify_connection():
+                logger.info("[OK] Server酱³ 连接测试成功!")
+            else:
+                logger.error("[FAIL] Server酱³ 连接测试失败!")
+            return
+
         if not is_serverchan_configured(config):
+            config = prompt_serverchan_config(config_path, config)
+
+        if not entries:
+            target_url = prompt_target_url()
+            entry = add_streamer(config, target_url)
+            save_config_atomic(config_path, config)
+            entries = list(config["streamers"])
+            print(f"已保存主播: {entry['id']}  {entry['url']}")
+
+        active_entries = enabled_streamers(entries)
+        if not active_entries:
             logger.error(
-                "Server酱³ 尚未配置!\n"
-                "请先运行 python monitor.py 进行配置，"
-                "或在 config.json 中手动填入推送 URL。\n"
-                "获取方式: 访问 https://sc3.ft07.com 微信扫码登录"
+                "没有已启用的主播，请使用 --enable-streamer ID 启用任务"
             )
             _pause_if_frozen()
             sys.exit(1)
-        notifier = create_notifier(config)
-        logger.info("测试 Server酱³ 连接...")
-        if notifier.verify_connection():
-            logger.info("[OK] Server酱³ 连接测试成功!")
-        else:
-            logger.error("[FAIL] Server酱³ 连接测试失败!")
-        return
 
-    if not is_serverchan_configured(config):
-        config = prompt_serverchan_config(config_path, config)
+        try:
+            service = create_monitor_service(
+                config,
+                active_entries,
+                debug=args.debug,
+                enable_console_stop=True,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error(f"监控参数无效: {exc}")
+            _pause_if_frozen()
+            sys.exit(2)
 
-    if not entries:
-        target_url = prompt_target_url()
-        entry = add_streamer(config, target_url)
-        save_config_atomic(config_path, config)
-        entries = list(config["streamers"])
-        print(f"已保存主播: {entry['id']}  {entry['url']}")
+        def signal_handler(sig, frame):
+            logger.info("\n收到退出信号...")
+            service.stop()
 
-    active_entries = enabled_streamers(entries)
-    if not active_entries:
-        logger.error(
-            "没有已启用的主播，请使用 --enable-streamer ID 启用任务"
-        )
+        signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, signal_handler)
+
+        try:
+            if args.once:
+                logger.info("对全部已启用主播执行单次检测...")
+                results = service.check_all_once()
+                _print_once_results(active_entries, results)
+                if not results:
+                    sys.exit(1)
+            else:
+                if not service.run():
+                    sys.exit(1)
+        except KeyboardInterrupt:
+            service.stop()
+            logger.info("用户中断")
+        except Exception as e:
+            service.stop()
+            logger.error(f"程序异常: {e}", exc_info=True)
+            _pause_if_frozen()
+            sys.exit(1)
+        finally:
+            service.close()
+
+        # Normal exit - pause for frozen exe so user can see output
         _pause_if_frozen()
-        sys.exit(1)
-
-    try:
-        service = create_monitor_service(
-            config,
-            active_entries,
-            debug=args.debug,
-            enable_console_stop=True,
-        )
-    except (TypeError, ValueError) as exc:
-        logger.error(f"监控参数无效: {exc}")
-        _pause_if_frozen()
-        sys.exit(2)
-
-    def signal_handler(sig, frame):
-        logger.info("\n收到退出信号...")
-        service.stop()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, signal_handler)
-
-    try:
-        if args.once:
-            logger.info("对全部已启用主播执行单次检测...")
-            results = service.check_all_once()
-            _print_once_results(active_entries, results)
-            if not results:
-                sys.exit(1)
-        else:
-            if not service.run():
-                sys.exit(1)
-    except KeyboardInterrupt:
-        service.stop()
-        logger.info("用户中断")
-    except Exception as e:
-        service.stop()
-        logger.error(f"程序异常: {e}", exc_info=True)
-        _pause_if_frozen()
-        sys.exit(1)
     finally:
-        service.close()
-
-    # Normal exit - pause for frozen exe so user can see output
-    _pause_if_frozen()
+        if instance_guard is not None:
+            instance_guard.close()
 
 
 if __name__ == "__main__":

@@ -1,2 +1,4 @@
 requests>=2.28.0
 brotli>=1.1.0
+pystray==0.19.5; sys_platform == "win32"
+Pillow>=11.3.0; sys_platform == "win32"

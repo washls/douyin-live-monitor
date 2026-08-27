@@ -29,6 +29,8 @@ BOOLEAN_CONFIG_FIELDS = {
     "startup_notify": False,
     "enable_daily_intimacy_reminder": True,
 }
+CLOSE_ACTIONS = {"exit", "hide_to_tray"}
+DEFAULT_CLOSE_ACTION = "exit"
 
 
 def validate_streamer_url(url: str) -> str:
@@ -79,6 +81,10 @@ def normalize_app_config(mapping: Mapping[str, Any]) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError(f"{key} 必须是布尔值")
         config[key] = value
+    close_action = config.get("close_action", DEFAULT_CLOSE_ACTION)
+    if not isinstance(close_action, str) or close_action not in CLOSE_ACTIONS:
+        raise ValueError("close_action 必须是 exit 或 hide_to_tray")
+    config["close_action"] = close_action
     normalize_streamers(config)
     return config
 

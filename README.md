@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.5.2-orange.svg" alt="Version 1.5.2">
+  <img src="https://img.shields.io/badge/version-1.6.0-orange.svg" alt="Version 1.6.0">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
@@ -13,22 +13,23 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.5.2.exe`，不需要安装 Python。
+Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.6.0.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
 3. 点击“新增主播”，填写主播主页链接和便于识别的名称。
 4. 点击“开始监控”。任务状态表会持续显示每个主播的检测结果。
+5. 如需后台常驻，可在“监控设置”中把关闭窗口行为改为“隐藏到任务栏托盘”。
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.5.2
+## v1.6.0
 
-这一版修复 Windows 11 双击 EXE 后任务栏仍保留终端窗口的问题。正式 EXE 现在使用原生 Windows GUI 子系统，默认启动不会再创建 Windows Terminal 窗口；传入命令行参数时，程序才会按需连接已有终端或创建控制台，现有 CLI 功能保持可用。
+这一版增加 Windows 任务栏托盘。关闭窗口时可以直接退出，也可以只隐藏主窗口，让监控继续在后台运行。托盘菜单可以打开主窗口、开始或停止监控，并显示当前在线主播数量。
 
-v1.5.2 保持 v1.5.1 的安全、误报和长期运行资源优化，也保持原配置字段与命令行参数兼容，没有不可逆的数据迁移。
+“Windows 开机自启”启用后，程序会在登录系统时静默进入托盘，并自动监控所有已启用主播。GUI、持续命令行监控和单次检测共用单实例保护，不会同时创建两套监控任务。
 
-如需回退，可以继续使用 [v1.5.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.5.1)。
+旧配置默认仍按关闭窗口时退出处理，没有不可逆的数据迁移。如需回退，请先在 v1.6.0 中关闭开机自启，再使用 [v1.5.2](https://github.com/washls/douyin-live-monitor/releases/tag/v1.5.2)。
 
 ## 主要功能
 
@@ -40,6 +41,7 @@ v1.5.2 保持 v1.5.1 的安全、误报和长期运行资源优化，也保持�
 - 未知状态采用渐进退避；明确结果会立即恢复正常检测间隔。
 - 推送请求遇到超时或连接中断时不会自动重复提交，减少服务端已接收后再次推送的风险。
 - 详细日志自动轮转，单个主播的本次运行日志可以在 GUI 中单独查看。
+- 支持 Windows 任务栏托盘、登录自启和单实例保护。
 - 支持 Windows 图形界面，也保留完整命令行模式。
 
 ## 图形界面使用说明
@@ -61,6 +63,16 @@ v1.5.2 保持 v1.5.1 的安全、误报和长期运行资源优化，也保持�
 开始监控后，在“运行状态”中选中主播，再点击“停止所选主播”，只会结束该主播的本次监控，其他任务继续运行。该主播会保持“已停止”状态，在途检测结果也不会覆盖它。
 
 顶部“停止全部”用于结束当前所有任务。重新点击“开始监控”时，所有仍处于启用状态的主播都会重新加入监控。
+
+### 使用任务栏托盘和开机自启
+
+Windows 版启动后会显示任务栏托盘图标。托盘菜单固定提供“打开主窗口”“开始监控”“停止监控”“当前在线主播数量”和“退出程序”。主窗口隐藏后，监控任务和实时状态仍会继续更新。
+
+在“监控设置”的“窗口与系统”区域，可以选择关闭窗口时“退出主程序”或“隐藏到任务栏托盘”。旧配置默认使用“退出主程序”；隐藏主窗口后，只有通过托盘菜单选择“退出程序”并确认，程序才会停止全部监控线程并结束进程。
+
+勾选“Windows 开机自启”后，程序会在当前用户登录 Windows 时静默进入托盘，并自动监控所有已启用主播。该设置跟随当前 EXE 路径；移动文件或升级到新文件名后，需要在新版本中重新勾选。
+
+同一 Windows 会话只允许一个监控实例。再次双击 EXE 会打开已有窗口；如果命令行监控正在运行，GUI 会提示先停止现有实例。`--help`、`--version`、推送测试和主播配置命令不受影响。
 
 ## 通知规则
 
@@ -92,6 +104,7 @@ v1.5.2 保持 v1.5.1 的安全、误报和长期运行资源优化，也保持�
   "startup_notify": false,
   "enable_daily_intimacy_reminder": true,
   "max_concurrent_checks": 2,
+  "close_action": "exit",
   "streamers": [
     {
       "id": "a1b2c3d4e5f6",
@@ -113,6 +126,7 @@ v1.5.2 保持 v1.5.1 的安全、误报和长期运行资源优化，也保持�
 | `startup_notify` | 启动监控时是否发送汇总通知 | `false` |
 | `enable_daily_intimacy_reminder` | 是否启用每日亲密度提醒 | `true` |
 | `max_concurrent_checks` | 同时执行的检测数量，范围为 1 到 8 | `2` |
+| `close_action` | 关闭窗口时退出程序或隐藏到托盘 | `exit` |
 | `streamers` | 主播配置列表，最多保存 100 项 | 空列表 |
 
 建议将检测间隔保持在 30 秒或更长。过于频繁的访问更容易触发平台风控，也会增加本机和网络负担。
@@ -169,8 +183,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-Start-Process -FilePath .\douyin-monitor-v1.5.2.exe -ArgumentList '--once' -NoNewWindow -Wait
-Start-Process -FilePath .\douyin-monitor-v1.5.2.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.6.0.exe -ArgumentList '--once' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.6.0.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
 ```
 
 正式 EXE 使用 Windows GUI 子系统，PowerShell 直接执行时不会自动等待。使用上面的 `Start-Process` 写法可以让命令行输出留在当前终端，并等待任务结束后再返回提示符。
@@ -192,7 +206,11 @@ Start-Process -FilePath .\douyin-monitor-v1.5.2.exe -ArgumentList '--list-stream
 
 #### 双击 EXE 后仍看到命令行窗口
 
-请确认下载的是 v1.5.2 或更高版本的正式 EXE。默认双击只会创建 GUI 窗口；从已有终端带参数启动时，程序会连接该终端以显示命令行输出，这是预期行为。
+请确认下载的是 v1.6.0 或更高版本的正式 EXE。默认双击只会创建 GUI 窗口和任务栏托盘图标；从已有终端带参数启动时，程序会连接该终端以显示命令行输出，这是预期行为。
+
+#### 双击 EXE 后没有出现新窗口
+
+程序可能已经隐藏在任务栏托盘中。再次双击 EXE 会唤醒已有窗口，不会启动第二套监控任务。也可以在 Windows 托盘区域找到蓝底红点图标，点击“打开主窗口”。
 
 #### 推送测试失败
 
@@ -251,6 +269,10 @@ python -m PyInstaller --clean --noconfirm douyin-monitor.spec
 | [DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder) | 签名算法分析参考 |
 | [requests](https://github.com/psf/requests) | HTTP 客户端 |
 | [PyInstaller](https://github.com/pyinstaller/pyinstaller) | Windows 可执行文件构建 |
+| [pystray](https://github.com/moses-palmer/pystray) | Windows 任务栏托盘 |
+| [Pillow](https://github.com/python-pillow/Pillow) | 托盘图标绘制 |
 | [Server 酱³](https://sc3.ft07.com) | 手机消息推送服务 |
+
+第三方依赖的许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 历史版本和正式构建产物请查看 [Releases](https://github.com/washls/douyin-live-monitor/releases)。

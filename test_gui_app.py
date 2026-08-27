@@ -37,6 +37,9 @@ def test_high_dpi_is_enabled_before_tk_window_creation(monkeypatch):
         def show_window(self):
             calls.append("show")
 
+        def shutdown_after_mainloop(self):
+            calls.append("shutdown")
+
     class FakeRoot:
         def withdraw(self):
             calls.append("withdraw")
@@ -115,6 +118,7 @@ def valid_settings():
         "notify_on_stream_end": True,
         "startup_notify": False,
         "enable_daily_intimacy_reminder": True,
+        "close_action": "exit",
     }
 
 
@@ -184,7 +188,29 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         lambda _path, loaded, _legacy: list(loaded["streamers"]),
     )
     monkeypatch.setattr("gui_app.messagebox.askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr("gui_app.is_autostart_enabled", lambda _path: False)
+    monkeypatch.setattr("gui_app.get_autostart_snapshot", lambda: None)
+    monkeypatch.setattr(
+        "gui_app.set_autostart_enabled", lambda _enabled, _path: None
+    )
+    monkeypatch.setattr("gui_app.restore_autostart_value", lambda _value: None)
     finished = threading.Event()
+
+    class FakeTray:
+        def __init__(self, sink):
+            self.sink = sink
+            self.states = []
+            self.stopped = False
+
+        def start(self):
+            self.sink({"type": "tray_ready"})
+            return True
+
+        def update_state(self, running, live_count):
+            self.states.append((running, live_count))
+
+        def stop(self, wait=True):
+            self.stopped = True
 
     class FakeService:
         def __init__(self, streamers, on_event, **_kwargs):
@@ -229,7 +255,8 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
     )
 
     try:
-        app = MonitorGui(root, config_path)
+        app = MonitorGui(root, config_path, tray_factory=FakeTray)
+        app._drain_events()
         root.update_idletasks()
 
         assert 0.75 <= app.display_scale <= 4.0
@@ -244,6 +271,9 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.stop_selected_button.cget("text") == "停止所选主播"
         assert str(app.stop_selected_button.cget("state")) == tk.DISABLED
         assert app.settings_canvas.winfo_exists()
+        assert app.tray_available is True
+        assert app.close_action_combo.get() == "退出主程序"
+        assert app.autostart_check.cget("text") == "Windows 开机自启"
 
         stopped_ids = []
         stop_finished = threading.Event()
@@ -336,6 +366,11 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
             "",
             "等待首次检测",
         )
+        app.config["close_action"] = "hide_to_tray"
+        app._on_close()
+        assert root.state() == "withdrawn"
+        assert app.tray_controller.stopped is False
+        app._restore_window()
     finally:
         root.destroy()
 
@@ -351,3 +386,223 @@ def test_streamer_log_event_queue_keeps_only_recent_entries():
     while not app.streamer_log_queue.empty():
         messages.append(app.streamer_log_queue.get_nowait()["message"])
     assert messages == ["2", "3", "4"]
+
+
+def test_silent_start_with_no_enabled_streamers_does_not_show_dialog(monkeypatch):
+    app = object.__new__(MonitorGui)
+    app.service_thread = None
+    app.config = {"streamers": []}
+    app.entries = []
+    app._save_settings = Mock(return_value=True)
+    app._set_global_status = Mock()
+    warning = Mock()
+    monkeypatch.setattr(gui_app.messagebox, "showwarning", warning)
+
+    assert app._start_monitoring(silent=True) is False
+
+    app._save_settings.assert_called_once_with(
+        show_success=False, include_system=False
+    )
+    app._set_global_status.assert_called_once_with("stopped", "没有已启用的主播")
+    warning.assert_not_called()
+
+
+def test_close_to_tray_never_stops_active_service():
+    app = object.__new__(MonitorGui)
+    app.config = {"close_action": "hide_to_tray"}
+    app.tray_available = True
+    app.exiting = False
+    app.root = Mock()
+    app._request_exit = Mock()
+
+    app._on_close()
+
+    app.root.withdraw.assert_called_once_with()
+    app._request_exit.assert_not_called()
+
+
+def test_exit_requests_one_service_stop(monkeypatch):
+    app = object.__new__(MonitorGui)
+    app.pending_close = False
+    app.runtime_closed = False
+    app.exiting = False
+    app.service_thread = SimpleNamespace(is_alive=lambda: True)
+    app.root = Mock()
+    app._stop_monitoring = Mock()
+    monkeypatch.setattr(gui_app.messagebox, "askyesno", lambda *args, **kwargs: True)
+
+    app._request_exit()
+    app._request_exit()
+
+    assert app.pending_close is True
+    app._stop_monitoring.assert_called_once_with()
+
+
+def test_unexpected_mainloop_exit_waits_for_service_before_tray():
+    app = object.__new__(MonitorGui)
+    app.runtime_closed = False
+    app.service = Mock()
+    app.service_thread = Mock()
+    app.tray_controller = Mock()
+    app._detach_streamer_log_handler = Mock()
+
+    app.shutdown_after_mainloop()
+
+    app.service.stop.assert_called_once_with()
+    app.service_thread.join.assert_called_once_with()
+    app.tray_controller.stop.assert_called_once_with()
+
+
+def test_tray_ready_autostarts_monitoring_once():
+    app = object.__new__(MonitorGui)
+    app.tray_available = False
+    app.tray_error = ""
+    app.autostart_requested = True
+    app.tray_disabled_for_session = False
+    app.tray_controller = None
+    app._sync_tray_state = Mock()
+    app._start_monitoring = Mock(return_value=True)
+
+    app._handle_event({"type": "tray_ready"})
+    app._handle_event({"type": "tray_ready"})
+
+    app._start_monitoring.assert_called_once_with(silent=True)
+
+
+def test_tray_failure_restores_window_and_disables_tray_session(monkeypatch):
+    app = object.__new__(MonitorGui)
+    app.tray_available = True
+    app.tray_error = ""
+    app.tray_failure_reported = False
+    app.tray_disabled_for_session = False
+    app.tray_controller = Mock()
+    app.exiting = False
+    app.root = Mock()
+    app._restore_window = Mock()
+    showerror = Mock()
+    monkeypatch.setattr(gui_app.messagebox, "showerror", showerror)
+
+    app._handle_event({"type": "tray_failed", "error": "backend stopped"})
+
+    assert app.tray_available is False
+    app.tray_controller.stop.assert_called_once_with(wait=False)
+    app._restore_window.assert_called_once_with()
+    showerror.assert_called_once()
+
+
+def test_tray_start_false_enqueues_failure(monkeypatch):
+    app = object.__new__(MonitorGui)
+    app.event_queue = gui_app.queue.Queue()
+    app.tray_error = ""
+    app.tray_factory = lambda _sink: SimpleNamespace(start=lambda: False)
+    monkeypatch.setattr(gui_app, "IS_WINDOWS", True)
+
+    app._start_tray()
+
+    assert app.event_queue.get_nowait() == {
+        "type": "tray_failed",
+        "error": "无法启动任务栏托盘",
+    }
+
+
+def test_tray_ready_watchdog_disables_stalled_backend():
+    app = object.__new__(MonitorGui)
+    app.tray_available = False
+    app.tray_disabled_for_session = False
+    app.exiting = False
+    app.runtime_closed = False
+    app.tray_controller = Mock()
+    app.event_queue = gui_app.queue.Queue()
+
+    app._check_tray_ready()
+
+    assert app.tray_disabled_for_session is True
+    app.tray_controller.stop.assert_called_once_with(wait=False)
+    assert app.event_queue.get_nowait() == {
+        "type": "tray_failed",
+        "error": "任务栏托盘初始化超时",
+    }
+
+
+def test_monitor_settings_save_does_not_touch_registry_or_system_choice(
+    monkeypatch, tmp_path
+):
+    app = object.__new__(MonitorGui)
+    app.config = monitor._default_config()
+    app.config["close_action"] = "hide_to_tray"
+    app.config_path = tmp_path / "config.json"
+    app.tray_available = False
+    app.autostart_var = Mock()
+    app.autostart_var.get.return_value = False
+    app.monitoring_ui_active = False
+    app.root = Mock()
+    values = valid_settings()
+    values["close_action"] = "exit"
+    app._settings_values = Mock(return_value=values)
+    registry_read = Mock(side_effect=AssertionError("registry must not be read"))
+    registry_write = Mock(side_effect=AssertionError("registry must not be written"))
+    monkeypatch.setattr(gui_app, "get_autostart_snapshot", registry_read)
+    monkeypatch.setattr(gui_app, "set_autostart_enabled", registry_write)
+
+    assert app._save_settings(show_success=False, include_system=False) is True
+
+    assert app.config["close_action"] == "hide_to_tray"
+    registry_read.assert_not_called()
+    registry_write.assert_not_called()
+
+
+def test_saving_while_running_preserves_status_text(monkeypatch, tmp_path):
+    app = object.__new__(MonitorGui)
+    app.config = monitor._default_config()
+    app.config_path = tmp_path / "config.json"
+    app.tray_available = True
+    app.autostart_var = Mock()
+    app.autostart_var.get.return_value = False
+    app.monitoring_ui_active = True
+    app.root = Mock()
+    app.global_status_var = Mock()
+    app.global_detail_var = Mock()
+    app._settings_values = Mock(return_value=valid_settings())
+    app._set_global_status = Mock()
+    monkeypatch.setattr(gui_app, "get_autostart_snapshot", lambda: None)
+    monkeypatch.setattr(gui_app, "set_autostart_enabled", lambda *_args: None)
+    showinfo = Mock()
+    monkeypatch.setattr(gui_app.messagebox, "showinfo", showinfo)
+
+    assert app._save_settings() is True
+
+    app._set_global_status.assert_not_called()
+    app.global_status_var.set.assert_not_called()
+    app.global_detail_var.set.assert_not_called()
+    showinfo.assert_called_once()
+
+
+def test_settings_save_rolls_back_autostart_when_config_write_fails(
+    monkeypatch, tmp_path
+):
+    app = object.__new__(MonitorGui)
+    app.config = monitor._default_config()
+    original = dict(app.config)
+    app.config_path = tmp_path / "config.json"
+    app.tray_available = True
+    app.autostart_var = Mock()
+    app.autostart_var.get.return_value = True
+    app.monitoring_ui_active = False
+    app.root = Mock()
+    app._settings_values = Mock(return_value=valid_settings())
+    old_snapshot = ("old-command", 2)
+    monkeypatch.setattr(gui_app, "get_autostart_snapshot", lambda: old_snapshot)
+    monkeypatch.setattr(gui_app, "set_autostart_enabled", lambda *_args: None)
+    restore = Mock()
+    monkeypatch.setattr(gui_app, "restore_autostart_value", restore)
+    monkeypatch.setattr(
+        gui_app,
+        "save_config_atomic",
+        Mock(side_effect=OSError("disk full")),
+    )
+    monkeypatch.setattr(gui_app.messagebox, "showerror", Mock())
+
+    assert app._save_settings() is False
+
+    assert app.config == original
+    restore.assert_called_once_with(old_snapshot)

@@ -172,6 +172,19 @@ def test_app_config_rejects_non_boolean_flags(value):
         normalize_app_config({"startup_notify": value})
 
 
+def test_app_config_defaults_and_validates_close_action():
+    assert normalize_app_config({})["close_action"] == "exit"
+    assert (
+        normalize_app_config({"close_action": "hide_to_tray"})["close_action"]
+        == "hide_to_tray"
+    )
+
+    with pytest.raises(ValueError, match="close_action"):
+        normalize_app_config({"close_action": "minimize"})
+    with pytest.raises(ValueError, match="close_action"):
+        normalize_app_config({"close_action": []})
+
+
 def test_posix_config_permissions_are_private(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     monkeypatch.setattr("streamer_config._IS_POSIX", True)
