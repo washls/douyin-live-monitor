@@ -1,30 +1,32 @@
 <div align="center">
   <a href="https://github.com/washls/douyin-live-monitor">
-    <img width="280" src="assets/app_icon.png" alt="抖音直播监听器程序图标">
+    <img width="420" src="assets/app_icon.png" alt="抖音直播监控与开播提醒工具插画">
   </a>
 
-  <h1>抖音直播监听器</h1>
+  <h1>抖音直播监控与开播提醒工具</h1>
 
 <p>
-  <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/version-1.6.2-orange.svg" alt="Version 1.6.2">
-  <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-green.svg" alt="PolyForm Noncommercial License 1.0.0">
+  <strong>抖音直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.6.3 · PolyForm NC 1.0.0
 </p>
 
 <p>
-  同时监控多个抖音主播，在开播、持续直播和下播时通过 Server 酱³ 推送到手机。
+  同时监控多个抖音主播，在开播、持续直播和下播时通过 Server 酱³ 推送到手机。<br>
+  支持 Windows 托盘、开机自启、单实例运行和独立主播日志。
 </p>
 
 <p>
   这是一个免费、开源、仅限非商业用途的抖音直播监听工具。<br>
   项目地址：<a href="https://github.com/washls/douyin-live-monitor">github.com/washls/douyin-live-monitor</a>
 </p>
+
+<p>
+  <strong><a href="https://github.com/washls/douyin-live-monitor/releases/latest">下载 Windows 免安装版</a></strong>
+</p>
 </div>
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-monitor/releases) 下载 `douyin-monitor-v1.6.2.exe`，不需要安装 Python。
+Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.6.3.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
@@ -34,13 +36,15 @@ Windows 用户可以直接从 [Releases](https://github.com/washls/douyin-live-m
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.6.2
+## v1.6.3
 
-这一版在 README 顶部加入程序插画，并在桌面程序底部固定显示开源项目声明与可点击的 GitHub 地址。该声明没有关闭选项，分发副本还必须保留 `NOTICE` 中的 `Required Notice:` 行。
+这一版把 README、程序窗口、任务栏、托盘和 Windows EXE 的品牌图像统一为新的蓝白猫耳直播监控插画，并新增适合 GitHub 分享展示的社交预览图。
+
+仓库描述、README 标题和下载入口也改为直接说明“抖音直播监控、开播提醒、多主播、Server 酱³ 推送、Windows”等核心用途，便于用户理解与搜索。本次没有程序行为或配置格式变化。
 
 自 v1.6.2 起，项目采用 PolyForm Noncommercial License 1.0.0，仅允许非商业用途。v1.6.1 及更早版本曾按 MIT License 发布，已经取得的 MIT 授权不受本次许可证变更影响。
 
-本次没有配置迁移。如需回退，可以直接使用 [v1.6.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.6.1)。
+如需回退，可以直接使用 [v1.6.2](https://github.com/washls/douyin-live-monitor/releases/tag/v1.6.2)。
 
 ## 主要功能
 
@@ -194,8 +198,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-Start-Process -FilePath .\douyin-monitor-v1.6.2.exe -ArgumentList '--once' -NoNewWindow -Wait
-Start-Process -FilePath .\douyin-monitor-v1.6.2.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.6.3.exe -ArgumentList '--once' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.6.3.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
 ```
 
 正式 EXE 使用 Windows GUI 子系统，PowerShell 直接执行时不会自动等待。使用上面的 `Start-Process` 写法可以让命令行输出留在当前终端，并等待任务结束后再返回提示符。

@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="washls.douyin-live-monitor"
-    version="1.6.2.0"
+    version="1.6.3.0"
     processorArchitecture="*"
   />
   <application xmlns="urn:schemas-microsoft-com:asm.v3">

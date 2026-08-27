@@ -214,7 +214,8 @@ def test_release_version_metadata_is_synchronized():
 
     assert f"name='douyin-monitor-v{version}'" in spec
     assert f'version="{version}.0"' in manifest
-    assert f"version-{version}-orange.svg" in readme
+    assert f"v{version} · PolyForm NC 1.0.0" in readme
+    assert f"douyin-monitor-v{version}.exe" in readme
     assert f"douyin-monitor-v{version}.exe" in readme
 
 
