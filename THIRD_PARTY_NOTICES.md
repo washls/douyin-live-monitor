@@ -1,6 +1,6 @@
 # 第三方依赖说明
 
-抖音直播监听器自身使用 MIT License。正式 Windows EXE 还会包含以下第三方组件：
+抖音直播监听器自身使用 [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)，仅允许非商业用途。完整条款和必须保留的项目声明分别见随程序分发的 `LICENSE` 与 `NOTICE`。正式 Windows EXE 还会包含以下第三方组件：
 
 | 组件 | 版本要求 | 许可证 | 用途 |
 |------|----------|--------|------|

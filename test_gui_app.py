@@ -7,7 +7,14 @@ from unittest.mock import Mock
 
 import gui_app
 import monitor
-from gui_app import MonitorGui, compact_ui_text, status_text, validate_gui_settings
+from gui_app import (
+    MonitorGui,
+    compact_ui_text,
+    open_project_repository,
+    status_text,
+    validate_gui_settings,
+)
+from project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
 from streamer_config import add_streamer, save_config_atomic
 
 
@@ -169,6 +176,17 @@ def test_remote_text_is_single_line_and_bounded():
     assert compact_ui_text("主播\n名称  测试", 6) == "主播 名称"
 
 
+def test_project_repository_link_opens_the_fixed_address(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        "gui_app.webbrowser.open_new_tab",
+        lambda url: opened.append(url) or True,
+    )
+
+    assert open_project_repository() is True
+    assert opened == [PROJECT_REPOSITORY_URL]
+
+
 def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch):
     try:
         root = tk.Tk()
@@ -274,6 +292,9 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.tray_available is True
         assert app.close_action_combo.get() == "退出主程序"
         assert app.autostart_check.cget("text") == "Windows 开机自启"
+        assert app.project_link.cget("text") == PROJECT_REPOSITORY_URL
+        assert app.project_link.bind("<Button-1>")
+        assert PROJECT_SOURCE_NOTICE == "本项目为开源项目，仅供非商业用途"
 
         stopped_ids = []
         stop_finished = threading.Event()

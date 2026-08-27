@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -24,6 +25,7 @@ from application import (
 )
 from monitor_service import MonitorService
 from notifier import ServerChanNotifier
+from project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
 from streamer_config import (
     add_streamer,
     enabled_streamers,
@@ -212,6 +214,14 @@ def status_text(status: str) -> str:
 def compact_ui_text(value: Any, limit: int) -> str:
     """Collapse untrusted remote text into one bounded table-cell value."""
     return " ".join(str(value or "").split())[:limit].rstrip()
+
+
+def open_project_repository() -> bool:
+    """Open the fixed public project address in the user's browser."""
+    try:
+        return bool(webbrowser.open_new_tab(PROJECT_REPOSITORY_URL))
+    except (OSError, webbrowser.Error):
+        return False
 
 
 def validate_gui_settings(values: Mapping[str, Any]) -> Dict[str, Any]:
@@ -548,16 +558,41 @@ class MonitorGui:
         )
         footer.grid(row=2, column=0, sticky="ew")
         footer.grid_columnconfigure(0, weight=1)
+        source_notice = ttk.Frame(footer, style="App.TFrame")
+        source_notice.grid(
+            row=0,
+            column=0,
+        )
         ttk.Label(
-            footer,
-            text="配置保存在程序目录，不会上传到网络",
+            source_notice,
+            text=f"{PROJECT_SOURCE_NOTICE} · 项目地址：",
             style="Subtitle.TLabel",
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            footer,
-            text="关闭窗口行为可在监控设置中选择",
-            style="Subtitle.TLabel",
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=0, sticky="e")
+        self.project_link = tk.Label(
+            source_notice,
+            text=PROJECT_REPOSITORY_URL,
+            fg=COLORS["accent"],
+            bg=COLORS["canvas"],
+            activeforeground=COLORS["accent"],
+            activebackground=COLORS["canvas"],
+            cursor="hand2",
+            font=("Segoe UI", 9, "underline"),
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=True,
+        )
+        self.project_link.grid(row=0, column=1, sticky="w")
+        self.project_link.bind("<Button-1>", self._open_project_repository)
+        self.project_link.bind("<Return>", self._open_project_repository)
+        self.project_link.bind("<space>", self._open_project_repository)
+
+    def _open_project_repository(self, _event: Any = None) -> None:
+        if not open_project_repository():
+            messagebox.showerror(
+                "无法打开项目地址",
+                f"请在浏览器中访问：\n{PROJECT_REPOSITORY_URL}",
+                parent=self.root,
+            )
 
     def _build_sidebar(self, parent: ttk.Frame) -> None:
         parent.grid_rowconfigure(1, weight=1)

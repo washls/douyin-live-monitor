@@ -6,6 +6,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
+        ('LICENSE', '.'),
+        ('NOTICE', '.'),
         ('THIRD_PARTY_NOTICES.md', '.'),
         ('assets/app_icon.png', 'assets'),
     ],
@@ -25,7 +27,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='douyin-monitor-v1.6.1',
+    name='douyin-monitor-v1.7.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
