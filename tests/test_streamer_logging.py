@@ -1,7 +1,7 @@
 import logging
 import threading
 
-from streamer_logging import (
+from douyin_monitor.streamer_logging import (
     RedactingFormatter,
     StreamerLogHandler,
     StreamerLogStore,

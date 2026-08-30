@@ -23,15 +23,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 
-from douyin_client import DouyinClient
-from monitor_service import (
+from douyin_monitor.douyin_client import DouyinClient
+from douyin_monitor.monitor_service import (
     LiveStatusUnknownError,
     MonitorCheckCancelled,
     MonitorService,
 )
-from monitor_types import StreamerStatus, WorkerPreparation
-from notifier import ServerChanNotifier
-from streamer_config import (
+from douyin_monitor.monitor_types import StreamerStatus, WorkerPreparation
+from douyin_monitor.notifier import ServerChanNotifier
+from douyin_monitor.streamer_config import (
     add_streamer,
     enabled_streamers,
     ensure_private_config_permissions,
@@ -41,7 +41,7 @@ from streamer_config import (
     validate_streamer_url,
     normalize_app_config,
 )
-from streamer_logging import RedactingFormatter
+from douyin_monitor.streamer_logging import RedactingFormatter
 
 # ===== Path Helpers (supports PyInstaller frozen exe) =====
 
@@ -353,7 +353,7 @@ def _pause_if_frozen() -> None:
 
 def _create_notifier(config: Dict[str, Any]) -> ServerChanNotifier:
     """Compatibility wrapper for the public application assembly helper."""
-    from application import create_notifier
+    from douyin_monitor.application import create_notifier
 
     return create_notifier(config)
 
@@ -881,7 +881,7 @@ def _load_streamer_entries(
     config_path: Path, config: Dict[str, Any]
 ) -> list[Dict[str, Any]]:
     """Compatibility wrapper for the public application assembly helper."""
-    from application import load_streamer_entries
+    from douyin_monitor.application import load_streamer_entries
 
     return load_streamer_entries(config_path, config, load_monitor_state())
 
@@ -999,12 +999,12 @@ def _print_once_results(
 
 def main():
     setup_logging()
-    from application import (
+    from douyin_monitor.application import (
         create_monitor_service,
         create_notifier,
         load_streamer_entries,
     )
-    from windows_integration import WindowsInstanceGuard
+    from douyin_monitor.windows_integration import WindowsInstanceGuard
 
     parser = argparse.ArgumentParser(
         description="抖音直播监听器 - 检测开播并通过Server酱³推送通知",

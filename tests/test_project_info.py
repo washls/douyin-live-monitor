@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from project_info import (
+from douyin_monitor.project_info import (
     PROJECT_LICENSE_NAME,
     PROJECT_LICENSE_URL,
     PROJECT_REPOSITORY_URL,

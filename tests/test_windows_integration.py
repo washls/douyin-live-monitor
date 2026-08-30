@@ -1,8 +1,11 @@
 from pathlib import Path
 from unittest.mock import Mock
 
-import windows_integration
-from windows_integration import WindowsInstanceGuard
+from douyin_monitor import windows_integration
+from douyin_monitor.windows_integration import WindowsInstanceGuard
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class FakeRegistryKey:
@@ -113,6 +116,16 @@ def test_autostart_command_quotes_paths_and_carries_config():
     assert f'"{config.resolve()}"' in command
     assert command.endswith("--autostart")
     assert "--gui" in command
+
+
+def test_source_autostart_command_uses_root_entry():
+    command = windows_integration.build_autostart_command(
+        Path("C:/Config/config.json"),
+        executable=Path("C:/Python/python.exe"),
+        frozen=False,
+    )
+
+    assert str(PROJECT_ROOT / "gui_entry.py") in command
 
 
 def test_autostart_registry_is_idempotent_and_restorable(monkeypatch, tmp_path):

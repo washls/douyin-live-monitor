@@ -3,9 +3,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import gui_app
 import gui_entry
 import monitor
+from douyin_monitor import gui_app
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

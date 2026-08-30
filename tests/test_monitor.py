@@ -13,9 +13,9 @@ from monitor import (
     _load_streamer_entries,
     is_serverchan_configured,
 )
-from notifier import ServerChanNotifier
-from douyin_client import DouyinClient
-from monitor_service import MonitorCheckCancelled
+from douyin_monitor.notifier import ServerChanNotifier
+from douyin_monitor.douyin_client import DouyinClient
+from douyin_monitor.monitor_service import MonitorCheckCancelled
 
 
 class MonitorStateTests(unittest.TestCase):
@@ -99,13 +99,15 @@ class NotifierTests(unittest.TestCase):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
         response = Mock(text='{"code": 0, "message": "ok"}')
         response.json.return_value = {"code": 0, "message": "ok"}
-        with patch("notifier.requests.post", return_value=response) as post:
+        with patch("douyin_monitor.notifier.requests.post", return_value=response) as post:
             self.assertTrue(notifier.send("same notification"))
         self.assertEqual(post.call_count, 1)
 
     def test_timeout_is_not_retried(self):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
-        with patch("notifier.requests.post", side_effect=requests.Timeout()) as post:
+        with patch(
+            "douyin_monitor.notifier.requests.post", side_effect=requests.Timeout()
+        ) as post:
             self.assertFalse(notifier.send("same notification"))
         self.assertTrue(notifier.delivery_unknown)
         self.assertEqual(post.call_count, 1)
@@ -115,14 +117,17 @@ class NotifierTests(unittest.TestCase):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
         notifier.api_url = f"https://1.push.ft07.com/send/{secret}.send"
         error = requests.Timeout(notifier.api_url)
-        with self.assertLogs("notifier", level="WARNING") as captured:
-            with patch("notifier.requests.post", side_effect=error):
+        with self.assertLogs("douyin_monitor.notifier", level="WARNING") as captured:
+            with patch("douyin_monitor.notifier.requests.post", side_effect=error):
                 self.assertFalse(notifier.send("title"))
         self.assertNotIn(secret, "\n".join(captured.output))
 
     def test_unexpected_send_error_is_not_retried(self):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
-        with patch("notifier.requests.post", side_effect=RuntimeError("network failure")) as post:
+        with patch(
+            "douyin_monitor.notifier.requests.post",
+            side_effect=RuntimeError("network failure"),
+        ) as post:
             self.assertFalse(notifier.send("same notification"))
         self.assertEqual(post.call_count, 1)
 
@@ -130,7 +135,7 @@ class NotifierTests(unittest.TestCase):
         notifier = ServerChanNotifier(sendkey="key", uid="uid")
         secret = "placeholder-secret-value"
 
-        with self.assertLogs("notifier", level="INFO") as captured:
+        with self.assertLogs("douyin_monitor.notifier", level="INFO") as captured:
             notifier.set_api_url(
                 f"https://12345.push.ft07.com/send/{secret}.send"
             )
@@ -152,7 +157,10 @@ class NotifierTests(unittest.TestCase):
         client.session.head = Mock(side_effect=[redirect, response])
 
         public_dns = [(None, None, None, None, ("8.8.8.8", 443))]
-        with patch("douyin_client.socket.getaddrinfo", return_value=public_dns):
+        with patch(
+            "douyin_monitor.douyin_client.socket.getaddrinfo",
+            return_value=public_dns,
+        ):
             self.assertEqual(
                 client.resolve_short_link("https://v.douyin.com/example/"),
                 response.url,
@@ -336,7 +344,7 @@ class MonitorControlTests(unittest.TestCase):
 
         with TemporaryDirectory() as temp_dir, patch(
             "monitor.load_monitor_state", return_value=legacy
-        ), patch("application.logger.info") as log_info:
+        ), patch("douyin_monitor.application.logger.info") as log_info:
             entries = _load_streamer_entries(
                 Path(temp_dir) / "config.json", config
             )
@@ -352,7 +360,7 @@ class MonitorControlTests(unittest.TestCase):
 
         with TemporaryDirectory() as temp_dir, patch(
             "monitor.load_monitor_state", return_value=legacy
-        ), patch("application.logger.warning") as log_warning:
+        ), patch("douyin_monitor.application.logger.warning") as log_warning:
             entries = _load_streamer_entries(
                 Path(temp_dir) / "config.json", config
             )

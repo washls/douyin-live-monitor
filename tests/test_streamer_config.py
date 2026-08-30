@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from streamer_config import (
+from douyin_monitor.streamer_config import (
     add_streamer,
     migrate_legacy_streamer,
     normalize_app_config,
@@ -143,7 +143,7 @@ def test_atomic_save_creates_private_temp_file(tmp_path, monkeypatch):
         modes.append(mode)
         return original_open(path, flags, mode)
 
-    monkeypatch.setattr("streamer_config.os.open", recording_open)
+    monkeypatch.setattr("douyin_monitor.streamer_config.os.open", recording_open)
 
     save_config_atomic(tmp_path / "config.json", {"streamers": []})
 
@@ -187,10 +187,10 @@ def test_app_config_defaults_and_validates_close_action():
 
 def test_posix_config_permissions_are_private(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    monkeypatch.setattr("streamer_config._IS_POSIX", True)
+    monkeypatch.setattr("douyin_monitor.streamer_config._IS_POSIX", True)
     chmod_calls = []
     monkeypatch.setattr(
-        "streamer_config.os.chmod",
+        "douyin_monitor.streamer_config.os.chmod",
         lambda path, mode: chmod_calls.append((path, mode)),
     )
 

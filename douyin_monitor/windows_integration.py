@@ -225,7 +225,8 @@ def build_autostart_command(
     else:
         pythonw = executable_path.with_name("pythonw.exe")
         interpreter = pythonw if pythonw.exists() else executable_path
-        entry = Path(source_entry or Path(__file__).with_name("gui_entry.py")).resolve()
+        default_entry = Path(__file__).resolve().parent.parent / "gui_entry.py"
+        entry = Path(source_entry or default_entry).resolve()
         arguments.extend((str(interpreter), str(entry)))
     arguments.extend(
         ("--gui", "--config", str(Path(config_path).resolve()), "--autostart")

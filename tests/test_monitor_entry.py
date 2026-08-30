@@ -3,9 +3,8 @@ from unittest.mock import Mock
 
 import pytest
 
-import application
 import monitor
-import windows_integration
+from douyin_monitor import application, windows_integration
 
 
 def cli_config():

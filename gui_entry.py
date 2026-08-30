@@ -10,7 +10,10 @@ from ctypes import wintypes
 from pathlib import Path
 
 import monitor
-from windows_integration import WindowsInstanceGuard, show_windows_warning
+from douyin_monitor.windows_integration import (
+    WindowsInstanceGuard,
+    show_windows_warning,
+)
 
 if sys.platform == "win32":
     import msvcrt
@@ -209,7 +212,7 @@ def main() -> None:
         if unknown:
             _prepare_frozen_cli_console()
             parser.error(f"GUI 模式不支持参数: {' '.join(unknown)}")
-        from gui_app import run_gui
+        from douyin_monitor.gui_app import run_gui
 
         try:
             instance_guard, existing_owner = WindowsInstanceGuard.acquire_gui()

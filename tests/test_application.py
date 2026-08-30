@@ -2,9 +2,9 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from application import create_monitor_service, create_monitor_worker
+from douyin_monitor.application import create_monitor_service, create_monitor_worker
 from monitor import MonitorConfigurationError
-from monitor_types import (
+from douyin_monitor.monitor_types import (
     MonitorEvent,
     MonitorEventType,
     StreamerSnapshot,

@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Callable, Deque, Dict, Iterator, List
 
-from monitor_types import MonitorEvent
+from .monitor_types import MonitorEvent
 
 
 CURRENT_STREAMER_ID: ContextVar[str] = ContextVar(

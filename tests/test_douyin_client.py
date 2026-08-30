@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 import requests
 import pytest
 
-import douyin_client
-from douyin_client import DouyinClient, compact_log_preview
+from douyin_monitor import douyin_client
+from douyin_monitor.douyin_client import DouyinClient, compact_log_preview
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_source_runtime_files_stay_at_project_root():
+    assert Path(douyin_client.RUNTIME_DIR) == PROJECT_ROOT
 
 
 class FakeResponse:

@@ -5,17 +5,17 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import gui_app
 import monitor
-from gui_app import (
+from douyin_monitor import gui_app
+from douyin_monitor.gui_app import (
     MonitorGui,
     compact_ui_text,
     open_project_repository,
     status_text,
     validate_gui_settings,
 )
-from project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
-from streamer_config import add_streamer, save_config_atomic
+from douyin_monitor.project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
+from douyin_monitor.streamer_config import add_streamer, save_config_atomic
 
 
 def test_high_dpi_prefers_per_monitor_v2(monkeypatch):
@@ -179,7 +179,7 @@ def test_remote_text_is_single_line_and_bounded():
 def test_project_repository_link_opens_the_fixed_address(monkeypatch):
     opened = []
     monkeypatch.setattr(
-        "gui_app.webbrowser.open_new_tab",
+        "douyin_monitor.gui_app.webbrowser.open_new_tab",
         lambda url: opened.append(url) or True,
     )
 
@@ -202,16 +202,22 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
     config_path = tmp_path / "config.json"
     save_config_atomic(config_path, config)
     monkeypatch.setattr(
-        "gui_app.load_streamer_entries",
+        "douyin_monitor.gui_app.load_streamer_entries",
         lambda _path, loaded, _legacy: list(loaded["streamers"]),
     )
-    monkeypatch.setattr("gui_app.messagebox.askyesno", lambda *args, **kwargs: True)
-    monkeypatch.setattr("gui_app.is_autostart_enabled", lambda _path: False)
-    monkeypatch.setattr("gui_app.get_autostart_snapshot", lambda: None)
     monkeypatch.setattr(
-        "gui_app.set_autostart_enabled", lambda _enabled, _path: None
+        "douyin_monitor.gui_app.messagebox.askyesno", lambda *args, **kwargs: True
     )
-    monkeypatch.setattr("gui_app.restore_autostart_value", lambda _value: None)
+    monkeypatch.setattr(
+        "douyin_monitor.gui_app.is_autostart_enabled", lambda _path: False
+    )
+    monkeypatch.setattr("douyin_monitor.gui_app.get_autostart_snapshot", lambda: None)
+    monkeypatch.setattr(
+        "douyin_monitor.gui_app.set_autostart_enabled", lambda _enabled, _path: None
+    )
+    monkeypatch.setattr(
+        "douyin_monitor.gui_app.restore_autostart_value", lambda _value: None
+    )
     finished = threading.Event()
 
     class FakeTray:
@@ -266,7 +272,7 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
             ]
 
     monkeypatch.setattr(
-        "gui_app.create_monitor_service",
+        "douyin_monitor.gui_app.create_monitor_service",
         lambda _config, entries, **kwargs: FakeService(
             entries, kwargs["on_event"]
         ),

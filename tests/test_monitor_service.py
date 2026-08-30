@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from monitor_service import LiveStatusUnknownError, MonitorService
-from streamer_logging import StreamerLogHandler
+from douyin_monitor.monitor_service import LiveStatusUnknownError, MonitorService
+from douyin_monitor.streamer_logging import StreamerLogHandler
 
 
 @dataclass
@@ -323,7 +323,7 @@ def test_daily_intimacy_reminder_is_aggregated_once_per_minute(monkeypatch):
         def now(cls):
             return __import__("datetime").datetime(2026, 8, 26, 23, 57, 10)
 
-    monkeypatch.setattr("monitor_service.datetime", FixedDateTime)
+    monkeypatch.setattr("douyin_monitor.monitor_service.datetime", FixedDateTime)
 
     service._check_daily_intimacy_reminder()
     service._check_daily_intimacy_reminder()
@@ -353,7 +353,7 @@ def test_daily_intimacy_reminder_respects_disabled_setting(monkeypatch):
         def now(cls):
             return __import__("datetime").datetime(2026, 8, 26, 23, 57, 10)
 
-    monkeypatch.setattr("monitor_service.datetime", FixedDateTime)
+    monkeypatch.setattr("douyin_monitor.monitor_service.datetime", FixedDateTime)
     service._check_daily_intimacy_reminder()
 
     assert worker.notifier.daily_messages == []
@@ -389,7 +389,7 @@ def test_daily_intimacy_reminder_does_not_block_scheduler(monkeypatch):
         def now(cls):
             return __import__("datetime").datetime(2026, 8, 26, 23, 57, 10)
 
-    monkeypatch.setattr("monitor_service.datetime", FixedDateTime)
+    monkeypatch.setattr("douyin_monitor.monitor_service.datetime", FixedDateTime)
     service.running = True
     service._notification_executor = ThreadPoolExecutor(max_workers=1)
     try:

@@ -2,7 +2,11 @@ from pathlib import Path
 
 from PIL import Image
 
-from app_icon import APP_ICON_RELATIVE_PATH, get_app_icon_path, load_app_icon
+from douyin_monitor.app_icon import (
+    APP_ICON_RELATIVE_PATH,
+    get_app_icon_path,
+    load_app_icon,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

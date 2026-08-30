@@ -1,6 +1,6 @@
 import threading
 
-from tray_controller import TrayController, create_tray_image
+from douyin_monitor.tray_controller import TrayController, create_tray_image
 
 
 class FakeMenuItem:

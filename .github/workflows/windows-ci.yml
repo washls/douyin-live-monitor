@@ -29,10 +29,7 @@ jobs:
       - name: Ruff
         run: python -m ruff check .
       - name: Compile production modules
-        run: >-
-          python -m py_compile abogus.py application.py douyin_client.py
-          gui_app.py gui_entry.py monitor.py monitor_service.py monitor_types.py
-          notifier.py streamer_config.py streamer_logging.py
+        run: python -m compileall -q gui_entry.py monitor.py douyin_monitor
       - name: Build Windows executable
         if: matrix.python-version == '3.12'
         run: python -m PyInstaller --clean --noconfirm douyin-monitor.spec

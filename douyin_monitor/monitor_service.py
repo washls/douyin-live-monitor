@@ -10,13 +10,13 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from monitor_types import (
+from .monitor_types import (
     MonitorEvent,
     StreamerSnapshot,
     StreamerStatus,
     WorkerPreparation,
 )
-from streamer_logging import run_with_streamer_context, streamer_log_context
+from .streamer_logging import run_with_streamer_context, streamer_log_context
 
 
 logger = logging.getLogger(__name__)

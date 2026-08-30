@@ -15,7 +15,7 @@ def get_app_icon_path() -> Path:
     bundle_root = getattr(sys, "_MEIPASS", None)
     if bundle_root:
         return Path(bundle_root) / APP_ICON_RELATIVE_PATH
-    return Path(__file__).resolve().parent / APP_ICON_RELATIVE_PATH
+    return Path(__file__).resolve().parent.parent / APP_ICON_RELATIVE_PATH
 
 
 def load_app_icon(

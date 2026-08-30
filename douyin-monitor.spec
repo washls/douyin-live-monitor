@@ -11,7 +11,7 @@ a = Analysis(
         ('THIRD_PARTY_NOTICES.md', '.'),
         ('assets/app_icon.png', 'assets'),
     ],
-    hiddenimports=['abogus', 'pystray._win32'],
+    hiddenimports=['douyin_monitor.abogus', 'pystray._win32'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

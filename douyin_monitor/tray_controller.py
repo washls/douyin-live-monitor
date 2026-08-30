@@ -6,7 +6,7 @@ import sys
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from app_icon import load_app_icon
+from .app_icon import load_app_icon
 
 
 TRAY_SIZE = 64

@@ -17,16 +17,16 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, Mapping, Optional, Union
 
 import monitor
-from app_icon import get_app_icon_path
-from application import (
+from .app_icon import get_app_icon_path
+from .application import (
     create_monitor_service,
     create_notifier,
     load_streamer_entries,
 )
-from monitor_service import MonitorService
-from notifier import ServerChanNotifier
-from project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
-from streamer_config import (
+from .monitor_service import MonitorService
+from .notifier import ServerChanNotifier
+from .project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
+from .streamer_config import (
     add_streamer,
     enabled_streamers,
     normalize_app_config,
@@ -34,9 +34,9 @@ from streamer_config import (
     save_config_atomic,
     update_streamer,
 )
-from streamer_logging import StreamerLogHandler, StreamerLogStore
-from tray_controller import TrayController
-from windows_integration import (
+from .streamer_logging import StreamerLogHandler, StreamerLogStore
+from .tray_controller import TrayController
+from .windows_integration import (
     IS_WINDOWS,
     WindowsInstanceGuard,
     get_autostart_snapshot,

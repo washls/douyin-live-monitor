@@ -6,10 +6,10 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from douyin_client import DouyinClient
-from monitor_service import EventCallback, MonitorService
-from notifier import ServerChanNotifier
-from streamer_config import (
+from .douyin_client import DouyinClient
+from .monitor_service import EventCallback, MonitorService
+from .notifier import ServerChanNotifier
+from .streamer_config import (
     migrate_legacy_streamer,
     normalize_app_config,
     normalize_streamers,

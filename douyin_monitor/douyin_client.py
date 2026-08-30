@@ -149,7 +149,7 @@ def _get_runtime_dir() -> str:
     """
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # Runtime writable directory
@@ -537,7 +537,7 @@ class DouyinClient:
             Dict with 'a_bogus' and 'msToken' keys
         """
         try:
-            from abogus import generate_signatures
+            from .abogus import generate_signatures
             ua = self.session.headers.get("User-Agent", "")
             a_bogus, ms_token = generate_signatures(params, ua)
             return {"a_bogus": a_bogus, "msToken": ms_token}
