@@ -8,7 +8,7 @@ import gui_entry
 import monitor
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_unified_entry_uses_gui_without_cli_flags(monkeypatch):

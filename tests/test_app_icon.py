@@ -5,7 +5,7 @@ from PIL import Image
 from app_icon import APP_ICON_RELATIVE_PATH, get_app_icon_path, load_app_icon
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_app_icon_asset_is_available_and_transparent():

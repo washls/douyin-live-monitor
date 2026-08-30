@@ -9,7 +9,7 @@ from project_info import (
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_required_notice_preserves_project_identity_and_noncommercial_terms():
