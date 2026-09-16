@@ -29,6 +29,7 @@ from urllib.parse import unquote, urljoin, urlparse, parse_qs
 
 import requests
 from requests.adapters import HTTPAdapter
+from .monitor_errors import ProfileDNSError, ProfileLinkError, failure_reason
 
 logger = logging.getLogger(__name__)
 
@@ -244,24 +245,26 @@ class DouyinClient:
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower().rstrip(".")
         if parsed.scheme != "https":
-            raise ValueError("抖音链接重定向必须使用 HTTPS")
+            raise ProfileLinkError("抖音链接重定向必须使用 HTTPS")
         if parsed.username is not None or parsed.password is not None:
-            raise ValueError("抖音链接不能包含账号凭据")
+            raise ProfileLinkError("抖音链接不能包含账号凭据")
         if parsed.port not in (None, 443):
-            raise ValueError("抖音链接重定向只能使用标准 HTTPS 端口")
+            raise ProfileLinkError("抖音链接重定向只能使用标准 HTTPS 端口")
         if not any(
             hostname == domain or hostname.endswith(f".{domain}")
             for domain in _ALLOWED_REDIRECT_DOMAINS
         ):
-            raise ValueError("抖音链接重定向到了不受信任的域名")
+            raise ProfileLinkError("抖音链接重定向到了不受信任的域名")
         try:
             addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
         except OSError as exc:
-            raise ValueError("无法验证抖音链接的公网地址") from exc
+            raise ProfileDNSError("DNS 域名解析失败，暂时无法验证抖音链接的公网地址") from exc
+        if not addresses:
+            raise ProfileDNSError("DNS 未返回可验证的地址")
         for address in {item[4][0] for item in addresses}:
             ip = ipaddress.ip_address(address.split("%", 1)[0])
             if not ip.is_global:
-                raise ValueError("抖音链接不能指向非公网地址")
+                raise ProfileLinkError("抖音链接不能指向非公网地址")
         return parsed.geturl()
 
     def _dump_debug(self, name: str, content: str, is_json: bool = False) -> None:
@@ -1028,6 +1031,7 @@ class DouyinClient:
             )
 
         except requests.RequestException as e:
+            result["error"] = failure_reason(e)
             logger.warning(f"[API检测] 请求失败: {e}")
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"[API检测] 响应解析失败: {e}")
@@ -1454,6 +1458,7 @@ class DouyinClient:
             )
 
         except requests.RequestException as e:
+            result["error"] = failure_reason(e)
             logger.warning(f"[Webcast info_by_user] 请求失败: {e}")
         except Exception as e:
             logger.warning(f"[Webcast info_by_user] 异常: {e}")

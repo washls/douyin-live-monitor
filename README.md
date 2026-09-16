@@ -6,7 +6,7 @@
   <h1>抖音直播监控与开播提醒工具</h1>
 
 <p>
-  <strong>抖音直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.6.3 · PolyForm NC 1.0.0
+  <strong>抖音直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.7.0 · PolyForm NC 1.0.0
 </p>
 
 <p>
@@ -26,7 +26,7 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.6.3.exe`，不需要安装 Python。
+Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.7.0.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
@@ -36,15 +36,15 @@ Windows 用户可以直接从 [最新版下载页](https://github.com/washls/dou
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.6.3
+## v1.7.0
 
-这一版把 README、程序窗口、任务栏、托盘和 Windows EXE 的品牌图像统一为新的蓝白猫耳直播监控插画，并新增适合 GitHub 分享展示的社交预览图。
+主播链接因 DNS、连接或超时问题暂时无法解析时，程序会自动重试；其他主播照常监控。首次失败后依次等待 10、30、60 秒，此后每 5 分钟重试，网络恢复后自动继续。
 
-仓库描述、README 标题和下载入口也改为直接说明“抖音直播监控、开播提醒、多主播、Server 酱³ 推送、Windows”等核心用途，便于用户理解与搜索。本次没有程序行为或配置格式变化。
+启动或检测持续异常满 5 分钟发送一次通知，恢复明确直播状态后再发送一次恢复通知。链接无效、安全校验拒绝或连续 10 次明确异常导致暂停时，立即通知。任务表展示具体原因、下次重试时间及异常通知发送结果。
+
+旧配置可以直接使用。回退时退出程序后运行 [v1.6.3](https://github.com/washls/douyin-live-monitor/releases/tag/v1.6.3)，原配置继续兼容。使用登录自启的用户需在新 EXE 中重新保存自启设置。
 
 自 v1.6.2 起，项目采用 PolyForm Noncommercial License 1.0.0，仅允许非商业用途。v1.6.1 及更早版本曾按 MIT License 发布，已经取得的 MIT 授权不受本次许可证变更影响。
-
-如需回退，可以直接使用 [v1.6.2](https://github.com/washls/douyin-live-monitor/releases/tag/v1.6.2)。
 
 ## 主要功能
 
@@ -65,7 +65,7 @@ Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后
 
 在左侧选择主播后，可以在“主播详情”中修改名称、主页链接和启用状态。停用的主播会保留配置，但下次开始监控时不会创建任务。
 
-同一抖音账号如果通过不同链接重复添加，程序会在启动时根据解析出的账号标识识别重复项，只保留列表中靠前的任务继续运行。
+同一抖音账号如果通过不同链接重复添加，程序会根据解析出的账号标识识别重复项。持续监控保留已成功解析并加入监控的任务，后续解析出的重复项会被跳过；单次检测按配置顺序保留第一项。
 
 ### 查看任务状态和实时日志
 
@@ -99,7 +99,15 @@ Windows 版启动后会显示任务栏托盘图标。托盘菜单固定提供“
 | 检测到下播 | 发送下播通知，可以在设置中关闭 |
 | 每日亲密度提醒 | 23:57、23:58、23:59 各发送一条，正文汇总当时所有已确认直播中的主播 |
 | 推送结果不明确 | 不自动重放相同请求，避免重复通知 |
-| 单个主播连续异常 | 连续 10 次明确检测异常后暂停该主播，其他任务继续运行 |
+| 启动网络解析失败 | 等待 10、30、60 秒后重试，此后每 5 分钟重试 |
+| 启动或检测持续异常 | 满 5 分钟通知一次，继续检测；原因变化不重新计时 |
+| 监控恢复 | 已触发异常通知后，首次确认直播状态时通知一次 |
+| 链接无效或安全校验失败 | 暂停该主播并通知一次 |
+| 单个主播连续异常 | 连续 10 次明确检测异常后暂停该主播并通知一次，其他任务继续运行 |
+
+异常与恢复通知默认启用，复用现有推送地址。同一事件只发送一次，即使失败或结果未知也不自动重发；断网时手机通知可能无法送达，请查看任务表和日志。故障记录仅保留在本次运行内，重启后重新计时。备用检测接口失败但整体检测成功、主动停止和重复主播跳过均不发送故障通知。
+
+`--once` 只执行一轮，任一启用主播未取得结果时返回非零退出码，不进入持续重试。
 
 每日亲密度提醒在多主播模式下按分钟合并。即使多个主播同时直播，同一分钟也只会收到一条提醒，不会按主播数量重复发送。
 
@@ -198,8 +206,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-Start-Process -FilePath .\douyin-monitor-v1.6.3.exe -ArgumentList '--once' -NoNewWindow -Wait
-Start-Process -FilePath .\douyin-monitor-v1.6.3.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.7.0.exe -ArgumentList '--once' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.7.0.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
 ```
 
 正式 EXE 使用 Windows GUI 子系统，PowerShell 直接执行时不会自动等待。使用上面的 `Start-Process` 写法可以让命令行输出留在当前终端，并等待任务结束后再返回提示符。

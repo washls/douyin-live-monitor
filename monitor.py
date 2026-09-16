@@ -30,6 +30,7 @@ from douyin_monitor.monitor_service import (
     MonitorService,
 )
 from douyin_monitor.monitor_types import StreamerStatus, WorkerPreparation
+from douyin_monitor.monitor_errors import ProfileLinkError
 from douyin_monitor.notifier import ServerChanNotifier
 from douyin_monitor.streamer_config import (
     add_streamer,
@@ -57,7 +58,7 @@ def _get_runtime_dir() -> Path:
 
 
 # ===== Constants =====
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.7.0"
 BASE_DIR = _get_runtime_dir()
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "monitor.log"
@@ -639,21 +640,23 @@ class DouyinLiveMonitor:
                     )
                 return sec_uid
             else:
-                logger.error("无法从URL中提取用户ID")
-                return None
+                raise ProfileLinkError("无法从主播链接中提取账号，请使用主播主页链接")
 
         except Exception as e:
-            logger.error(f"解析用户失败: {e}")
-            return None
+            logger.error("解析用户失败 (%s)", type(e).__name__)
+            raise
 
     def prepare(self) -> WorkerPreparation:
         """Resolve the target before scheduled checks begin."""
-        sec_uid = self._resolve_sec_uid() or ""
-        return WorkerPreparation(
-            sec_uid=sec_uid,
-            nickname=self.state.streamer_nickname,
-            status=StreamerStatus(self.state.status),
-        )
+        with self._check_lock:
+            self._raise_if_stopped()
+            sec_uid = self._resolve_sec_uid() or ""
+            self._raise_if_stopped()
+            return WorkerPreparation(
+                sec_uid=sec_uid,
+                nickname=self.state.streamer_nickname,
+                status=StreamerStatus(self.state.status),
+            )
 
     def _handle_live_detected(self, info: Dict[str, Any]) -> None:
         """Handle when streamer goes live (first detection)."""
@@ -1201,7 +1204,7 @@ def main():
                 logger.info("对全部已启用主播执行单次检测...")
                 results = service.check_all_once()
                 _print_once_results(active_entries, results)
-                if not results:
+                if len(results) != len(active_entries):
                     sys.exit(1)
             else:
                 if not service.run():

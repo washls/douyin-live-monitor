@@ -65,6 +65,7 @@ MAX_LOG_EVENTS_PER_TICK = 200
 
 STATUS_TEXT = {
     "pending": "待启动",
+    "retrying": "等待重试",
     "unknown": "待检测",
     "starting": "启动中",
     "live": "直播中",
@@ -1202,6 +1203,8 @@ class MonitorGui:
         streamer_id = str(entry["id"])
         runtime = self.runtime_by_id.get(streamer_id, {})
         state = runtime.get("status", "pending")
+        if runtime.get("suspended") and not runtime.get("stopped_by_user"):
+            state = "suspended"
         if not entry.get("enabled", True):
             state = "stopped"
         name = compact_ui_text(
@@ -1214,6 +1217,10 @@ class MonitorGui:
             or ("已停用" if not entry.get("enabled", True) else "等待首次检测"),
             160,
         )
+        if runtime.get("next_retry"):
+            detail += f" | 下次重试 {runtime['next_retry']}"
+        if runtime.get("notification_status"):
+            detail += f" | {runtime['notification_status']}"
         return state, name, runtime.get("last_check", ""), detail
 
     def _refresh_runtime_row(self, streamer_id: str) -> None:
@@ -1738,6 +1745,8 @@ class MonitorGui:
         elif event_type in {
             "prepared",
             "prepare_error",
+            "retrying",
+            "notification",
             "status",
             "error",
             "suspended",

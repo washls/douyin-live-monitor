@@ -80,6 +80,21 @@ def test_once_releases_the_monitor_lock(monkeypatch):
     guard.close.assert_called_once_with()
 
 
+def test_once_partial_failure_returns_nonzero(monkeypatch):
+    config = prepare_cli(monkeypatch, ["--once"])
+    config["streamers"].append({**config["streamers"][0], "id": "two"})
+    guard = Mock()
+    service = Mock()
+    service.check_all_once.return_value = {"one": {"is_live": False}}
+    monkeypatch.setattr(windows_integration.WindowsInstanceGuard, "acquire_monitor", lambda: guard)
+    monkeypatch.setattr(application, "create_monitor_service", lambda *args, **kwargs: service)
+    with pytest.raises(SystemExit) as caught:
+        monitor.main()
+    assert caught.value.code == 1
+    service.close.assert_called_once_with()
+    guard.close.assert_called_once_with()
+
+
 def test_configuration_commands_do_not_acquire_the_monitor_lock(monkeypatch, capsys):
     prepare_cli(monkeypatch, ["--list-streamers"])
 

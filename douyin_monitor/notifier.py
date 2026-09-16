@@ -162,6 +162,23 @@ class ServerChanNotifier:
             logger.warning("通知发送异常，不重试 (%s)", type(e).__name__)
         return False
 
+    def send_monitor_alert(
+        self, nickname: str, reason: str, duration: int, retrying: bool,
+    ) -> bool:
+        action = "程序将继续自动重试" if retrying else "任务已暂停，请检查后重新开始监控"
+        return self.send(
+            title=f"[异常] {nickname} 监控{'异常' if retrying else '已暂停'}",
+            desp=f"**主播**: {nickname}\n\n**原因**: {reason}\n\n"
+                 f"**持续时间**: {duration} 秒\n\n{action}",
+        )
+
+    def send_monitor_recovery(self, nickname: str, duration: int) -> bool:
+        return self.send(
+            title=f"[恢复] {nickname} 监控已恢复",
+            desp=f"**主播**: {nickname}\n\n已重新确认直播状态，监控继续运行。\n\n"
+                 f"**故障持续时间**: {duration} 秒",
+        )
+
     def send_live_notification(
         self, nickname: str, room_id: str, title: str = ""
     ) -> bool:

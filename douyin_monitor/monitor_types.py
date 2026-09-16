@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 class StreamerStatus(str, Enum):
     PENDING = "pending"
+    RETRYING = "retrying"
     UNKNOWN = "unknown"
     LIVE = "live"
     OFFLINE = "offline"
@@ -20,6 +21,8 @@ class StreamerStatus(str, Enum):
 class MonitorEventType(str, Enum):
     PREPARED = "prepared"
     PREPARE_ERROR = "prepare_error"
+    RETRYING = "retrying"
+    NOTIFICATION = "notification"
     STATUS = "status"
     ERROR = "error"
     SUSPENDED = "suspended"
@@ -52,6 +55,8 @@ class StreamerSnapshot:
     consecutive_unknowns: int
     suspended: bool
     stopped_by_user: bool
+    next_retry: str = ""
+    notification_status: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)

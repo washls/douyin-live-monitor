@@ -17,6 +17,7 @@ from .monitor_types import (
     WorkerPreparation,
 )
 from .streamer_logging import run_with_streamer_context, streamer_log_context
+from .monitor_errors import ProfileLinkError, failure_reason, transient_network_error
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,16 @@ class MonitorService:
         self._daily_reminder_future: Optional[Future] = None
         self._daily_reminder_pending: Optional[tuple[str, int]] = None
         self._notification_executor: Optional[ThreadPoolExecutor] = None
+        self._preparing: Dict[str, Any] = {}
+        self._preparation_futures: set[Future] = set()
+        self._resolved_users: Dict[str, str] = {}
+        self._prepare_attempts: Dict[str, int] = {}
+        self._faults: Dict[str, Dict[str, Any]] = {}
+        self._pending_alerts: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._alert_future: Optional[Future] = None
+        self._alert_streamer = ""
+        self._initial_attempts: set[str] = set()
+        self._startup_sent = False
 
         for entry in self.streamers:
             streamer_id = str(entry["id"])
@@ -100,6 +111,8 @@ class MonitorService:
                 "consecutive_unknowns": 0,
                 "suspended": False,
                 "stopped_by_user": False,
+                "next_retry": "",
+                "notification_status": "",
             }
 
     def _emit(self, event_type: str, streamer_id: str = "", **data: Any) -> None:
@@ -173,7 +186,7 @@ class MonitorService:
                             sec_uid = str(prepared or "")
                             preparation = WorkerPreparation(sec_uid=sec_uid)
                         if not sec_uid:
-                            raise RuntimeError("无法解析主播")
+                            raise ProfileLinkError("无法从主播链接中提取账号，请使用主播主页链接")
                         prepared_sec_uids[streamer_id] = str(sec_uid)
                         with self._lock:
                             runtime = self._runtime[streamer_id]
@@ -207,6 +220,7 @@ class MonitorService:
                 runtime["last_error"] = ""
                 nickname = runtime["nickname"]
             self._emit("prepared", streamer_id, nickname=nickname)
+            self._resolved_users[streamer_id] = sec_uid
 
         with self._lock:
             return list(self._workers)
@@ -224,23 +238,180 @@ class MonitorService:
             run_with_streamer_context(streamer_id, close)
 
     def _mark_prepare_error(self, streamer_id: str, exc: Exception) -> None:
-        message = str(exc)
+        message = failure_reason(exc)
+        if "指向同一账号" in str(exc):
+            message = "与已解析主播指向同一账号，已跳过"
         with streamer_log_context(streamer_id):
             logger.error("主播 %s 初始化失败: %s", streamer_id, message)
         with self._lock:
             runtime = self._runtime[streamer_id]
+            if runtime["stopped_by_user"] or self._stop_event.is_set():
+                return
             runtime["status"] = "error"
             runtime["last_error"] = message
             runtime["suspended"] = True
+            runtime["next_retry"] = ""
         self._emit("prepare_error", streamer_id, error=message)
+
+    def _prepare_worker(self, entry: Mapping[str, Any]) -> tuple[Any, WorkerPreparation]:
+        streamer_id = str(entry["id"])
+        worker = self.worker_factory(entry)
+        with self._lock:
+            self._preparing[streamer_id] = worker
+            cancelled = self._stop_event.is_set() or self._runtime[streamer_id]["stopped_by_user"]
+        try:
+            if cancelled:
+                raise MonitorCheckCancelled("监控任务已停止")
+            prepared = worker.prepare()
+            if not isinstance(prepared, WorkerPreparation):
+                prepared = WorkerPreparation(sec_uid=str(prepared or ""))
+            if not prepared.sec_uid:
+                raise ProfileLinkError("无法从主播链接中提取账号，请使用主播主页链接")
+            return worker, prepared
+        except Exception:
+            self._close_candidate(streamer_id, worker)
+            raise
+        finally:
+            with self._lock:
+                self._preparing.pop(streamer_id, None)
+
+    def _collect_preparation(self, streamer_id: str, future: Future) -> float:
+        self._initial_attempts.add(streamer_id)
+        runtime = self._runtime[streamer_id]
+        cancelled = self._stop_event.is_set() or runtime["stopped_by_user"]
+        try:
+            worker, prepared = future.result()
+        except Exception as exc:
+            if cancelled or isinstance(exc, MonitorCheckCancelled):
+                return 0.0
+            if transient_network_error(exc):
+                attempts = self._prepare_attempts.get(streamer_id, 0)
+                delay = (10.0, 30.0, 60.0, 300.0)[min(attempts, 3)]
+                self._prepare_attempts[streamer_id] = attempts + 1
+                message = failure_reason(exc)
+                with self._lock:
+                    if runtime["stopped_by_user"] or self._stop_event.is_set():
+                        return 0.0
+                    runtime.update(status="retrying", last_error=message,
+                                   next_retry=datetime.fromtimestamp(time.time() + delay).strftime("%H:%M:%S"))
+                self._start_fault(streamer_id, message)
+                logger.warning("主播 %s 初始化暂时失败: %s，%s 秒后重试", streamer_id, message, delay)
+                self._emit("retrying", streamer_id, error=message, retry_in=delay)
+                return delay
+            self._mark_prepare_error(streamer_id, exc)
+            self._start_fault(streamer_id, failure_reason(exc))
+            self._queue_fault_alert(streamer_id, "suspended")
+            return 0.0
+        if cancelled:
+            self._close_candidate(streamer_id, worker)
+            return 0.0
+        if prepared.sec_uid in self._resolved_users.values():
+            self._mark_prepare_error(streamer_id, RuntimeError("指向同一账号"))
+            self._faults.pop(streamer_id, None)
+            self._discard_alerts(streamer_id)
+            self._close_candidate(streamer_id, worker)
+            return 0.0
+        with self._lock:
+            # stop_streamer may have run while future.result() was collected.
+            cancelled = runtime["stopped_by_user"] or self._stop_event.is_set()
+            if not cancelled:
+                self._workers[streamer_id] = worker
+                self._resolved_users[streamer_id] = prepared.sec_uid
+                runtime.update(status=prepared.status.value, last_error="", next_retry="",
+                               nickname=prepared.nickname or runtime["label"])
+        if cancelled:
+            self._close_candidate(streamer_id, worker)
+        else:
+            self._emit("prepared", streamer_id, nickname=runtime["nickname"])
+        return 0.0
+
+    def _start_fault(self, streamer_id: str, reason: str) -> None:
+        fault = self._faults.setdefault(streamer_id, {
+            "started": time.monotonic(), "alerted": False, "suspended": False,
+        })
+        fault["reason"] = reason
+
+    def _queue_fault_alert(self, streamer_id: str, kind: str) -> None:
+        fault = self._faults[streamer_id]
+        flag = "suspended" if kind == "suspended" else "alerted"
+        if fault[flag] or self._runtime[streamer_id]["stopped_by_user"]:
+            return
+        fault[flag] = True
+        self._queue_alert(streamer_id, kind, fault)
+
+    def _queue_alert(self, streamer_id: str, kind: str, fault: Mapping[str, Any]) -> None:
+        runtime = self._runtime[streamer_id]
+        # At most three pending events per streamer; newer events of the same
+        # kind replace older unsent events and retain chronological ordering.
+        key = (streamer_id, kind)
+        if kind != "recovery":
+            self._pending_alerts.pop((streamer_id, "recovery"), None)
+        self._pending_alerts.pop(key, None)
+        self._pending_alerts[key] = {
+            "kind": kind,
+            "nickname": runtime["nickname"] or runtime["label"] or "未命名主播",
+            "reason": fault["reason"],
+            "duration": max(0, int(time.monotonic() - fault["started"])),
+        }
+
+    def _discard_alerts(self, streamer_id: str) -> None:
+        for key in list(self._pending_alerts):
+            if key[0] == streamer_id:
+                self._pending_alerts.pop(key, None)
+
+    @staticmethod
+    def _send_alert(notifier: Any, event: Mapping[str, Any]) -> tuple[bool, bool]:
+        if event["kind"] == "recovery":
+            success = notifier.send_monitor_recovery(event["nickname"], event["duration"])
+        else:
+            success = notifier.send_monitor_alert(
+                event["nickname"], event["reason"], event["duration"], event["kind"] != "suspended",
+            )
+        return success, bool(notifier.delivery_unknown)
+
+    def _check_fault_notifications(self) -> None:
+        future = self._alert_future
+        if future is not None and future.done():
+            try:
+                success, unknown = future.result()
+            except Exception:
+                success, unknown = False, True
+            message = "异常/恢复通知已发送" if success else (
+                "异常/恢复通知结果未知，不重发" if unknown else "异常/恢复通知发送失败，不重发"
+            )
+            with self._lock:
+                self._runtime[self._alert_streamer]["notification_status"] = message
+            logger.info("主播 %s: %s", self._alert_streamer, message)
+            self._emit("notification", self._alert_streamer)
+            self._alert_future = None
+        if self._stop_event.is_set():
+            return
+        for streamer_id, fault in list(self._faults.items()):
+            if not self._runtime[streamer_id]["suspended"] and time.monotonic() - fault["started"] >= 300:
+                self._queue_fault_alert(streamer_id, "error")
+        if self._alert_future is not None or not self._pending_alerts or self._notification_executor is None:
+            return
+        key = next(iter(self._pending_alerts))
+        event = self._pending_alerts.pop(key)
+        if self._runtime[key[0]]["stopped_by_user"]:
+            return
+        self._alert_streamer = key[0]
+        try:
+            notifier = self._get_service_notifier()
+            self._alert_future = self._notification_executor.submit(self._send_alert, notifier, event)
+        except Exception:
+            self._alert_future = Future()
+            self._alert_future.set_result((False, False))
+        self._alert_future.add_done_callback(lambda _future: self._wake_event.set())
 
     def _send_startup_notification(self) -> None:
         if not self.startup_notify or not self._workers:
             return
         names = []
-        for streamer_id in self._workers:
-            runtime = self._runtime[streamer_id]
-            names.append(runtime["nickname"] or runtime["label"] or streamer_id)
+        with self._lock:
+            for streamer_id in self._workers:
+                runtime = self._runtime[streamer_id]
+                names.append(runtime["nickname"] or runtime["label"] or "未命名主播")
         self._get_service_notifier().send(
             title="[START] 抖音直播监听器已启动",
             desp=(
@@ -361,7 +532,12 @@ class MonitorService:
     def check_all_once(self) -> Dict[str, Dict[str, Any]]:
         """Prepare and check every valid streamer once."""
         self.prepare_all()
+        for streamer_id, runtime in self._runtime.items():
+            if runtime["suspended"] and not runtime["stopped_by_user"] and "同一账号" not in runtime["last_error"]:
+                self._start_fault(streamer_id, runtime["last_error"])
+                self._queue_fault_alert(streamer_id, "suspended")
         if not self._workers:
+            self._deliver_once_alerts()
             return {}
         results: Dict[str, Dict[str, Any]] = {}
         with ThreadPoolExecutor(
@@ -385,7 +561,20 @@ class MonitorService:
                 except Exception as exc:
                     self._record_error(streamer_id, exc)
         self._check_daily_intimacy_reminder()
+        self._deliver_once_alerts()
         return results
+
+    def _deliver_once_alerts(self) -> None:
+        """Finish this single round's alerts without scheduling retries."""
+        if not self._pending_alerts:
+            return
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            self._notification_executor = executor
+            while (self._pending_alerts or self._alert_future is not None) and not self._stop_event.is_set():
+                self._check_fault_notifications()
+                self._wake_event.wait(0.05)
+                self._wake_event.clear()
+        self._notification_executor = None
 
     def run(self) -> bool:
         """Run all prepared workers until stopped or all are suspended."""
@@ -395,19 +584,13 @@ class MonitorService:
         self._wake_event.clear()
         if self.enable_console_stop:
             self._start_stop_listener()
-        self.prepare_all()
-        if not self._workers:
-            logger.error("没有可运行的主播监控任务")
+        if not self.streamers:
             self.running = False
             return False
-        if not self.running:
-            self.stop()
-            return True
 
         failed_all = False
         try:
-            self._send_startup_notification()
-            worker_ids = list(self._workers)
+            worker_ids = [str(entry["id"]) for entry in self.streamers]
             offsets = self.initial_offsets(len(worker_ids), self.check_interval)
             started_at = time.monotonic()
             self._next_due = {
@@ -430,12 +613,21 @@ class MonitorService:
                 self._collect_finished()
                 if not self.running:
                     break
+                self._check_fault_notifications()
+                if not self._startup_sent and len(self._initial_attempts) == len(self.streamers):
+                    self._startup_sent = True
+                    if self.startup_notify and self._workers:
+                        self._notification_executor.submit(self._send_startup_notification)
                 self._submit_due_checks()
                 if not self._has_runnable_workers():
+                    if self._pending_alerts or self._alert_future is not None:
+                        self._wake_event.wait(0.1)
+                        self._wake_event.clear()
+                        continue
                     with self._lock:
                         all_stopped_by_user = all(
                             self._runtime[streamer_id]["stopped_by_user"]
-                            for streamer_id in self._workers
+                            for streamer_id in self._runtime
                         )
                     if all_stopped_by_user:
                         logger.info("所有主播任务均已由用户停止，监控结束")
@@ -457,8 +649,10 @@ class MonitorService:
             self._executor = None
             notification_executor = self._notification_executor
             if notification_executor is not None:
-                notification_executor.shutdown(wait=True, cancel_futures=False)
+                notification_executor.shutdown(wait=True, cancel_futures=True)
             self._collect_daily_reminder_result()
+            self._check_fault_notifications()
+            self._pending_alerts.clear()
             self._notification_executor = None
             self.close()
             logger.info("多主播监听器已停止")
@@ -469,7 +663,9 @@ class MonitorService:
             return
         in_flight = set(self._futures.values())
         now = time.monotonic()
-        for streamer_id, worker in self._workers.items():
+        for entry in self.streamers:
+            streamer_id = str(entry["id"])
+            worker = self._workers.get(streamer_id)
             runtime = self._runtime[streamer_id]
             if runtime["suspended"] or streamer_id in in_flight:
                 continue
@@ -478,8 +674,11 @@ class MonitorService:
             future = self._executor.submit(
                 run_with_streamer_context,
                 streamer_id,
-                worker.check_once,
+                worker.check_once if worker is not None else self._prepare_worker,
+                *(() if worker is not None else (entry,)),
             )
+            if worker is None:
+                self._preparation_futures.add(future)
             self._futures[future] = streamer_id
             self._next_due[streamer_id] = float("inf")
             future.add_done_callback(lambda _future: self._wake_event.set())
@@ -491,6 +690,13 @@ class MonitorService:
                 continue
             del self._futures[future]
             collected = True
+            if future in self._preparation_futures:
+                self._preparation_futures.remove(future)
+                delay = self._collect_preparation(streamer_id, future)
+                self._next_due[streamer_id] = time.monotonic() + delay
+                continue
+            if self._stop_event.is_set() or self._runtime[streamer_id]["stopped_by_user"]:
+                continue
             delay = float(self.check_interval)
             try:
                 result = future.result()
@@ -521,10 +727,14 @@ class MonitorService:
             runtime["title"] = str(result.get("title") or "")
             runtime["last_check"] = now_text
             runtime["last_error"] = ""
+            runtime["next_retry"] = ""
             runtime["check_count"] += 1
             runtime["consecutive_errors"] = 0
             runtime["consecutive_unknowns"] = 0
             count = runtime["check_count"]
+        fault = self._faults.pop(streamer_id, None)
+        if fault and (fault["alerted"] or fault["suspended"]):
+            self._queue_alert(streamer_id, "recovery", fault)
         icon = "🔴" if is_live else "⚫"
         state_text = "直播中" if is_live else "未开播"
         line = (
@@ -541,12 +751,21 @@ class MonitorService:
         self._emit("status", streamer_id, result=dict(result))
 
     def _record_error(self, streamer_id: str, exc: Exception) -> float:
-        message = str(exc)
+        message = failure_reason(exc)
+        if isinstance(exc, LiveStatusUnknownError):
+            message = "直播状态暂时无法确认"
+            for reason in ("DNS 域名解析失败", "网络请求超时", "网络连接失败", "服务请求失败"):
+                if reason in str(exc):
+                    message = reason
+                    break
+        if self._runtime[streamer_id]["stopped_by_user"]:
+            return float(self.check_interval)
         if isinstance(exc, MonitorCheckCancelled):
             with streamer_log_context(streamer_id):
                 logger.info("主播 %s 的在途检测已取消", streamer_id)
             return float(self.check_interval)
-        if isinstance(exc, LiveStatusUnknownError):
+        self._start_fault(streamer_id, message)
+        if isinstance(exc, LiveStatusUnknownError) or transient_network_error(exc):
             with self._lock:
                 runtime = self._runtime[streamer_id]
                 if runtime["stopped_by_user"]:
@@ -567,6 +786,9 @@ class MonitorService:
             )
             with streamer_log_context(streamer_id):
                 logger.warning("主播 %s 状态暂时无法确认: %s", streamer_id, message)
+            with self._lock:
+                if not runtime["stopped_by_user"]:
+                    runtime["next_retry"] = datetime.fromtimestamp(time.time() + delay).strftime("%H:%M:%S")
             self._emit(
                 "error",
                 streamer_id,
@@ -587,6 +809,7 @@ class MonitorService:
             runtime["status"] = "error"
             if count >= 10:
                 runtime["suspended"] = True
+                runtime["next_retry"] = ""
         with streamer_log_context(streamer_id):
             logger.error(
                 "主播 %s 检测异常 (连续错误 %s/10): %s",
@@ -596,6 +819,7 @@ class MonitorService:
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
         if count >= 10:
+            self._queue_fault_alert(streamer_id, "suspended")
             with streamer_log_context(streamer_id):
                 logger.error("主播 %s 已暂停，其他主播继续监控", streamer_id)
             self._emit("suspended", streamer_id, error=message)
@@ -606,7 +830,7 @@ class MonitorService:
     def _has_runnable_workers(self) -> bool:
         return any(
             not self._runtime[streamer_id]["suspended"]
-            for streamer_id in self._workers
+            for streamer_id in self._runtime
         )
 
     def _seconds_until_next_due(self) -> float:
@@ -615,6 +839,10 @@ class MonitorService:
             for streamer_id, due in self._next_due.items()
             if not self._runtime[streamer_id]["suspended"]
         ]
+        due_times.extend(
+            fault["started"] + 300 for streamer_id, fault in self._faults.items()
+            if not fault["alerted"] and not self._runtime[streamer_id]["suspended"]
+        )
         if not due_times:
             return 0.1
         timeout = min(due_times) - time.monotonic()
@@ -626,7 +854,7 @@ class MonitorService:
         self._stop_event.set()
         self._wake_event.set()
         with self._lock:
-            workers = list(self._workers.items())
+            workers = list(self._workers.items()) + list(self._preparing.items())
             emit_stopped = not self._stopped_emitted
             self._stopped_emitted = True
         for streamer_id, worker in workers:
@@ -638,18 +866,19 @@ class MonitorService:
         """Stop one prepared streamer while leaving the other tasks running."""
         streamer_id = str(streamer_id or "")
         with self._lock:
-            worker = self._workers.get(streamer_id)
+            worker = self._workers.get(streamer_id) or self._preparing.get(streamer_id)
             runtime = self._runtime.get(streamer_id)
-            if worker is None or runtime is None or runtime["stopped_by_user"]:
+            if runtime is None or runtime["stopped_by_user"]:
                 return False
             runtime["stopped_by_user"] = True
             runtime["suspended"] = True
             runtime["status"] = "stopped"
             runtime["last_error"] = ""
+            runtime["next_retry"] = ""
         stop_and_wait = getattr(worker, "stop_and_wait", None)
         if callable(stop_and_wait):
             run_with_streamer_context(streamer_id, stop_and_wait)
-        else:
+        elif worker is not None:
             run_with_streamer_context(streamer_id, worker.stop)
         with streamer_log_context(streamer_id):
             logger.info("主播 %s 已由用户停止，其他主播继续监控", streamer_id)
