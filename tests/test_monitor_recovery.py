@@ -294,6 +294,24 @@ def test_pending_alerts_remain_bounded(clock):
     assert len(service._pending_alerts) <= 3
 
 
+def test_stopping_streamer_cancels_alert_queued_behind_other_notification(clock):
+    notifier = AlertNotifier()
+    service = MonitorService([streamer("one")], FakeWorker, service_notifier=notifier)
+    service._start_fault("one", "DNS 域名解析失败")
+    clock[0] += 300
+    release = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(release.wait, 3)
+        service._notification_executor = executor
+        service._check_fault_notifications()
+        service.stop_streamer("one")
+        release.set()
+        service._alert_future.result(timeout=2)
+        service._check_fault_notifications()
+    assert not notifier.events
+    assert "取消" in service.snapshot()[0]["notification_status"]
+
+
 def test_once_failure_attempts_only_once_and_notifies():
     notifier = AlertNotifier()
     worker = FakeWorker(streamer("one"))

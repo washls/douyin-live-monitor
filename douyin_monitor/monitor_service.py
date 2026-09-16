@@ -359,8 +359,9 @@ class MonitorService:
             if key[0] == streamer_id:
                 self._pending_alerts.pop(key, None)
 
-    @staticmethod
-    def _send_alert(notifier: Any, event: Mapping[str, Any]) -> tuple[bool, bool]:
+    def _send_alert(self, notifier: Any, event: Mapping[str, Any], streamer_id: str) -> tuple[bool, bool]:
+        if self._stop_event.is_set() or self._runtime[streamer_id]["stopped_by_user"]:
+            return False, False
         if event["kind"] == "recovery":
             success = notifier.send_monitor_recovery(event["nickname"], event["duration"])
         else:
@@ -379,6 +380,10 @@ class MonitorService:
             message = "异常/恢复通知已发送" if success else (
                 "异常/恢复通知结果未知，不重发" if unknown else "异常/恢复通知发送失败，不重发"
             )
+            if future.cancelled() or (not success and not unknown and (
+                self._stop_event.is_set() or self._runtime[self._alert_streamer]["stopped_by_user"]
+            )):
+                message = "异常/恢复通知已取消"
             with self._lock:
                 self._runtime[self._alert_streamer]["notification_status"] = message
             logger.info("主播 %s: %s", self._alert_streamer, message)
@@ -398,7 +403,7 @@ class MonitorService:
         self._alert_streamer = key[0]
         try:
             notifier = self._get_service_notifier()
-            self._alert_future = self._notification_executor.submit(self._send_alert, notifier, event)
+            self._alert_future = self._notification_executor.submit(self._send_alert, notifier, event, key[0])
         except Exception:
             self._alert_future = Future()
             self._alert_future.set_result((False, False))
