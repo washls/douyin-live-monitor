@@ -15,6 +15,7 @@ debug_dumps/
 
 # Logs
 *.log
+monitor.log*
 
 # Runtime state
 .monitor_state.json
@@ -32,6 +33,7 @@ Thumbs.db
 # Config (contains user secrets, each user creates their own)
 # config.json is committed as config.example.json instead
 config.json
+*.pre-v1.8.0.bak
 .env
 .env.*
 *.pem

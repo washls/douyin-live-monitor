@@ -54,10 +54,10 @@ def test_normalize_rejects_unbounded_streamer_list():
         normalize_streamers(config)
 
 
-def test_streamer_url_rejects_non_douyin_hostname():
+def test_streamer_url_rejects_unsupported_hostname():
     config = {"streamers": [], "max_concurrent_checks": 2}
 
-    with pytest.raises(ValueError, match="不是可识别的抖音链接"):
+    with pytest.raises(ValueError, match="暂不支持该平台"):
         add_streamer(config, "https://example.com/?next=douyin.com")
 
 

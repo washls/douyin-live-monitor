@@ -33,9 +33,16 @@ class MonitorEventType(str, Enum):
 
 @dataclass(frozen=True)
 class WorkerPreparation:
-    sec_uid: str
+    sec_uid: str = ""
     nickname: str = ""
     status: StreamerStatus = StreamerStatus.UNKNOWN
+    platform: str = "douyin"
+    target_id: str = ""
+    url: str = ""
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.platform, self.target_id or self.sec_uid
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,10 @@ class StreamerSnapshot:
     stopped_by_user: bool
     next_retry: str = ""
     notification_status: str = ""
+    platform: str = "douyin"
+    live_url: str = ""
+    session_id: str = ""
+    error_kind: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)

@@ -15,21 +15,25 @@ from douyin_monitor.monitor_errors import ProfileDNSError
 from douyin_monitor.monitor_service import LiveStatusUnknownError, MonitorService
 from douyin_monitor.monitor_types import WorkerPreparation
 from douyin_monitor.notifier import ServerChanNotifier
-from test_monitor_service import FakeWorker, streamer
+from douyin_monitor.platform_clients import PlatformAccessError
+from test_monitor_service import FakeWorker, PlatformWorker, platform_streamer, streamer
 
 
 class AlertNotifier:
     def __init__(self, success=True, unknown=False):
         self.events = []
+        self.metadata = []
         self.success = success
         self.delivery_unknown = unknown
 
-    def send_monitor_alert(self, name, reason, duration, retrying):
+    def send_monitor_alert(self, name, reason, duration, retrying, platform="douyin", live_url=""):
         self.events.append(("error" if retrying else "suspended", name, reason, duration))
+        self.metadata.append((platform, live_url))
         return self.success
 
-    def send_monitor_recovery(self, name, duration):
+    def send_monitor_recovery(self, name, duration, platform="douyin", live_url=""):
         self.events.append(("recovery", name, duration))
+        self.metadata.append((platform, live_url))
         return self.success
 
 
@@ -186,7 +190,7 @@ def test_fault_then_suspension_sends_one_additional_event(clock):
 def test_duplicate_after_retry_is_closed_without_fault_alert(clock):
     notifier = AlertNotifier()
     service = MonitorService([streamer("one"), streamer("two")], FakeWorker, service_notifier=notifier)
-    service._resolved_users["one"] = "same"
+    service._resolved_users["one"] = ("douyin", "same")
     service._collect_preparation("two", failed_future(ProfileDNSError("DNS")))
     worker = FakeWorker(streamer("two"))
     future = Future()
@@ -385,7 +389,7 @@ def test_waiting_retry_ui_exposes_reason_time_and_notification():
         "status": "retrying", "last_error": "DNS 域名解析失败",
         "next_retry": "12:05:00", "notification_status": "异常/恢复通知发送失败，不重发",
     }}
-    state, _, _, detail = gui._streamer_row_values(streamer("one", "测试主播"))
+    state, *_, detail = gui._streamer_row_values(streamer("one", "测试主播"))
     assert status_text(state) == "等待重试"
     assert "DNS" in detail and "12:05:00" in detail and "通知发送失败" in detail
 
@@ -407,3 +411,87 @@ def test_actual_fault_notifier_submits_one_post(monkeypatch, outcome):
     notifier.send_monitor_alert("测试主播", "DNS 域名解析失败", 300, True)
     assert post.call_count == 1
     assert notifier.delivery_unknown == (outcome in {"timeout", "connection", "http500"})
+
+
+def test_continuous_preparation_dedup_is_scoped_to_platform(clock):
+    entries = [platform_streamer("one", "bilibili"), platform_streamer("two", "huya"),
+               platform_streamer("alias", "bilibili")]
+    service = MonitorService(entries, PlatformWorker)
+    workers = {}
+    for entry in entries:
+        worker = workers[entry["id"]] = PlatformWorker(entry)
+        future = Future()
+        future.set_result((worker, WorkerPreparation(platform=entry["platform"], target_id="123")))
+        service._collect_preparation(entry["id"], future)
+    assert set(service._workers) == {"one", "two"}
+    assert workers["alias"].closed
+    assert not service._faults and not service._pending_alerts
+    service.close()
+
+
+@pytest.mark.parametrize("kind", ["restricted", "rate_limited", "parse", "network"])
+def test_platform_preparation_failure_retries_instead_of_suspending(clock, kind):
+    service = MonitorService([platform_streamer("one", "huya")], PlatformWorker)
+    delay = service._collect_preparation("one", failed_future(
+        PlatformAccessError("https://private.invalid/token", error_kind=kind,
+                            cooldown=120 if kind == "rate_limited" else 0)))
+    assert delay == (120 if kind == "rate_limited" else 10)
+    snapshot = service.snapshot()[0]
+    assert snapshot["status"] == "retrying" and not snapshot["suspended"]
+    assert snapshot["error_kind"] == kind and "private" not in snapshot["last_error"]
+    if kind == "rate_limited":
+        assert service._platform_cooldown == {"huya": 220}
+
+
+def test_platform_fault_and_recovery_notifications_keep_watch_link(clock):
+    entry = platform_streamer("one", "huya")
+    notifier = AlertNotifier()
+    service = MonitorService([entry], PlatformWorker, service_notifier=notifier)
+    service.prepare_all()
+    service._record_success("one", {"is_live": True, "live_url": "https://www.huya.com/123"})
+    service._record_success("one", {"is_live": None, "indeterminate": True, "error_kind": "restricted"})
+    clock[0] += 300
+    flush_alerts(service)
+    service._record_success("one", {"is_live": None, "indeterminate": True})
+    flush_alerts(service)
+    assert [item[0] for item in notifier.events] == ["error"]
+    service._record_success("one", {"is_live": False, "live_url": "https://www.huya.com/123"})
+    flush_alerts(service)
+    assert [item[0] for item in notifier.events] == ["error", "recovery"]
+    assert notifier.metadata == [("huya", "https://www.huya.com/123")] * 2
+    service.close()
+
+
+@pytest.mark.parametrize("kind", ["invalid_target", "network", "unknown", "restricted", "parse", "rate_limited"])
+def test_worker_error_classification_reaches_scheduler_and_preserves_other_tasks(clock, kind):
+    entry = platform_streamer("one", "bilibili")
+    entry["url"] = "https://live.bilibili.com/123"
+    class Adapter:
+        def resolve(self, url):
+            return {"target_id": "123", "url": url}
+        def check(self, url):
+            return {"is_live": None, "indeterminate": True, "error_kind": kind,
+                    "error": "https://private.invalid/token"}
+        def close(self):
+            pass
+    notifier = AlertNotifier()
+    def factory(target):
+        if target["id"] != "one":
+            return FakeWorker(target)
+        return monitor.DouyinLiveMonitor(monitor._default_config(), entry["url"],
+                                        client=Adapter(), notifier=Mock(), platform="bilibili")
+    service = MonitorService([entry, streamer("other")], factory, service_notifier=notifier)
+    assert set(service.check_all_once()) == {"other"}
+    snapshot = service.snapshot()[0]
+    assert snapshot["error_kind"] == kind
+    assert "private" not in snapshot["last_error"]
+    assert service.snapshot()[1]["status"] == "offline"
+    if kind == "invalid_target":
+        assert snapshot["suspended"] and snapshot["consecutive_errors"] == 1
+        assert snapshot["consecutive_unknowns"] == 0 and not snapshot["next_retry"]
+        assert [item[0] for item in notifier.events] == ["suspended"]
+    else:
+        assert not snapshot["suspended"] and snapshot["consecutive_errors"] == 0
+        assert snapshot["consecutive_unknowns"] == 1 and snapshot["next_retry"]
+        assert not notifier.events
+    service.close()

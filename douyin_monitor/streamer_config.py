@@ -8,7 +8,8 @@ import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
-from urllib.parse import urlparse
+
+from .platform_clients import infer_platform, validate_platform_url
 
 
 STREAMERS_KEY = "streamers"
@@ -33,29 +34,14 @@ CLOSE_ACTIONS = {"exit", "hide_to_tray"}
 DEFAULT_CLOSE_ACTION = "exit"
 
 
-def validate_streamer_url(url: str) -> str:
-    """Return a trimmed Douyin URL or raise ``ValueError``."""
+def validate_streamer_url(url: str, platform: str | None = None) -> str:
+    """Validate a supported public streamer link without making requests."""
     value = (url or "").strip()
     if not value:
         raise ValueError("主播链接不能为空")
     if len(value) > MAX_URL_LENGTH:
         raise ValueError(f"主播链接不能超过 {MAX_URL_LENGTH} 个字符")
-    parsed = urlparse(value)
-    hostname = (parsed.hostname or "").lower()
-    allowed_hosts = ("douyin.com", "iesdouyin.com")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("主播链接不能包含账号凭据")
-    if parsed.scheme not in {"http", "https"} or not any(
-        hostname == domain or hostname.endswith(f".{domain}")
-        for domain in allowed_hosts
-    ):
-        raise ValueError("该链接不是可识别的抖音链接")
-    if parsed.port not in (None, 80, 443):
-        raise ValueError("主播链接只能使用标准端口")
-    if parsed.scheme == "http":
-        parsed = parsed._replace(scheme="https", netloc=parsed.netloc.replace(":80", ""))
-        value = parsed.geturl()
-    return value
+    return validate_platform_url(value, platform=platform)
 
 
 def normalize_app_config(mapping: Mapping[str, Any]) -> Dict[str, Any]:
@@ -97,6 +83,7 @@ def make_streamer(url: str, label: str = "") -> Dict[str, Any]:
     return {
         "id": uuid.uuid4().hex[:12],
         "url": validate_streamer_url(url),
+        "platform": infer_platform(url),
         "label": clean_label,
         "enabled": True,
     }
@@ -122,7 +109,11 @@ def normalize_streamers(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], b
             entry = make_streamer(raw)
             changed = True
         elif isinstance(raw, Mapping):
-            url = validate_streamer_url(str(raw.get("url", "")))
+            # Entries from earlier versions describe Douyin targets.
+            platform = raw.get("platform", "douyin")
+            if not isinstance(platform, str):
+                raise ValueError(f"第 {index} 个主播的平台必须是字符串")
+            url = validate_streamer_url(str(raw.get("url", "")), platform)
             streamer_id = str(raw.get("id", "")).strip()
             if not streamer_id:
                 streamer_id = uuid.uuid4().hex[:12]
@@ -142,6 +133,7 @@ def normalize_streamers(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], b
                 {
                     "id": streamer_id,
                     "url": url,
+                    "platform": platform,
                     "label": label,
                     "enabled": enabled,
                 }
@@ -197,6 +189,29 @@ def save_config_atomic(config_path: Path, config: Mapping[str, Any]) -> None:
     """Atomically replace a JSON config without leaving partial contents."""
     config_path = Path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    if config_path.exists():
+        old = json.loads(config_path.read_text(encoding="utf-8"))
+        old_entries = old.get(STREAMERS_KEY, [])
+        if any(isinstance(item, str) or (
+            isinstance(item, Mapping) and "platform" not in item
+        ) for item in old_entries or []):
+            backup = config_path.with_name(f"{config_path.name}.pre-v1.8.0.bak")
+            if not backup.exists():
+                backup_temp = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    descriptor = os.open(backup_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(config_path.read_bytes())
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    ensure_private_config_permissions(backup_temp)
+                    # Install only a complete backup, without overwriting an earlier one.
+                    try:
+                        os.link(backup_temp, backup)
+                    except FileExistsError:
+                        pass
+                finally:
+                    backup_temp.unlink(missing_ok=True)
     temp_path = config_path.with_name(f".{config_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         descriptor = os.open(
@@ -291,6 +306,7 @@ def update_streamer(
             entry.update(
                 {
                     "url": clean_url,
+                    "platform": infer_platform(clean_url),
                     "label": clean_label,
                     "enabled": bool(enabled),
                 }

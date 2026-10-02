@@ -12,6 +12,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import requests
 
+from .platform_clients import platform_name
+
 logger = logging.getLogger(__name__)
 
 # Server酱³ API base URL template
@@ -164,23 +166,28 @@ class ServerChanNotifier:
 
     def send_monitor_alert(
         self, nickname: str, reason: str, duration: int, retrying: bool,
+        platform: str = "douyin", live_url: str = "",
     ) -> bool:
         action = "程序将继续自动重试" if retrying else "任务已暂停，请检查后重新开始监控"
+        link = f"\n\n[主播直播间]({live_url})" if live_url else ""
         return self.send(
-            title=f"[异常] {nickname} 监控{'异常' if retrying else '已暂停'}",
-            desp=f"**主播**: {nickname}\n\n**原因**: {reason}\n\n"
-                 f"**持续时间**: {duration} 秒\n\n{action}",
+            title=f"[异常] [{platform_name(platform)}] {nickname} 监控{'异常' if retrying else '已暂停'}",
+            desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n**原因**: {reason}\n\n"
+                 f"**持续时间**: {duration} 秒\n\n{action}{link}",
         )
 
-    def send_monitor_recovery(self, nickname: str, duration: int) -> bool:
+    def send_monitor_recovery(self, nickname: str, duration: int,
+                              platform: str = "douyin", live_url: str = "") -> bool:
+        link = f"\n\n[主播直播间]({live_url})" if live_url else ""
         return self.send(
-            title=f"[恢复] {nickname} 监控已恢复",
-            desp=f"**主播**: {nickname}\n\n已重新确认直播状态，监控继续运行。\n\n"
-                 f"**故障持续时间**: {duration} 秒",
+            title=f"[恢复] [{platform_name(platform)}] {nickname} 监控已恢复",
+            desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n已重新确认直播状态，监控继续运行。\n\n"
+                 f"**故障持续时间**: {duration} 秒{link}",
         )
 
     def send_live_notification(
-        self, nickname: str, room_id: str, title: str = ""
+        self, nickname: str, room_id: str, title: str = "",
+        platform: str = "douyin", live_url: str = "",
     ) -> bool:
         """
         Send a formatted "streamer went live" notification.
@@ -193,13 +200,14 @@ class ServerChanNotifier:
         Returns:
             True if sent successfully
         """
-        live_url = f"https://live.douyin.com/{room_id}" if room_id else ""
+        live_url = live_url or (f"https://live.douyin.com/{room_id}" if platform == "douyin" and room_id else "")
 
         # Build Markdown message
         md_parts = [
             "📺 **开播提醒**",
             "",
             f"- **博主**: {nickname}",
+            f"- **平台**: {platform_name(platform)}",
         ]
         if title:
             md_parts.append(f"- **标题**: {title}")
@@ -215,19 +223,20 @@ class ServerChanNotifier:
 
         desp = "\n".join(md_parts)
 
-        notify_title = f"🔴 {nickname} 正在直播!"
+        notify_title = f"🔴 [{platform_name(platform)}] {nickname} 正在直播!"
         if title:
             notify_title += f" - {title[:30]}"
 
         return self.send(
             title=notify_title,
             desp=desp,
-            tags="抖音直播|开播提醒",
+            tags=f"{platform_name(platform)}直播|开播提醒",
             short=f"{nickname} 开播了",
         )
 
     def send_stream_end_notification(
-        self, nickname: str, duration: str = ""
+        self, nickname: str, duration: str = "",
+        platform: str = "douyin", live_url: str = "",
     ) -> bool:
         """
         Send a "stream ended" notification.
@@ -243,17 +252,20 @@ class ServerChanNotifier:
             "⏹️ **下播提醒**",
             "",
             f"- **博主**: {nickname}",
+            f"- **平台**: {platform_name(platform)}",
             f"- **时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         ]
         if duration:
             md_parts.append(f"- **直播时长**: {duration}")
+        if live_url:
+            md_parts.append(f"- **链接**: [主播直播间]({live_url})")
 
         desp = "\n".join(md_parts)
 
         return self.send(
-            title=f"⏹️ {nickname} 已下播",
+            title=f"⏹️ [{platform_name(platform)}] {nickname} 已下播",
             desp=desp,
-            tags="抖音直播|下播提醒",
+            tags=f"{platform_name(platform)}直播|下播提醒",
             short=f"{nickname} 已下播",
         )
 
@@ -265,6 +277,7 @@ class ServerChanNotifier:
         repeat_count: int = 1,
         max_repeat: int = 3,
         duration: str = "",
+        platform: str = "douyin", live_url: str = "",
     ) -> bool:
         """
         Send a periodic "still live" reminder notification.
@@ -280,12 +293,13 @@ class ServerChanNotifier:
         Returns:
             True if sent successfully
         """
-        live_url = f"https://live.douyin.com/{room_id}" if room_id else ""
+        live_url = live_url or (f"https://live.douyin.com/{room_id}" if platform == "douyin" and room_id else "")
 
         md_parts = [
             f"🔴 **仍在直播提醒 ({repeat_count}/{max_repeat})**",
             "",
             f"- **博主**: {nickname}",
+            f"- **平台**: {platform_name(platform)}",
         ]
         if title:
             md_parts.append(f"- **标题**: {title}")
@@ -304,14 +318,14 @@ class ServerChanNotifier:
 
         desp = "\n".join(md_parts)
 
-        notify_title = f"🔴 {nickname} 仍在直播 ({repeat_count}/{max_repeat})"
+        notify_title = f"🔴 [{platform_name(platform)}] {nickname} 仍在直播 ({repeat_count}/{max_repeat})"
         if title:
             notify_title += f" - {title[:20]}"
 
         return self.send(
             title=notify_title,
             desp=desp,
-            tags="抖音直播|持续提醒",
+            tags=f"{platform_name(platform)}直播|持续提醒",
             short=f"{nickname} 仍在直播 ({repeat_count}/{max_repeat})",
         )
 
@@ -321,6 +335,7 @@ class ServerChanNotifier:
         minute: int,
         room_id: str = "",
         title: str = "",
+        live_url: str = "",
     ) -> bool:
         """
         Send a daily intimacy refresh reminder at 23:57 / 23:58 / 23:59.
@@ -334,7 +349,7 @@ class ServerChanNotifier:
         Returns:
             True if sent successfully
         """
-        live_url = f"https://live.douyin.com/{room_id}" if room_id else ""
+        live_url = live_url or (f"https://live.douyin.com/{room_id}" if room_id else "")
         remaining = 60 - minute  # minutes until midnight reset
 
         md_parts = [
@@ -385,7 +400,7 @@ class ServerChanNotifier:
         minute: int,
     ) -> bool:
         """Send one daily reminder covering all currently live streamers."""
-        live_streamers = list(streamers)
+        live_streamers = [item for item in streamers if item.get("platform", "douyin") == "douyin"]
         if not live_streamers:
             return False
         if len(live_streamers) == 1:
@@ -395,6 +410,7 @@ class ServerChanNotifier:
                 minute=minute,
                 room_id=str(item.get("room_id") or ""),
                 title=str(item.get("title") or ""),
+                live_url=str(item.get("live_url") or ""),
             )
 
         remaining = 60 - minute
@@ -408,7 +424,7 @@ class ServerChanNotifier:
             nickname = str(item.get("nickname") or "未知主播")
             room_id = str(item.get("room_id") or "")
             title = str(item.get("title") or "")
-            live_url = f"https://live.douyin.com/{room_id}" if room_id else ""
+            live_url = str(item.get("live_url") or "") or (f"https://live.douyin.com/{room_id}" if room_id else "")
             line = f"- **{nickname}**"
             if title:
                 line += f"：{title}"

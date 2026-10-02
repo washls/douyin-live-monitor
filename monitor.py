@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 
 from douyin_monitor.douyin_client import DouyinClient
+from douyin_monitor.platform_clients import create_platform_client, infer_platform, platform_name
 from douyin_monitor.monitor_service import (
     LiveStatusUnknownError,
     MonitorCheckCancelled,
@@ -165,6 +166,8 @@ class MonitorState:
         self.last_status_change: float = self._clock()
         self.streamer_nickname: str = ""
         self.stream_room_id: str = ""
+        self.stream_session_id: str = ""
+        self.stream_live_url: str = ""
         self.stream_title: str = ""
         self.notification_sent: bool = False
         # Repeat notification tracking (while still live)
@@ -184,10 +187,13 @@ class MonitorState:
         nickname = info.get("nickname", self.streamer_nickname)
         room_id = info.get("room_id", "")
         title = info.get("title", "")
+        session_id = str(info.get("session_id") or "")
+        platform = info.get("platform", "douyin")
 
         if is_live:
             # Snapshot old room_id BEFORE updating, so we can detect new streams
             old_room_id = self.stream_room_id
+            old_session_id = self.stream_session_id
 
             if nickname:
                 self.streamer_nickname = nickname
@@ -195,14 +201,22 @@ class MonitorState:
                 self.stream_room_id = room_id
             if title:
                 self.stream_title = title
+            if session_id:
+                self.stream_session_id = session_id
+            if info.get("live_url"):
+                self.stream_live_url = info["live_url"]
 
             if self.status == self.LIVE:
                 # Still live — but reset if stream changed (new room = new stream)
-                if room_id and old_room_id and room_id != old_room_id:
+                new_session = bool(session_id and old_session_id and session_id != old_session_id)
+                new_room = bool(platform == "douyin" and room_id and old_room_id and room_id != old_room_id)
+                if new_session or new_room:
                     logger.info("检测到新直播间 (可能是新一轮直播)")
                     self.notification_sent = False
                     self.repeat_notify_count = 0
                     self.last_repeat_notify_time = 0.0
+                    self.last_live_start = self._clock()
+                    self.last_status_change = self._clock()
                     return "went_live"
 
                 # Still live, same room — check for repeat notification
@@ -216,6 +230,7 @@ class MonitorState:
             self.notification_sent = False
             self.repeat_notify_count = 0
             self.last_repeat_notify_time = 0.0
+            self.stream_session_id = session_id
             return "went_live"
 
         else:
@@ -234,6 +249,7 @@ class MonitorState:
                 f"状态变更: LIVE -> OFFLINE (直播时长: {duration})"
             )
             self.status = self.OFFLINE
+            self.stream_session_id = ""
             self.last_status_change = self._clock()
             return "went_offline"
 
@@ -260,7 +276,7 @@ class MonitorState:
         return not self.notification_sent
 
     def mark_first_notification_sent(self) -> None:
-        """Commit the first-live notification only after a successful send."""
+        """Commit the first-live attempt so the event is never replayed."""
         self.notification_sent = True
         self.last_repeat_notify_time = self._clock()
 
@@ -591,6 +607,7 @@ class DouyinLiveMonitor:
         client: Optional[DouyinClient] = None,
         notifier: Optional[ServerChanNotifier] = None,
         clock: Optional[Callable[[], float]] = None,
+        platform: str = "",
     ):
         self.config = config
         self.target_url = target_url or config.get("target_url", "")
@@ -603,12 +620,14 @@ class DouyinLiveMonitor:
         if not self.target_url:
             raise MonitorConfigurationError("未设置目标主播链接")
         try:
-            self.target_url = validate_streamer_url(str(self.target_url))
+            self.platform = platform or infer_platform(str(self.target_url))
+            self.target_url = validate_streamer_url(str(self.target_url), self.platform)
         except ValueError as exc:
             raise MonitorConfigurationError(str(exc)) from exc
 
         # Initialize components
-        self.client = client or DouyinClient(debug=debug)
+        self.client = client or create_platform_client(self.platform, debug=debug)
+        self._uses_platform_adapter = client is None or callable(getattr(type(client), "resolve", None))
         self.notifier = notifier or _create_notifier(config)
 
         self.state = MonitorState(clock=clock)
@@ -650,6 +669,19 @@ class DouyinLiveMonitor:
         """Resolve the target before scheduled checks begin."""
         with self._check_lock:
             self._raise_if_stopped()
+            if getattr(self, "_uses_platform_adapter", False):
+                prepared = self.client.resolve(self.target_url)
+                self._raise_if_stopped()
+                self.state.streamer_nickname = str(prepared.get("nickname") or "")
+                self.target_url = str(prepared.get("url") or self.target_url)
+                return WorkerPreparation(
+                    platform=self.platform,
+                    target_id=str(prepared.get("target_id") or ""),
+                    sec_uid=str(prepared.get("target_id") or "") if self.platform == "douyin" else "",
+                    nickname=self.state.streamer_nickname,
+                    url=self.target_url,
+                    status=StreamerStatus(self.state.status),
+                )
             sec_uid = self._resolve_sec_uid() or ""
             self._raise_if_stopped()
             return WorkerPreparation(
@@ -677,12 +709,10 @@ class DouyinLiveMonitor:
             nickname=nickname,
             room_id=room_id,
             title=title,
+            platform=getattr(self, "platform", "douyin"),
+            live_url=info.get("live_url", ""),
         )
-        if success:
-            self.state.mark_first_notification_sent()
-        elif self.notifier.delivery_unknown:
-            # The POST may have been accepted before the connection failed.
-            self.state.mark_first_notification_sent()
+        self.state.mark_first_notification_sent()
 
         if success:
             logger.info("[OK] 开播通知已发送!")
@@ -711,6 +741,8 @@ class DouyinLiveMonitor:
             repeat_count=count,
             max_repeat=max_count,
             duration=duration_str,
+            platform=getattr(self, "platform", "douyin"),
+            live_url=info.get("live_url", ""),
         )
 
         if success:
@@ -724,7 +756,7 @@ class DouyinLiveMonitor:
         Only sends when the streamer is currently live.
         Each minute slot is sent at most once per day.
         """
-        if not self.config.get("enable_daily_intimacy_reminder", True):
+        if getattr(self, "platform", "douyin") != "douyin" or not self.config.get("enable_daily_intimacy_reminder", True):
             return
         if self.daily_reminder_managed_externally:
             return
@@ -767,10 +799,7 @@ class DouyinLiveMonitor:
             room_id=room_id,
             title=title,
         )
-        if success:
-            self.state._daily_reminder_minutes_sent.add(minute)
-        elif self.notifier.delivery_unknown:
-            self.state._daily_reminder_minutes_sent.add(minute)
+        self.state._daily_reminder_minutes_sent.add(minute)
 
         if success:
             logger.info(f"[OK] 亲密度提醒已发送 (23:{minute})!")
@@ -789,7 +818,9 @@ class DouyinLiveMonitor:
         logger.info(f"[OFFLINE] 直播结束: {nickname}")
 
         self.notifier.send_stream_end_notification(
-            nickname=nickname, duration=duration
+            nickname=nickname, duration=duration,
+            platform=getattr(self, "platform", "douyin"),
+            live_url=self.state.stream_live_url,
         )
 
     def check_once(self) -> Dict[str, Any]:
@@ -808,11 +839,17 @@ class DouyinLiveMonitor:
     def _check_once_locked(self) -> Dict[str, Any]:
         """Run one check inside the per-worker lifecycle boundary."""
         self._raise_if_stopped()
-        result = self.client.check_live(target_url=self.target_url)
+        if getattr(self, "_uses_platform_adapter", False):
+            result = self.client.check(self.target_url)
+        else:
+            result = self.client.check_live(target_url=self.target_url)
         self._raise_if_stopped()
-        if result.get("indeterminate"):
+        if result.get("indeterminate") or not isinstance(result.get("is_live"), bool):
             reason = result.get("error") or "所有检测方法均无法确认状态"
-            raise LiveStatusUnknownError(f"直播状态暂时无法确认: {reason}")
+            error = LiveStatusUnknownError(f"直播状态暂时无法确认: {reason}")
+            error.error_kind = result.get("error_kind", "unknown")
+            error.cooldown = result.get("cooldown", 0)
+            raise error
 
         # Update state
         is_live = result.get("is_live", False)
@@ -842,6 +879,7 @@ class DouyinLiveMonitor:
                 "url": self.target_url,
                 "label": self.state.streamer_nickname,
                 "enabled": True,
+                "platform": getattr(self, "platform", "douyin"),
             }],
             worker_factory=lambda _entry: self,
             check_interval=self.check_interval,
@@ -898,7 +936,7 @@ def _print_streamers(entries: list[Dict[str, Any]]) -> None:
     for entry in entries:
         status = "启用" if entry.get("enabled", True) else "停用"
         label = entry.get("label") or "未命名"
-        print(f"  [{status}] {entry['id']}  {label}  {entry['url']}")
+        print(f"  [{status}] [{platform_name(entry.get('platform', 'douyin'))}] {entry['id']}  {label}  {entry['url']}")
 
 
 def _confirm_remove(entry: Dict[str, Any], assume_yes: bool) -> bool:
@@ -986,6 +1024,7 @@ def _print_once_results(
         entry = by_id.get(streamer_id, {})
         _safe_print("\n" + "=" * 48)
         _safe_print(f"主播 ID: {streamer_id}")
+        _safe_print(f"  平台: {platform_name(entry.get('platform', 'douyin'))}")
         _safe_print(
             f"  博主: {result.get('nickname') or entry.get('label') or '未知'}"
         )
@@ -995,6 +1034,7 @@ def _print_once_results(
         _safe_print(f"  房间 ID: {result.get('room_id', 'N/A')}")
         _safe_print(f"  标题: {result.get('title', 'N/A')}")
         _safe_print(f"  检测方法: {result.get('method', 'N/A')}")
+        _safe_print(f"  观看链接: {result.get('live_url', '')}")
         _safe_print(f"  尝试方法: {result.get('methods_tried', 'N/A')}")
     if results:
         _safe_print("=" * 48)
@@ -1010,7 +1050,7 @@ def main():
     from douyin_monitor.windows_integration import WindowsInstanceGuard
 
     parser = argparse.ArgumentParser(
-        description="抖音直播监听器 - 检测开播并通过Server酱³推送通知",
+        description="抖音直播监听器 - 多平台开播监控与Server酱³推送通知",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

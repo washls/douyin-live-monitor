@@ -1,12 +1,15 @@
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 
 from douyin_monitor.monitor_service import LiveStatusUnknownError, MonitorService
+from douyin_monitor.monitor_types import WorkerPreparation
+from douyin_monitor.notifier import ServerChanNotifier
 from douyin_monitor.streamer_logging import StreamerLogHandler
 
 
@@ -623,3 +626,246 @@ def test_run_reports_failure_when_no_worker_can_prepare():
 
     assert service.run() is False
     assert created[0].closed is True
+
+
+def platform_streamer(streamer_id, platform):
+    return dict(streamer(streamer_id), platform=platform,
+                url=f"https://live.example/{streamer_id}")
+
+
+class PlatformWorker(FakeWorker):
+    def prepare(self):
+        return WorkerPreparation(platform=self.entry["platform"], target_id=self.sec_uid,
+                                 url=self.entry["url"])
+
+
+def test_platform_identity_keeps_cross_platform_ids_and_drops_aliases():
+    entries = [platform_streamer("one", "bilibili"), platform_streamer("two", "huya"),
+               platform_streamer("alias", "bilibili")]
+    workers = {}
+    service = MonitorService(entries, lambda entry: workers.setdefault(
+        entry["id"], PlatformWorker(entry, sec_uid="123")))
+
+    assert service.prepare_all() == ["one", "two"]
+    assert service._resolved_users == {"one": ("bilibili", "123"), "two": ("huya", "123")}
+    assert workers["alias"].closed
+    assert service.snapshot()[0]["platform"] == "bilibili"
+    service.close()
+
+
+class RecordingExecutor:
+    """Keep admitted tasks unfinished to expose scheduler queue growth."""
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, *args):
+        future = Future()
+        self.submitted.append((future, args))
+        return future
+
+
+def test_hundred_tasks_are_fair_and_never_queue_more_than_capacity(monkeypatch):
+    now = 200.0
+    monkeypatch.setattr("douyin_monitor.monitor_service.time.monotonic", lambda: now)
+    platforms = ["douyin", "bilibili", "huya", "douyu", "kuaishou"]
+    entries = [platform_streamer(str(index), platforms[index % 5]) for index in range(100)]
+    service = MonitorService(entries, PlatformWorker, max_concurrent_checks=2,
+                             enable_daily_intimacy_reminder=False)
+    service.running = True
+    service._workers = {entry["id"]: PlatformWorker(entry) for entry in entries}
+    service._next_due = {entry["id"]: 100 - int(entry["id"]) for entry in entries}
+    service._executor = RecordingExecutor()
+    checked = []
+    for _ in range(50):
+        service._submit_due_checks()
+        assert len(service._futures) == 2
+        assert len({service._platform(item) for item in service._futures.values()}) == 2
+        submitted = len(service._executor.submitted)
+        service._submit_due_checks()
+        assert len(service._executor.submitted) == submitted
+        assert service._seconds_until_next_due() == 1.0
+        for future, streamer_id in service._futures.items():
+            checked.append(streamer_id)
+            future.set_result(service._workers[streamer_id].result)
+        service._collect_finished()
+    assert checked == [str(index) for index in reversed(range(100))]
+    assert all(runtime["check_count"] == 1 for runtime in service._runtime.values())
+    assert not service._futures
+    service.close()
+
+
+def test_preparation_and_checks_share_platform_slot(monkeypatch):
+    monkeypatch.setattr("douyin_monitor.monitor_service.time.monotonic", lambda: 100.0)
+    entries = [platform_streamer("prepared", "huya"), platform_streamer("pending", "huya"),
+               platform_streamer("other", "douyu")]
+    service = MonitorService(entries, PlatformWorker, max_concurrent_checks=8)
+    service.running = True
+    service._executor = RecordingExecutor()
+    service._workers["prepared"] = PlatformWorker(entries[0])
+    service._submit_due_checks()
+    assert set(service._futures.values()) == {"prepared", "other"}
+    assert len(service._preparation_futures) == 1
+    assert service._seconds_until_next_due() == 1.0
+    service.stop()
+
+
+@pytest.mark.parametrize("platform,expected", [("douyin", 1), ("bilibili", 30), ("huya", 30),
+                                                ("douyu", 30), ("kuaishou", 60)])
+def test_platform_minimum_interval(platform, expected):
+    service = MonitorService([platform_streamer("one", platform)], PlatformWorker, check_interval=1)
+    assert service._check_delay("one") == expected
+    service.check_interval = 600
+    assert service._check_delay("one") == 600
+
+
+def test_unknown_result_cools_only_its_platform_and_preserves_live_metadata(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("douyin_monitor.monitor_service.time.monotonic", lambda: now[0])
+    entries = [platform_streamer("limited", "huya"), platform_streamer("same", "huya"),
+               platform_streamer("other", "douyu")]
+    service = MonitorService(entries, PlatformWorker, max_concurrent_checks=2)
+    service._record_success("limited", {"is_live": True, "room_id": "123", "title": "直播",
+                                         "session_id": "session", "live_url": entries[0]["url"]})
+    delay = service._record_success("limited", {"indeterminate": True, "is_live": False,
+                                                "error_kind": "rate_limited", "cooldown": 120,
+                                                "error": "https://private.invalid/token"})
+    snapshot = service.snapshot()[0]
+    assert delay == 120
+    assert snapshot["room_id"] == "123" and snapshot["session_id"] == "session"
+    assert snapshot["status"] == "error" and snapshot["check_count"] == 1
+    assert snapshot["error_kind"] == "rate_limited"
+    assert "private" not in snapshot["last_error"]
+    service.running = True
+    service._executor = RecordingExecutor()
+    service._next_due = {entry["id"]: 100.0 for entry in entries}
+    service._submit_due_checks()
+    assert list(service._futures.values()) == ["other"]
+    assert service._seconds_until_next_due() == 30.0
+    now[0] = 220.0
+    service._submit_due_checks()
+    assert set(service._futures.values()) == {"other", "limited"}
+    service.stop()
+
+
+def test_once_omits_indeterminate_result_for_partial_failure():
+    entries = [streamer("unknown"), streamer("good")]
+    def factory(entry):
+        return FakeWorker(entry, result={"indeterminate": True, "is_live": False}) if entry["id"] == "unknown" else FakeWorker(entry)
+    service = MonitorService(entries, factory)
+    assert set(service.check_all_once()) == {"good"}
+    assert service.snapshot()[0]["status"] == "error"
+    service.close()
+
+
+def test_daily_reminder_only_includes_douyin_with_watch_link(monkeypatch):
+    entries = [platform_streamer("douyin", "douyin"), platform_streamer("bili", "bilibili")]
+    notifier = FakeNotifier()
+    service = MonitorService(entries, PlatformWorker, service_notifier=notifier)
+    service.prepare_all()
+    for entry in entries:
+        service._record_success(entry["id"], {"is_live": True, "live_url": entry["url"]})
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime(2026, 10, 2, 23, 57, 10)
+    monkeypatch.setattr("douyin_monitor.monitor_service.datetime", FixedDateTime)
+    service._check_daily_intimacy_reminder()
+    assert len(notifier.daily_messages) == 1
+    payload = notifier.daily_messages[0][0]
+    assert len(payload) == 1 and payload[0]["platform"] == "douyin"
+    assert payload[0]["live_url"] == entries[0]["url"]
+    service.close()
+
+
+def test_once_rate_limit_skips_remaining_platform_requests_without_blocking_others():
+    entries = [platform_streamer("limited", "huya"), platform_streamer("same", "huya"),
+               platform_streamer("other", "douyu")]
+    workers = {}
+    def factory(entry):
+        worker = workers[entry["id"]] = PlatformWorker(entry)
+        worker.calls = 0
+        def check():
+            worker.calls += 1
+            if entry["id"] == "limited":
+                return {"is_live": None, "indeterminate": True,
+                        "error_kind": "rate_limited", "cooldown": 60}
+            return worker.result
+        worker.check_once = check
+        return worker
+    service = MonitorService(entries, factory)
+    assert set(service.check_all_once()) == {"other"}
+    assert workers["limited"].calls == 1 and workers["same"].calls == 0
+    assert workers["other"].calls == 1
+    assert service.snapshot()[1]["error_kind"] == "rate_limited"
+    service.close()
+
+
+def test_queued_daily_and_startup_notifications_honor_stop(monkeypatch):
+    entry = streamer("one")
+    notifier = FakeNotifier()
+    service = MonitorService([entry], FakeWorker, startup_notify=True, service_notifier=notifier)
+    service.prepare_all()
+    service.stop_streamer("one")
+    assert service._send_daily_intimacy_reminder(notifier, [{"id": "one"}], 57) == (False, False)
+    service._send_startup_notification()
+    assert not notifier.messages and not notifier.daily_messages
+    service.close()
+
+
+def test_once_skipped_request_keeps_original_cooldown_deadline(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("douyin_monitor.monitor_service.time.monotonic", lambda: now[0])
+    entry = platform_streamer("one", "huya")
+    service = MonitorService([entry], PlatformWorker)
+    service.prepare_all()
+    service._platform_cooldown["huya"] = 160.0
+    now[0] = 150.0
+    assert service.check_all_once() == {}
+    assert service._platform_cooldown["huya"] == 160.0
+    service.close()
+
+
+def test_authoritative_success_still_respects_metadata_rate_limit(monkeypatch):
+    monkeypatch.setattr("douyin_monitor.monitor_service.time.monotonic", lambda: 100.0)
+    entries = [platform_streamer("one", "bilibili"), platform_streamer("same", "bilibili"),
+               platform_streamer("other", "huya")]
+    service = MonitorService(entries, PlatformWorker)
+    service._record_success("one", {"is_live": True, "room_id": "123", "session_id": "session-a",
+                                    "error_kind": "rate_limited", "cooldown": 120})
+    snapshot = service.snapshot()[0]
+    assert snapshot["status"] == "live" and snapshot["session_id"] == "session-a"
+    assert not snapshot["last_error"] and not service._faults
+    assert service._platform_cooldown == {"bilibili": 220.0}
+    service.running = True
+    service._executor = RecordingExecutor()
+    service._submit_due_checks()
+    assert list(service._futures.values()) == ["other"]
+    service.stop()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_daily_rejected_notification_is_submitted_once_per_minute(monkeypatch, asynchronous):
+    response = Mock()
+    response.json.return_value = {"code": 1}
+    post = Mock(return_value=response)
+    monkeypatch.setattr("douyin_monitor.notifier.requests.post", post)
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return __import__("datetime").datetime(2026, 10, 2, 23, 57, 10)
+    monkeypatch.setattr("douyin_monitor.monitor_service.datetime", FixedDateTime)
+    notifier = ServerChanNotifier(sendkey="example-key", uid="example-uid")
+    service = MonitorService([streamer("one")], FakeWorker, service_notifier=notifier)
+    service.prepare_all()
+    service._runtime["one"].update(status="live", room_id="123")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        service.running = asynchronous
+        service._notification_executor = executor if asynchronous else None
+        service._check_daily_intimacy_reminder()
+        if service._daily_reminder_future is not None:
+            service._daily_reminder_future.result(timeout=2)
+            service._collect_daily_reminder_result()
+        service._check_daily_intimacy_reminder()
+    assert post.call_count == 1
+    assert service._daily_reminder_minutes_sent == {57}
+    service.close()

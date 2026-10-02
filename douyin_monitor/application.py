@@ -76,6 +76,7 @@ def create_monitor_worker(
         client=client,
         notifier=notifier,
         clock=clock,
+        platform=str(entry.get("platform") or ""),
     )
 
 
