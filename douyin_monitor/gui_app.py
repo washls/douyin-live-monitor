@@ -14,7 +14,7 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Callable, Dict, Mapping, Optional, Union
 
 import monitor
 from .app_icon import get_app_icon_path
@@ -25,6 +25,7 @@ from .application import (
 )
 from .monitor_service import MonitorService
 from .notifier import ServerChanNotifier
+from .platform_clients import infer_platform, platform_name, validate_platform_url
 from .project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
 from .streamer_config import (
     add_streamer,
@@ -71,6 +72,7 @@ STATUS_TEXT = {
     "live": "直播中",
     "offline": "未开播",
     "error": "异常",
+    "restricted": "访问受限",
     "suspended": "已暂停",
     "stopped": "已停止",
 }
@@ -85,6 +87,15 @@ BASE_DPI = 96
 BASE_WINDOW_SIZE = (1080, 700)
 BASE_MIN_WINDOW_SIZE = (900, 600)
 TRAY_READY_TIMEOUT_MS = 5000
+
+PLATFORM_LINK_EXAMPLES = (
+    "抖音：www.douyin.com/user/主播ID 或 v.douyin.com/分享码\n"
+    "B站：live.bilibili.com/房间号\n"
+    "虎牙：www.huya.com/房间号或别名\n"
+    "斗鱼：www.douyu.com/房间号或别名\n"
+    "快手：live.kuaishou.com/u/主播ID（实验支持）\n"
+    "视频号：当前不支持免登录监控"
+)
 
 
 class _MonitorInfo(ctypes.Structure):
@@ -210,6 +221,12 @@ def get_work_area(root: tk.Misc) -> tuple[int, int, int, int]:
 def status_text(status: str) -> str:
     """Return concise Chinese status copy for the UI."""
     return STATUS_TEXT.get(str(status or "unknown"), "未知")
+
+
+def gui_platform_name(platform: str) -> str:
+    """Include the experimental support level wherever a platform is shown."""
+    name = platform_name(platform)
+    return f"{name}（实验）" if platform == "kuaishou" else name
 
 
 def compact_ui_text(value: Any, limit: int) -> str:
@@ -461,6 +478,7 @@ class MonitorGui:
         self.streamer_id_var = tk.StringVar()
         self.streamer_label_var = tk.StringVar()
         self.streamer_url_var = tk.StringVar()
+        self.streamer_platform_var = tk.StringVar(value="输入链接后自动识别")
         self.streamer_enabled_var = tk.BooleanVar(value=True)
         self.push_url_var = tk.StringVar()
         self.reveal_push_url_var = tk.BooleanVar(value=False)
@@ -490,7 +508,7 @@ class MonitorGui:
         )
         ttk.Label(
             header,
-            text=f"v{monitor.APP_VERSION}  ·  多主播监控",
+            text=f"v{monitor.APP_VERSION}  ·  多平台主播监控",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(self._px(3), 0))
 
@@ -614,12 +632,13 @@ class MonitorGui:
 
         self.streamer_tree = ttk.Treeview(
             parent,
-            columns=("status", "name"),
+            columns=("status", "platform", "name"),
             show="headings",
             selectmode="browse",
             height=12,
         )
         self.streamer_tree.heading("status", text="状态", anchor=tk.CENTER)
+        self.streamer_tree.heading("platform", text="平台", anchor=tk.CENTER)
         self.streamer_tree.heading("name", text="主播", anchor=tk.CENTER)
         self.streamer_tree.column(
             "status",
@@ -629,23 +648,38 @@ class MonitorGui:
             anchor=tk.CENTER,
         )
         self.streamer_tree.column(
+            "platform",
+            width=self._px(94),
+            minwidth=self._px(80),
+            stretch=False,
+            anchor=tk.CENTER,
+        )
+        self.streamer_tree.column(
             "name",
-            width=self._px(220),
-            minwidth=self._px(120),
+            width=self._px(128),
+            minwidth=self._px(86),
             stretch=True,
             anchor=tk.CENTER,
         )
         self.streamer_tree.grid(row=1, column=0, sticky="nsew")
         self.streamer_tree.bind("<<TreeviewSelect>>", self._on_streamer_selected)
+        self.streamer_tree.bind("<Configure>", self._fit_streamer_columns)
         sidebar_scroll = ttk.Scrollbar(
             parent, orient=tk.VERTICAL, command=self.streamer_tree.yview
         )
         sidebar_scroll.grid(row=1, column=1, sticky="ns")
-        self.streamer_tree.configure(yscrollcommand=sidebar_scroll.set)
+        sidebar_horizontal_scroll = ttk.Scrollbar(
+            parent, orient=tk.HORIZONTAL, command=self.streamer_tree.xview
+        )
+        sidebar_horizontal_scroll.grid(row=2, column=0, sticky="ew")
+        self.streamer_tree.configure(
+            yscrollcommand=sidebar_scroll.set,
+            xscrollcommand=sidebar_horizontal_scroll.set,
+        )
 
         actions = ttk.Frame(parent, style="Sidebar.TFrame")
         actions.grid(
-            row=2,
+            row=3,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -668,6 +702,22 @@ class MonitorGui:
             row=0, column=1, sticky="ew", padx=(self._px(5), 0)
         )
 
+    def _fit_streamer_columns(self, event: Any) -> None:
+        """Keep all three identities visible as the sidebar narrows."""
+        available = max(3, int(event.width) - 4)
+        preferred = tuple(self._px(width) for width in (76, 94, 128))
+        if available >= sum(preferred):
+            status_width, platform_width = preferred[:2]
+        else:
+            status_width = max(1, int(available * preferred[0] / sum(preferred)))
+            platform_width = max(1, int(available * preferred[1] / sum(preferred)))
+        name_width = max(1, available - status_width - platform_width)
+        for column, width in zip(
+            ("status", "platform", "name"),
+            (status_width, platform_width, name_width),
+        ):
+            self.streamer_tree.column(column, width=width, minwidth=1)
+
     def _build_content(self, parent: ttk.Frame) -> None:
         parent.grid_rowconfigure(0, weight=1)
         parent.grid_columnconfigure(0, weight=1)
@@ -684,7 +734,9 @@ class MonitorGui:
         self.notebook.add(detail_tab, text="主播详情")
         self.notebook.add(settings_tab, text="监控设置")
         self._build_status_tab(status_tab)
-        self._build_detail_tab(detail_tab)
+        self.detail_canvas = self._build_scrollable_form(
+            detail_tab, self._build_detail_tab, padding=0
+        )
         self._build_scrollable_settings_tab(settings_tab)
 
     def _build_status_tab(self, parent: ttk.Frame) -> None:
@@ -695,7 +747,7 @@ class MonitorGui:
         )
         ttk.Label(
             parent,
-            text="每个主播独立检测，单个任务异常不会中断其他任务。",
+            text="各平台独立检测与恢复，访问受限时等待重试。",
             style="Muted.TLabel",
         ).grid(
             row=1,
@@ -705,11 +757,12 @@ class MonitorGui:
         )
         self.status_tree = ttk.Treeview(
             parent,
-            columns=("status", "name", "last_check", "detail"),
+            columns=("status", "platform", "name", "last_check", "detail"),
             show="headings",
         )
         for column, label in (
             ("status", "状态"),
+            ("platform", "平台"),
             ("name", "主播"),
             ("last_check", "最后检测"),
             ("detail", "详情"),
@@ -717,6 +770,9 @@ class MonitorGui:
             self.status_tree.heading(column, text=label, anchor=tk.CENTER)
         self.status_tree.column(
             "status", width=self._px(82), stretch=False, anchor=tk.CENTER
+        )
+        self.status_tree.column(
+            "platform", width=self._px(96), stretch=False, anchor=tk.CENTER
         )
         self.status_tree.column(
             "name", width=self._px(150), minwidth=self._px(110), anchor=tk.CENTER
@@ -743,6 +799,7 @@ class MonitorGui:
         )
         self.status_tree.tag_configure("live", foreground=COLORS["success"])
         self.status_tree.tag_configure("error", foreground=COLORS["danger"])
+        self.status_tree.tag_configure("restricted", foreground=COLORS["warning"])
         self.status_tree.tag_configure("suspended", foreground=COLORS["warning"])
 
         status_actions = ttk.Frame(parent, style="Surface.TFrame")
@@ -812,7 +869,7 @@ class MonitorGui:
             padx=(self._px(14), 0),
             pady=self._px(7),
         )
-        ttk.Label(form, text="抖音链接").grid(
+        ttk.Label(form, text="主播链接").grid(
             row=2, column=0, sticky="w", pady=self._px(7)
         )
         self.url_entry = ttk.Entry(form, textvariable=self.streamer_url_var)
@@ -823,19 +880,52 @@ class MonitorGui:
             padx=(self._px(14), 0),
             pady=self._px(7),
         )
+        ttk.Label(form, text="平台").grid(
+            row=3, column=0, sticky="w", pady=self._px(7)
+        )
+        self.streamer_platform_label = ttk.Label(
+            form,
+            textvariable=self.streamer_platform_var,
+            style="Muted.TLabel",
+        )
+        self.streamer_platform_label.grid(
+            row=3,
+            column=1,
+            sticky="ew",
+            padx=(self._px(14), 0),
+            pady=self._px(7),
+        )
+        self.streamer_url_var.trace_add("write", self._update_streamer_platform)
         self.enabled_check = ttk.Checkbutton(
             form, text="启用此主播", variable=self.streamer_enabled_var
         )
         self.enabled_check.grid(
-            row=3,
+            row=4,
             column=1,
             sticky="w",
             padx=(self._px(14), 0),
             pady=(self._px(8), self._px(4)),
         )
+        self.platform_support_label = ttk.Label(
+            parent,
+            text=PLATFORM_LINK_EXAMPLES,
+            style="Muted.TLabel",
+            justify=tk.LEFT,
+            wraplength=self._px(560),
+        )
+        self.platform_support_label.grid(
+            row=3, column=0, sticky="ew", pady=(self._px(12), 0)
+        )
+        parent.bind(
+            "<Configure>",
+            lambda event: self.platform_support_label.configure(
+                wraplength=max(1, event.width)
+            ),
+            add="+",
+        )
         action_row = ttk.Frame(parent, style="Surface.TFrame")
         action_row.grid(
-            row=3, column=0, sticky="e", pady=(self._px(16), 0)
+            row=4, column=0, sticky="e", pady=(self._px(12), 0)
         )
         self.save_streamer_button = ttk.Button(
             action_row,
@@ -847,55 +937,87 @@ class MonitorGui:
 
     def _build_scrollable_settings_tab(self, parent: ttk.Frame) -> None:
         """Keep all settings reachable on short or heavily scaled displays."""
+        self.settings_canvas = self._build_scrollable_form(
+            parent, self._build_settings_tab, padding=self._px(16)
+        )
+
+    def _build_scrollable_form(
+        self,
+        parent: ttk.Frame,
+        build_content: Callable[[ttk.Frame], None],
+        padding: int,
+    ) -> tk.Canvas:
+        """Share the existing form scroll behavior across details and settings."""
         parent.grid_rowconfigure(0, weight=1)
         parent.grid_columnconfigure(0, weight=1)
-        self.settings_canvas = tk.Canvas(
+        canvas = tk.Canvas(
             parent,
             background=COLORS["surface"],
             highlightthickness=0,
             borderwidth=0,
         )
-        settings_scroll = ttk.Scrollbar(
-            parent, orient=tk.VERTICAL, command=self.settings_canvas.yview
+        scrollbar = ttk.Scrollbar(
+            parent, orient=tk.VERTICAL, command=canvas.yview
         )
-        self.settings_canvas.configure(yscrollcommand=settings_scroll.set)
-        self.settings_canvas.grid(row=0, column=0, sticky="nsew")
-        settings_scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
 
         inner = ttk.Frame(
-            self.settings_canvas,
+            canvas,
             style="Surface.TFrame",
-            padding=self._px(16),
+            padding=padding,
         )
-        inner_window = self.settings_canvas.create_window(
+        inner_window = canvas.create_window(
             (0, 0), window=inner, anchor="nw"
         )
         inner.bind(
             "<Configure>",
-            lambda _event: self.settings_canvas.configure(
-                scrollregion=self.settings_canvas.bbox("all")
+            lambda _event: canvas.configure(
+                scrollregion=canvas.bbox("all")
             ),
         )
-        self.settings_canvas.bind(
+        canvas.bind(
             "<Configure>",
-            lambda event: self.settings_canvas.itemconfigure(
+            lambda event: canvas.itemconfigure(
                 inner_window, width=event.width
             ),
         )
-        self._build_settings_tab(inner)
+        build_content(inner)
 
-        def bind_mousewheel(widget: tk.Misc) -> None:
-            widget.bind("<MouseWheel>", self._scroll_settings, add="+")
+        def reveal_focused_control(event: tk.Event) -> None:
+            bounds = canvas.bbox("all")
+            if not bounds or bounds[3] <= canvas.winfo_height():
+                return
+            y = event.widget.winfo_rooty() - inner.winfo_rooty()
+            bottom = y + event.widget.winfo_height()
+            visible_top = canvas.canvasy(0)
+            if y < visible_top:
+                canvas.yview_moveto(y / bounds[3])
+            elif bottom > visible_top + canvas.winfo_height():
+                canvas.yview_moveto((bottom - canvas.winfo_height()) / bounds[3])
+
+        def bind_scroll_controls(widget: tk.Misc) -> None:
+            widget.bind(
+                "<MouseWheel>",
+                lambda event: self._scroll_form(event, canvas),
+                add="+",
+            )
+            widget.bind("<FocusIn>", reveal_focused_control, add="+")
             for child in widget.winfo_children():
-                bind_mousewheel(child)
+                bind_scroll_controls(child)
 
-        bind_mousewheel(inner)
+        bind_scroll_controls(inner)
+        return canvas
 
     def _scroll_settings(self, event: tk.Event) -> Optional[str]:
-        bounds = self.settings_canvas.bbox("all")
-        if bounds and bounds[3] > self.settings_canvas.winfo_height():
+        return self._scroll_form(event, self.settings_canvas)
+
+    def _scroll_form(self, event: tk.Event, canvas: tk.Canvas) -> Optional[str]:
+        bounds = canvas.bbox("all")
+        if bounds and bounds[3] > canvas.winfo_height():
             direction = -1 if event.delta > 0 else 1
-            self.settings_canvas.yview_scroll(direction, "units")
+            canvas.yview_scroll(direction, "units")
             return "break"
         return None
 
@@ -989,6 +1111,19 @@ class MonitorGui:
             )
             self.setting_inputs.append(entry)
 
+        ttk.Label(
+            timing,
+            text="B站、虎牙和斗鱼至少 30 秒，快手至少 60 秒；同平台依次检测。",
+            style="Muted.TLabel",
+            wraplength=self._px(520),
+        ).grid(
+            row=4 if self.compact_layout else 2,
+            column=0,
+            columnspan=2 if self.compact_layout else 4,
+            sticky="w",
+            pady=(self._px(6), 0),
+        )
+
         options = ttk.Frame(parent, style="Surface.TFrame")
         options.grid(row=4, column=0, sticky="ew", pady=(self._px(16), 0))
         self.notify_end_check = ttk.Checkbutton(
@@ -1004,7 +1139,7 @@ class MonitorGui:
             row=1, column=0, sticky="w", pady=self._px(4)
         )
         self.daily_check = ttk.Checkbutton(
-            options, text="启用每日亲密度提醒", variable=self.daily_reminder_var
+            options, text="启用抖音每日亲密度提醒", variable=self.daily_reminder_var
         )
         self.daily_check.grid(
             row=2, column=0, sticky="w", pady=self._px(4)
@@ -1172,9 +1307,9 @@ class MonitorGui:
                 tree.delete(item)
         for entry in self.entries:
             streamer_id = entry["id"]
-            state, name, last_check, detail = self._streamer_row_values(entry)
+            state, name, platform, last_check, detail = self._streamer_row_values(entry)
             self.streamer_tree.insert(
-                "", tk.END, iid=streamer_id, values=(status_text(state), name)
+                "", tk.END, iid=streamer_id, values=(status_text(state), platform, name)
             )
             self.status_tree.insert(
                 "",
@@ -1182,6 +1317,7 @@ class MonitorGui:
                 iid=streamer_id,
                 values=(
                     status_text(state),
+                    platform,
                     name,
                     last_check,
                     detail,
@@ -1203,6 +1339,10 @@ class MonitorGui:
         streamer_id = str(entry["id"])
         runtime = self.runtime_by_id.get(streamer_id, {})
         state = runtime.get("status", "pending")
+        if runtime.get("error_kind") == "restricted" and state in {
+            "error", "retrying", "unknown",
+        }:
+            state = "restricted"
         if runtime.get("suspended") and not runtime.get("stopped_by_user"):
             state = "suspended"
         if not entry.get("enabled", True):
@@ -1221,7 +1361,10 @@ class MonitorGui:
             detail += f" | 下次重试 {runtime['next_retry']}"
         if runtime.get("notification_status"):
             detail += f" | {runtime['notification_status']}"
-        return state, name, runtime.get("last_check", ""), detail
+        platform = gui_platform_name(
+            str(runtime.get("platform") or entry.get("platform") or "douyin")
+        )
+        return state, name, platform, runtime.get("last_check", ""), detail
 
     def _refresh_runtime_row(self, streamer_id: str) -> None:
         entry = next(
@@ -1229,15 +1372,15 @@ class MonitorGui:
         )
         if entry is None:
             return
-        state, name, last_check, detail = self._streamer_row_values(entry)
+        state, name, platform, last_check, detail = self._streamer_row_values(entry)
         if self.streamer_tree.exists(streamer_id):
             self.streamer_tree.item(
-                streamer_id, values=(status_text(state), name)
+                streamer_id, values=(status_text(state), platform, name)
             )
         if self.status_tree.exists(streamer_id):
             self.status_tree.item(
                 streamer_id,
-                values=(status_text(state), name, last_check, detail),
+                values=(status_text(state), platform, name, last_check, detail),
                 tags=(state,),
             )
 
@@ -1338,7 +1481,8 @@ class MonitorGui:
         )
 
         window = tk.Toplevel(self.root)
-        window.title(f"{name} · 实时运行日志")
+        platform = gui_platform_name(str(entry.get("platform") or "douyin"))
+        window.title(f"{platform} · {name} · 实时运行日志")
         window.configure(background=COLORS["surface"])
         width = min(self._px(780), max(self._px(520), self.root.winfo_width()))
         height = min(self._px(520), max(self._px(360), self.root.winfo_height()))
@@ -1358,7 +1502,7 @@ class MonitorGui:
         ).pack(anchor="w")
         ttk.Label(
             content,
-            text="当前监控会话日志，停止后仍可查看。",
+            text=f"{platform} · 当前监控会话日志，停止后仍可查看。",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(self._px(3), self._px(10)))
 
@@ -1479,20 +1623,37 @@ class MonitorGui:
             self.status_tree.focus(streamer_id)
         self._update_stop_selected_button()
 
+    def _update_streamer_platform(self, *_args: Any) -> None:
+        """Recognize public links locally as the user edits the form."""
+        url = self.streamer_url_var.get().strip()
+        color = COLORS["muted"]
+        label = "输入链接后自动识别"
+        if url:
+            try:
+                platform = infer_platform(url)
+                validate_platform_url(url, platform)
+                label = gui_platform_name(platform)
+            except ValueError as exc:
+                label = compact_ui_text(str(exc), 80)
+                color = COLORS["warning"]
+        self.streamer_platform_var.set(label)
+        self.streamer_platform_label.configure(foreground=color)
+
     def _save_streamer(self) -> None:
         try:
+            url = validate_platform_url(self.streamer_url_var.get())
             if self.selected_streamer_id:
                 entry = update_streamer(
                     self.config,
                     self.selected_streamer_id,
-                    self.streamer_url_var.get(),
+                    url,
                     label=self.streamer_label_var.get(),
                     enabled=self.streamer_enabled_var.get(),
                 )
             else:
                 entry = add_streamer(
                     self.config,
-                    self.streamer_url_var.get(),
+                    url,
                     label=self.streamer_label_var.get(),
                 )
                 entry["enabled"] = self.streamer_enabled_var.get()

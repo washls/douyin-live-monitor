@@ -10,6 +10,7 @@ from douyin_monitor import gui_app
 from douyin_monitor.gui_app import (
     MonitorGui,
     compact_ui_text,
+    gui_platform_name,
     open_project_repository,
     status_text,
     validate_gui_settings,
@@ -169,11 +170,104 @@ def test_gui_settings_reject_invalid_push_url():
 
 def test_status_text_has_a_safe_fallback():
     assert status_text("live") == "直播中"
+    assert status_text("restricted") == "访问受限"
     assert status_text("unexpected") == "未知"
+
+
+@pytest.mark.parametrize(
+    ("platform", "name"),
+    [
+        ("douyin", "抖音"),
+        ("bilibili", "哔哩哔哩"),
+        ("huya", "虎牙"),
+        ("douyu", "斗鱼"),
+        ("kuaishou", "快手（实验）"),
+    ],
+)
+def test_gui_platform_names_include_the_support_level(platform, name):
+    assert gui_platform_name(platform) == name
+
+
+@pytest.mark.parametrize("status", ["error", "retrying", "unknown"])
+def test_restricted_streamer_status_preserves_retry_and_platform(status):
+    app = object.__new__(MonitorGui)
+    entry = {"id": "restricted", "platform": "bilibili", "enabled": True}
+    app.runtime_by_id = {
+        "restricted": {
+            "status": status,
+            "error_kind": "restricted",
+            "last_error": "平台访问受限",
+            "next_retry": "10-02 12:30",
+        }
+    }
+
+    state, _name, platform, _last_check, detail = app._streamer_row_values(entry)
+
+    assert status_text(state) == "访问受限"
+    assert platform == "哔哩哔哩"
+    assert "平台访问受限" in detail
+    assert "下次重试 10-02 12:30" in detail
+
+
+def test_legacy_streamer_rows_use_douyin_and_disabled_status_takes_precedence():
+    app = object.__new__(MonitorGui)
+    app.runtime_by_id = {
+        "legacy": {"status": "error", "error_kind": "restricted"}
+    }
+
+    state, _name, platform, _last_check, _detail = app._streamer_row_values(
+        {"id": "legacy", "enabled": False}
+    )
+
+    assert state == "stopped"
+    assert platform == "抖音"
 
 
 def test_remote_text_is_single_line_and_bounded():
     assert compact_ui_text("主播\n名称  测试", 6) == "主播 名称"
+
+
+def assert_scaled_layout_controls_remain_accessible(root, path, streamer_id, monkeypatch):
+    monkeypatch.setattr(gui_app, "IS_WINDOWS", False)
+    monkeypatch.setattr(gui_app, "is_autostart_enabled", lambda _path: False)
+    monkeypatch.setattr(gui_app.monitor, "load_monitor_state", lambda: {})
+    for work_size, scale in (
+        ((1920, 1040), 1.0), ((1366, 728), 1.25), ((1366, 728), 2.0)
+    ):
+        for after_id in root.tk.call("after", "info"):
+            root.after_cancel(after_id)
+        for child in root.winfo_children():
+            child.destroy()
+        root.tk.call("tk", "scaling", 96 / 72 * scale)
+        monkeypatch.setattr(gui_app, "get_display_scale", lambda _root: scale)
+        monkeypatch.setattr(gui_app, "get_work_area", lambda _root: (0, 0, *work_size))
+        app = MonitorGui(root, path)
+        app.show_window()
+        root.deiconify()
+        root.update()
+        tree = app.streamer_tree
+        width = tree.winfo_width()
+        name_x, _y, name_width, _height = tree.bbox(streamer_id, "name")
+        visible_name_width = min(name_width, width - name_x)
+
+        assert visible_name_width >= width * 0.30
+        assert tree.bbox(streamer_id, "status")[0] < width
+        assert tree.bbox(streamer_id, "platform")[0] < width
+        assert tree.cget("xscrollcommand")
+
+        app.notebook.select(1)
+        root.update()
+        app.save_streamer_button.event_generate("<FocusIn>")
+        root.update()
+        viewport_top = app.detail_canvas.winfo_rooty()
+        viewport_bottom = viewport_top + app.detail_canvas.winfo_height()
+        save_top = app.save_streamer_button.winfo_rooty()
+        save_bottom = save_top + app.save_streamer_button.winfo_height()
+
+        assert save_top >= viewport_top
+        assert save_bottom <= viewport_bottom
+        assert app.detail_canvas.cget("yscrollcommand")
+        app.shutdown_after_mainloop()
 
 
 def test_project_repository_link_opens_the_fixed_address(monkeypatch):
@@ -198,6 +292,16 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         config,
         "https://www.douyin.com/user/gui-test",
         label="界面测试主播",
+    )
+    bilibili = add_streamer(
+        config,
+        "https://live.bilibili.com/100001",
+        label="B站测试主播",
+    )
+    kuaishou = add_streamer(
+        config,
+        "https://live.kuaishou.com/u/gui-test",
+        label="快手测试主播",
     )
     config_path = tmp_path / "config.json"
     save_config_atomic(config_path, config)
@@ -286,8 +390,12 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert 0.75 <= app.display_scale <= 4.0
         assert app.selected_streamer_id == first["id"]
         assert app.streamer_label_var.get() == "界面测试主播"
-        assert app.status_tree.item(first["id"], "values")[3] == "等待首次检测"
+        assert app.status_tree.set(first["id"], "detail") == "等待首次检测"
+        assert app.streamer_platform_var.get() == "抖音"
         for tree in (app.streamer_tree, app.status_tree):
+            assert tree.set(first["id"], "platform") == "抖音"
+            assert tree.set(bilibili["id"], "platform") == "哔哩哔哩"
+            assert tree.set(kuaishou["id"], "platform") == "快手（实验）"
             for column in tree["columns"]:
                 assert str(tree.heading(column, "anchor")) == "center"
                 assert str(tree.column(column, "anchor")) == "center"
@@ -301,6 +409,26 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.project_link.cget("text") == PROJECT_REPOSITORY_URL
         assert app.project_link.bind("<Button-1>")
         assert PROJECT_SOURCE_NOTICE == "本项目为开源项目，仅供非商业用途"
+
+        app._new_streamer()
+        assert app.streamer_platform_var.get() == "输入链接后自动识别"
+        app.streamer_url_var.set("https://www.huya.com/gui-alias")
+        assert app.streamer_platform_var.get() == "虎牙"
+        app.streamer_url_var.set("https://www.douyu.com/gui-alias")
+        assert app.streamer_platform_var.get() == "斗鱼"
+        app.streamer_url_var.set("https://live.kuaishou.com/u/gui-test")
+        assert app.streamer_platform_var.get() == "快手（实验）"
+        showerror = Mock()
+        monkeypatch.setattr(gui_app.messagebox, "showerror", showerror)
+        app.streamer_url_var.set("https://channels.weixin.qq.com/platform")
+        assert "当前不支持免登录监控" in app.streamer_platform_var.get()
+        before = list(app.config["streamers"])
+        app._save_streamer()
+        assert app.config["streamers"] == before
+        showerror.assert_called_once()
+        assert "视频号：当前不支持免登录监控" in app.platform_support_label.cget("text")
+        app.streamer_tree.selection_set(first["id"])
+        app._on_streamer_selected()
 
         stopped_ids = []
         stop_finished = threading.Event()
@@ -389,6 +517,7 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert app.runtime_by_id == {}
         assert app.status_tree.item(first["id"], "values") == (
             "待启动",
+            "抖音",
             "界面测试主播",
             "",
             "等待首次检测",
@@ -398,6 +527,10 @@ def test_real_tk_window_builds_and_selects_first_streamer(tmp_path, monkeypatch)
         assert root.state() == "withdrawn"
         assert app.tray_controller.stopped is False
         app._restore_window()
+        app.shutdown_after_mainloop()
+        assert_scaled_layout_controls_remain_accessible(
+            root, config_path, kuaishou["id"], monkeypatch
+        )
     finally:
         root.destroy()
 
