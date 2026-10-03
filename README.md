@@ -6,7 +6,7 @@
   <h1>多平台直播监控与开播提醒工具</h1>
 
 <p>
-  <strong>多平台直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.8.0 · PolyForm NC 1.0.0
+  <strong>多平台直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.8.1 · PolyForm NC 1.0.0
 </p>
 
 <p>
@@ -27,7 +27,7 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.8.0.exe`，不需要安装 Python。
+Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.8.1.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
 2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
@@ -37,13 +37,21 @@ Windows 用户可以直接从 [最新版下载页](https://github.com/washls/dou
 
 Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
 
-## v1.8.0
+## v1.8.1
+
+抖音支持直接添加 `https://live.douyin.com/房间号`，程序会解析对应主播，主播主页和直播间链接指向同一账号时自动去重。通知使用该主播已确认的网页版直播间地址；暂时无法取得地址时显示“主播主页”链接。页面受限或身份无法确认时自动重试。
+
+快手根据当前目标房间的明确状态和有效播放地址判断直播，修复部分在播房间因主播资料中的默认状态而无法识别的问题。快手继续为实验支持，匿名访问受限、数据缺失或房间证据冲突时保持未知。
+
+v1.8.0 配置可直接使用。回退时退出新版，恢复升级前保留的配置副本，再运行 [v1.8.0](https://github.com/washls/douyin-live-monitor/releases/tag/v1.8.0)；抖音主页和分享链接适用于旧版。使用登录自启的用户需要在新 EXE 中重新保存自启设置。
+
+### v1.8.0 多平台支持
 
 新增哔哩哔哩、虎牙和斗鱼直播状态监控，实验支持快手。各平台通过公开页面或接口查询，无需用户登录。主播列表和运行状态显示平台，开播、持续直播、下播以及故障恢复通知均标明平台，并使用对应平台的观看链接。
 
 | 平台 | 支持的链接 | 支持情况 |
 |------|------------|----------|
-| 抖音 | 主播主页及现有分享链接 | 正式支持 |
+| 抖音 | 主播主页、直播间直链及现有分享链接 | 正式支持 |
 | 哔哩哔哩 | `https://live.bilibili.com/房间号` | 正式支持，支持短房间号 |
 | 虎牙 | `https://www.huya.com/房间号或别名` | 正式支持 |
 | 斗鱼 | `https://www.douyu.com/房间号或别名` | 正式支持，轮播不触发开播提醒 |
