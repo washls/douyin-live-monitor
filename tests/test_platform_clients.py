@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -417,7 +418,144 @@ def test_douyin_wrapper_preserves_existing_calls_and_room_session(monkeypatch):
     result = adapter.check(prepared["url"])
     assert result["status"] == "live"
     assert result["session_id"] == "synthetic_session"
-    assert result["live_url"] == "https://live.douyin.com/synthetic_session"
+    assert result["live_url"] == "https://www.douyin.com/user/synthetic_user"
     assert [kind for kind, _value in calls] == ["resolve", "extract", "info", "check"]
     adapter.close()
     assert adapter.client.closed
+
+
+class FakeDouyinIdentity:
+    def __init__(self, debug=False):
+        self.results = []
+        self.room_calls = []
+
+    def resolve_short_link(self, url):
+        if url == "https://v.douyin.com/synthetic/":
+            return "https://live.douyin.com/100000001"
+        return url
+
+    def resolve_live_room_url(self, url):
+        self.room_calls.append(url)
+        return {"sec_uid": "synthetic_user", "nickname": "示例主播", "web_rid": "100000001",
+                "url": "https://www.douyin.com/user/synthetic_user"}
+
+    def extract_sec_uid(self, url):
+        return url.rstrip("/").rsplit("/", 1)[-1]
+
+    def get_user_info(self, sec_uid):
+        return {"nickname": "示例主播"}
+
+    def check_live(self, target_url=None):
+        return self.results.pop(0)
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("url", [
+    "https://live.douyin.com/100000001", "https://v.douyin.com/synthetic/",
+])
+def test_douyin_live_room_resolves_profile_and_keeps_session_separate(monkeypatch, url):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    direct = adapter.resolve(url)
+    profile = adapter.resolve("https://www.douyin.com/user/synthetic_user")
+    assert direct == profile
+    assert adapter.client.room_calls == ["https://live.douyin.com/100000001"]
+    adapter.client.results = [
+        {"is_live": True, "room_id": "synthetic_session_one"},
+        {"is_live": False, "room_id": ""},
+        {"is_live": True, "room_id": "synthetic_session_two"},
+    ]
+    first, offline, second = [adapter.check(direct["url"]) for _ in range(3)]
+    assert first["session_id"] == "synthetic_session_one"
+    assert offline["status"] == "offline"
+    assert second["session_id"] == "synthetic_session_two"
+    assert {result["live_url"] for result in (first, offline, second)} == {
+        "https://live.douyin.com/100000001",
+    }
+
+
+@pytest.mark.parametrize("web_rid,expected_url", [
+    ("100000002", "https://live.douyin.com/100000002"),
+    (100000002, "https://live.douyin.com/100000002"),
+    ("synthetic_session", "https://www.douyin.com/user/synthetic_user"),
+    (True, "https://www.douyin.com/user/synthetic_user"),
+    ("0", "https://www.douyin.com/user/synthetic_user"),
+    (None, "https://www.douyin.com/user/synthetic_user"),
+])
+def test_douyin_watch_link_requires_valid_web_room_id(monkeypatch, web_rid, expected_url):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    adapter.client.results = [{"is_live": True, "room_id": "100000099", "web_rid": web_rid}]
+    result = adapter.check("https://www.douyin.com/user/synthetic_user?from=example")
+    assert result["live_url"] == expected_url
+    assert result["room_id"] == result["session_id"] == "100000099"
+
+
+def test_douyin_bound_web_room_does_not_cross_target_identity(monkeypatch):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    adapter.resolve("https://live.douyin.com/100000001")
+    adapter.client.results = [{"is_live": True, "room_id": "synthetic_session"}]
+    result = adapter.check("https://www.douyin.com/user/another_synthetic_user")
+    assert result["live_url"] == "https://www.douyin.com/user/another_synthetic_user"
+
+
+def test_douyin_new_web_room_metadata_replaces_only_bound_room(monkeypatch):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    prepared = adapter.resolve("https://live.douyin.com/100000001")
+    adapter.client.results = [
+        {"is_live": True, "room_id": "synthetic_session", "web_rid": "100000002"},
+        {"is_live": False},
+    ]
+    assert adapter.check(prepared["url"])["live_url"] == "https://live.douyin.com/100000002"
+    assert adapter.check(prepared["url"])["live_url"] == "https://live.douyin.com/100000002"
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.iesdouyin.com/share/user/synthetic_user",
+    "https://webcast.amemv.com/douyin/webcast/reflow/100000099?sec_uid=synthetic_user",
+    "https://webcast.amemv.com/reflow/100000099?sec_user_id=synthetic_user",
+])
+def test_douyin_share_watch_fallback_uses_canonical_profile(monkeypatch, url):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    adapter.client.results = [{"is_live": True, "room_id": "100000099"}]
+    assert adapter.check(url)["live_url"] == "https://www.douyin.com/user/synthetic_user"
+
+
+def test_douyin_unresolved_watch_target_omits_link(monkeypatch):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    adapter.client.results = [{"is_live": True, "room_id": "100000099"}]
+    result = adapter.check("https://v.douyin.com/synthetic/")
+    assert result["live_url"] == ""
+
+
+@pytest.mark.parametrize("kind,cooldown", [("restricted", 0), ("rate_limited", 90), ("network", 0)])
+@pytest.mark.parametrize("confirmed_offline", [False, True])
+def test_douyin_adapter_keeps_access_error_category_and_platform_cooldown(
+    monkeypatch, kind, cooldown, confirmed_offline,
+):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    adapter.client.results = [{"is_live": False, "determined": confirmed_offline,
+                               "indeterminate": not confirmed_offline, "error_kind": kind,
+                               "cooldown": cooldown, "error": "" if confirmed_offline else "访问受限"}]
+    result = adapter.check("https://www.douyin.com/user/synthetic_user")
+    assert result["status"] == ("offline" if confirmed_offline else "unknown")
+    assert result["error_kind"] == kind
+    assert result["cooldown"] == cooldown
+
+
+def test_direct_douyin_room_uses_bounded_resolver_without_short_link_head(monkeypatch):
+    monkeypatch.setattr(clients, "DouyinClient", FakeDouyinIdentity)
+    adapter = clients.create_platform_client("douyin")
+    adapter.client.resolve_short_link = Mock(side_effect=AssertionError("unexpected HEAD resolution"))
+    prepared = adapter.resolve("https://live.douyin.com/100000001")
+    assert prepared["target_id"] == "synthetic_user"
+    assert prepared["url"] == "https://www.douyin.com/user/synthetic_user"
+    assert adapter.client.room_calls == ["https://live.douyin.com/100000001"]
+    adapter.client.resolve_short_link.assert_not_called()

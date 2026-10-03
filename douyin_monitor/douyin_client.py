@@ -29,7 +29,7 @@ from urllib.parse import unquote, urljoin, urlparse, parse_qs
 
 import requests
 from requests.adapters import HTTPAdapter
-from .monitor_errors import ProfileDNSError, ProfileLinkError, failure_reason
+from .monitor_errors import ProfileAccessError, ProfileDNSError, ProfileLinkError, failure_reason
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,12 @@ _ALLOWED_REDIRECT_DOMAINS = ("douyin.com", "iesdouyin.com", "amemv.com")
 _FULL_CHECK_INTERVAL_SECONDS = 300.0
 _FULL_CHECK_EVERY_OFFLINE_ROUNDS = 10
 _FULL_CHECK_BUDGET_SECONDS = 45.0
+_ROOM_PAGE_BUDGET_SECONDS = 15.0
+_MAX_ROOM_PAGE_BYTES = 4 * 1024 * 1024
+_ROOM_CHALLENGE = re.compile(
+    r'<title[^>]*>[^<]*(?:登录|验证码|安全验证|访问验证|access denied|captcha)|'
+    r'请完成安全验证|访问过于频繁', re.I,
+)
 
 
 class LiveDecision(Enum):
@@ -328,10 +334,9 @@ class DouyinClient:
             and "captcha" not in lower_url
             and "captcha" not in lower_sample
         )
-        room_ids = set(_RE_ROOM_ID_LIVE.findall(html)) | set(
-            _RE_ROOM_ID_REFLOW.findall(html)
-        )
-        if len(room_ids) > 1:
+        # Web room numbers and internal session IDs occupy different namespaces.
+        if (len(set(_RE_ROOM_ID_LIVE.findall(html))) > 1
+                or len(set(_RE_ROOM_ID_REFLOW.findall(html))) > 1):
             trustworthy = False
         render_match = _RE_RENDER_DATA.search(html)
         if render_match:
@@ -442,8 +447,6 @@ class DouyinClient:
         if cached_url:
             self.extract_sec_uid(cached_url)
             room_match = _RE_ROOM_ID_REFLOW.search(cached_url)
-            if not room_match:
-                room_match = _RE_ROOM_ID_LIVE.search(cached_url)
             if room_match:
                 self._cached_room_id = room_match.group(1)
             if "iesdouyin.com/share/user/" in cached_url:
@@ -488,12 +491,6 @@ class DouyinClient:
                 if room_match:
                     self._cached_room_id = room_match.group(1)
                     logger.info(f"从链接提取直播间ID: {self._cached_room_id}")
-                # Also try other patterns
-                if not self._cached_room_id:
-                    room_match = _RE_ROOM_ID_LIVE.search(final_url)
-                    if room_match:
-                        self._cached_room_id = room_match.group(1)
-
             # Save the IES share URL for later use
             if "iesdouyin.com/share/user/" in final_url:
                 self._ies_share_url = final_url
@@ -503,6 +500,111 @@ class DouyinClient:
         except Exception as e:
             logger.error(f"短链接解析失败: {e}")
             raise
+
+    @staticmethod
+    def _room_infos_from_html(html: str) -> list[Dict[str, Any]]:
+        """Decode room-store JSON without executing page scripts or scanning accounts."""
+        roots = []
+        render = _RE_RENDER_DATA.search(html)
+        if render:
+            try:
+                roots.append(json.loads(unquote(render.group(1))))
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                pass
+        decoder = json.JSONDecoder()
+        for script in _RE_SCRIPT_TAGS.findall(html):
+            for marker in re.finditer(r'self\.__pace_f\.push\s*\(', script):
+                try:
+                    event, _end = decoder.raw_decode(script[marker.end():].lstrip())
+                    if not isinstance(event, list) or len(event) < 2 or not isinstance(event[1], str):
+                        continue
+                    payload = event[1].split(":", 1)[-1]
+                    roots.append(json.loads(payload))
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    continue
+        rooms = []
+        while roots:
+            item = roots.pop()
+            if isinstance(item, list):
+                roots.extend(item)
+            elif isinstance(item, dict):
+                state = item.get("state", item)
+                store = state.get("roomStore") if isinstance(state, dict) else None
+                room = store.get("roomInfo") if isinstance(store, dict) else None
+                if isinstance(room, dict):
+                    rooms.append(room)
+                else:
+                    roots.extend(value for value in item.values() if isinstance(value, (dict, list)))
+        return rooms
+
+    def _get_live_room_page(self, url: str) -> str:
+        """Fetch one public room page with bounded size, time and trusted redirects."""
+        deadline = self._monotonic() + _ROOM_PAGE_BUDGET_SECONDS
+        for hop in range(_MAX_REDIRECTS + 1):
+            url = self._validate_redirect_target(url)
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise requests.Timeout("抖音直播间解析超过时限")
+            timeout = max(0.05, min(5.0, remaining / 2))
+            with self.session.get(url, stream=True, allow_redirects=False,
+                                  timeout=(timeout, timeout)) as response:
+                code = response.status_code
+                if code == 429:
+                    retry = response.headers.get("Retry-After", "")
+                    cooldown = min(3600, max(60, int(retry))) if retry.isdigit() else 60
+                    raise ProfileAccessError("抖音请求频率受限，稍后重试", "rate_limited", cooldown)
+                if code in {401, 403, 412}:
+                    raise ProfileAccessError("抖音暂时限制匿名访问", "restricted")
+                if code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location", "")
+                    if hop == _MAX_REDIRECTS or not location:
+                        raise ProfileAccessError("抖音直播间重定向无法完成")
+                    url = urljoin(url, location)
+                    if re.search(r'/(?:login|passport|captcha|verify)(?:[/?]|$)', urlparse(url).path, re.I):
+                        raise ProfileAccessError("抖音要求登录或安全验证", "restricted")
+                    continue
+                if code == 404:
+                    raise ProfileAccessError("暂时无法读取抖音直播间")
+                if code >= 400:
+                    raise ProfileAccessError("抖音直播间服务请求失败", "network")
+                response.raise_for_status()
+                chunks = []
+                size = 0
+                for chunk in response.iter_content(chunk_size=16384):
+                    if self._monotonic() >= deadline:
+                        raise requests.Timeout("抖音直播间解析超过时限")
+                    size += len(chunk)
+                    if size > _MAX_ROOM_PAGE_BYTES:
+                        raise ProfileAccessError("抖音直播间响应超过大小限制")
+                    chunks.append(chunk)
+                html = b"".join(chunks).decode("utf-8-sig", errors="replace")
+            if _ROOM_CHALLENGE.search(html):
+                raise ProfileAccessError("抖音要求登录或安全验证", "restricted")
+            return html
+        raise ProfileAccessError("抖音直播间解析无法完成")
+
+    def resolve_live_room_url(self, url: str) -> Dict[str, str]:
+        """Resolve a public web room to its stable anchor identity within one budget."""
+        parsed = urlparse(url)
+        if parsed.hostname != "live.douyin.com" or not re.fullmatch(r'/\d+/?', parsed.path):
+            raise ProfileLinkError("请填写完整的抖音直播间链接")
+        expected_web_rid = parsed.path.strip("/")
+        html = self._get_live_room_page(url)
+        matches = {}
+        for room in self._room_infos_from_html(html):
+            anchor = room.get("anchor")
+            if str(room.get("web_rid") or "") != expected_web_rid or not isinstance(anchor, dict):
+                continue
+            sec_uid = anchor.get("sec_uid")
+            if not isinstance(sec_uid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,256}', sec_uid):
+                continue
+            matches[sec_uid] = str(anchor.get("nickname") or "")
+        if len(matches) != 1:
+            raise ProfileAccessError("抖音直播间暂未提供唯一主播身份")
+        sec_uid, nickname = next(iter(matches.items()))
+        self._cached_sec_uid = sec_uid
+        return {"sec_uid": sec_uid, "nickname": nickname, "web_rid": expected_web_rid,
+                "url": f"https://www.douyin.com/user/{sec_uid}"}
 
     def extract_sec_uid(self, url: str) -> str:
         """Extract sec_uid from a Douyin profile URL.
@@ -723,7 +825,7 @@ class DouyinClient:
 
             # === Extract room_id if live ===
             if result["is_live"] and not result["room_id"]:
-                room_match = _RE_ROOM_ID_LIVE.search(html)
+                room_match = _RE_ROOM_ID_REFLOW.search(html)
                 if room_match:
                     result["room_id"] = room_match.group(1)
 
@@ -1007,6 +1109,13 @@ class DouyinClient:
                 )
                 result["title"] = room_data.get("title", "")
 
+            web_rid = user_data.get("web_rid") or (
+                room_data.get("web_rid") if isinstance(room_data, dict) else ""
+            )
+            if (user_data.get("sec_uid", sec_uid) == sec_uid and not isinstance(web_rid, bool)
+                    and str(web_rid or "").isdigit() and int(web_rid) > 0):
+                result["web_rid"] = str(web_rid)
+
             # Also check for room_id directly on the user object (current API format)
             if not result["room_id"]:
                 direct_room = (
@@ -1281,69 +1390,43 @@ class DouyinClient:
 
         return result
 
-    def check_live_by_room_page(self, room_id: str) -> Dict[str, Any]:
-        """
-        Method 8: Check by accessing the live room page directly.
-
-        Args:
-            room_id: The room ID (web_rid)
-
-        Returns:
-            Dict with live status info
-        """
-        result = {
-            "is_live": False,
-            "room_id": room_id,
-            "title": "",
-            "nickname": "",
-            "method": "room_page",
-        }
-
-        if not room_id:
+    def check_live_by_room_page(
+        self, web_rid: str, expected_sec_uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Check only the requested web room's structured state and internal ID."""
+        result = {"is_live": False, "room_id": "", "web_rid": web_rid,
+                  "title": "", "nickname": "", "method": "room_page", "determined": False}
+        if not str(web_rid).isdigit() or int(web_rid) <= 0:
             return result
-
         try:
-            url = f"https://live.douyin.com/{room_id}"
-            logger.debug(f"[直播间检测] 访问: {url}")
-
-            resp = self.session.get(
-                url,
-                timeout=15,
-                allow_redirects=True,
-            )
-            resp.raise_for_status()
-            html = resp.text
-
-            # Check if redirected away (means not live or room doesn't exist)
-            if "live.douyin.com" not in resp.url:
-                logger.debug("[直播间检测] 被重定向，可能未开播")
+            html = self._get_live_room_page(f"https://live.douyin.com/{web_rid}")
+            rooms = [room for room in self._room_infos_from_html(html)
+                     if str(room.get("web_rid") or "") == str(web_rid)]
+            if len(rooms) != 1:
                 return result
-
-            # Look for live indicators in the page
-            for pattern, _desc in _LIVE_STATUS_PATTERNS:
-                if pattern.search(html):
-                    logger.debug(f"[直播间检测] 匹配直播标识: {pattern.pattern}")
-                    result["is_live"] = True
-                    break
-
-            # Also check text indicators and DOM ids
-            if not result["is_live"]:
-                for indicator in (*_LIVE_TEXT_INDICATORS, 'id="live-room-title"'):
-                    if indicator in html:
-                        logger.debug(f"[直播间检测] 发现直播标识: {indicator}")
-                        result["is_live"] = True
-                        break
-
-            # Extract title
-            title_match = _RE_TITLE.search(html)
-            if title_match:
-                result["title"] = title_match.group(1)
-
-        except requests.RequestException as e:
-            logger.warning(f"[直播间检测] 请求失败: {e}")
-        except Exception as e:
-            logger.warning(f"[直播间检测] 解析异常: {e}")
-
+            info = rooms[0]
+            room = info.get("room")
+            if not isinstance(room, dict):
+                return result
+            anchor = info.get("anchor")
+            if expected_sec_uid is not None and (
+                not isinstance(anchor, dict) or anchor.get("sec_uid") != expected_sec_uid
+            ):
+                return result
+            if isinstance(anchor, dict):
+                result["nickname"] = str(anchor.get("nickname") or "")
+            result["room_id"] = str(room.get("id_str") or room.get("id") or info.get("roomId") or "")
+            result["title"] = str(room.get("title") or "")
+            status = room.get("status")
+            if isinstance(status, int) and not isinstance(status, bool) and status in {2, 3, 4}:
+                result["is_live"] = status == 2
+                result["determined"] = True
+        except (requests.RequestException, ProfileAccessError) as exc:
+            result["error"] = str(exc) if isinstance(exc, ProfileAccessError) else failure_reason(exc)
+            result["error_kind"] = getattr(exc, "error_kind", "network")
+            if getattr(exc, "cooldown", 0):
+                result["cooldown"] = exc.cooldown
+            logger.warning("[直播间检测] 请求暂时失败 (%s)", type(exc).__name__)
         return result
 
     def check_live_by_webcast_info_by_user(self, sec_uid: str) -> Dict[str, Any]:
@@ -1499,9 +1582,9 @@ class DouyinClient:
             # Pattern 2: webcast.amemv.com/reflow/{room_id}
             webcast_matches = _RE_ROOM_ID_REFLOW.findall(html)
 
-            all_room_ids = set(live_room_matches + webcast_matches)
+            all_room_ids = set(webcast_matches)
 
-            if len(all_room_ids) > 1:
+            if len(all_room_ids) > 1 or len(set(live_room_matches)) > 1:
                 result["determined"] = False
                 result["error"] = "profile_multiple_rooms"
                 return result
@@ -1780,18 +1863,23 @@ class DouyinClient:
             if result.get("is_live") is True:
                 return self._finish_result(result, methods_tried)
 
-        room_id = best_result.get("room_id") or self._cached_room_id
+        web_rid = best_result.get("web_rid")
+        room_error = ""
         if (
             not budget_exhausted
-            and room_id
-            and str(room_id) != "0"
+            and web_rid
+            and str(web_rid) != "0"
             and self._monotonic() - full_started < _FULL_CHECK_BUDGET_SECONDS
         ):
-            room_result = self.check_live_by_room_page(str(room_id))
+            room_result = self.check_live_by_room_page(str(web_rid), expected_sec_uid=sec_uid)
             methods_tried.append("room_page")
             self._merge_best_result(best_result, room_result)
             if room_result.get("is_live") is True:
                 return self._finish_result(room_result, methods_tried)
+            room_error = str(room_result.get("error") or "")
+            for key in ("error_kind", "cooldown"):
+                if key in room_result:
+                    best_result[key] = room_result[key]
 
         if dual_offline:
             best_result["method"] = "full_check"
@@ -1801,7 +1889,7 @@ class DouyinClient:
             best_result["error"] = (
                 "full_check_budget_exhausted"
                 if budget_exhausted
-                else primary.reason or secondary.reason or "status_conflict"
+                else room_error or primary.reason or secondary.reason or "status_conflict"
             )
         return self._finish_result(best_result, methods_tried)
 
@@ -1812,6 +1900,8 @@ class DouyinClient:
             best["nickname"] = new["nickname"]
         if new.get("room_id") and not best.get("room_id"):
             best["room_id"] = new["room_id"]
+        if new.get("web_rid") and not best.get("web_rid"):
+            best["web_rid"] = new["web_rid"]
         if new.get("title") and not best.get("title"):
             best["title"] = new["title"]
         # is_live is NOT merged — the caller checks and returns early if found

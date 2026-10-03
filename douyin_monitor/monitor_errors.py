@@ -13,6 +13,15 @@ class ProfileLinkError(ValueError):
     """A safe, user-facing explanation for a rejected profile link."""
 
 
+class ProfileAccessError(RuntimeError):
+    """A retryable anonymous profile response with a safe failure category."""
+
+    def __init__(self, message: str, error_kind: str = "parse", cooldown: float = 0):
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.cooldown = cooldown
+
+
 def transient_network_error(exc: Exception) -> bool:
     return isinstance(exc, (requests.ConnectionError, requests.Timeout, socket.gaierror))
 

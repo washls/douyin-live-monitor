@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+import json
+from unittest.mock import Mock
 
 import requests
 import pytest
@@ -362,3 +364,316 @@ def test_empty_webcast_json_is_unknown():
 
     assert result["is_live"] is False
     assert result["determined"] is False
+
+
+def live_room_page(web_rid="100000001", sec_uid="synthetic_user", **room_values):
+    room = {"web_rid": web_rid, "roomId": "200000001",
+            "anchor": {"sec_uid": sec_uid, "nickname": "示例主播"}, **room_values}
+    payload = ["$", "$L12", None, {"state": {"roomStore": {"roomInfo": room}}}]
+    event = [1, "d:" + json.dumps(payload)]
+    return "<script>self.__pace_f.push(" + json.dumps(event) + ");</script>"
+
+
+class RoomResponse(FakeResponse):
+    def __init__(self, *, chunks=None, **kwargs):
+        super().__init__(**kwargs)
+        self.chunks = chunks
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.closed = True
+
+    def iter_content(self, chunk_size):
+        yield from self.chunks if self.chunks is not None else [self.text.encode()]
+
+
+def room_client(monkeypatch, responses):
+    monkeypatch.setattr(douyin_client.socket, "getaddrinfo", lambda *_a, **_kw: [
+        (2, 1, 6, "", ("8.8.8.8", 443)),
+    ])
+    client = DouyinClient()
+    calls = []
+    pending = iter(responses)
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return next(pending)
+
+    client.session.get = get
+    return client, calls
+
+
+def test_live_room_url_resolves_only_matching_structured_anchor(monkeypatch):
+    response = RoomResponse(text=live_room_page() +
+                            '<a href="https://www.douyin.com/user/recommended_user">推荐</a>')
+    client, calls = room_client(monkeypatch, [response])
+    try:
+        result = client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert result == {"sec_uid": "synthetic_user", "nickname": "示例主播",
+                          "web_rid": "100000001", "url": "https://www.douyin.com/user/synthetic_user"}
+        assert calls[0][1]["allow_redirects"] is False
+        assert calls[0][1]["stream"] is True
+        assert response.closed
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("page", [
+    live_room_page(web_rid="100000002"),
+    live_room_page(sec_uid=""),
+    live_room_page() + live_room_page(sec_uid="another_user"),
+    '<a href="https://www.douyin.com/user/recommended_user">直播中</a>',
+    '<script>self.__pace_f.push([1,"broken"]);</script>',
+])
+def test_room_identity_missing_or_ambiguous_is_retryable(monkeypatch, page):
+    client, _calls = room_client(monkeypatch, [RoomResponse(text=page)])
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert caught.value.error_kind == "parse"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("response,kind", [
+    (RoomResponse(status_code=403), "restricted"),
+    (RoomResponse(status_code=429, headers={"Retry-After": "90"}), "rate_limited"),
+    (RoomResponse(text="<title>安全验证</title>"), "restricted"),
+    (RoomResponse(status_code=302, headers={"Location": "/verify/captcha"}), "restricted"),
+    (RoomResponse(status_code=404), "parse"),
+    (RoomResponse(status_code=500), "network"),
+])
+def test_room_access_failures_keep_safe_retryable_classification(monkeypatch, response, kind):
+    client, _calls = room_client(monkeypatch, [response])
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert caught.value.error_kind == kind
+        assert response.closed
+        if kind == "rate_limited":
+            assert caught.value.cooldown == 90
+    finally:
+        client.close()
+
+
+def test_room_redirect_private_dns_and_size_limits(monkeypatch):
+    first = RoomResponse(status_code=302, headers={"Location": "https://example.com/100000001"})
+    client, calls = room_client(monkeypatch, [first])
+    try:
+        with pytest.raises(ValueError, match="不受信任"):
+            client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert len(calls) == 1
+        assert first.closed
+        monkeypatch.setattr(douyin_client.socket, "getaddrinfo", lambda *_a, **_kw: [
+            (2, 1, 6, "", ("127.0.0.1", 443)),
+        ])
+        with pytest.raises(ValueError, match="非公网"):
+            client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert len(calls) == 1
+    finally:
+        client.close()
+    large = RoomResponse(chunks=[b"x" * (4 * 1024 * 1024 + 1)])
+    client, _calls = room_client(monkeypatch, [large])
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert caught.value.error_kind == "parse"
+        assert large.closed
+    finally:
+        client.close()
+
+
+def test_profile_api_keeps_internal_and_web_room_ids_separate(monkeypatch):
+    client = DouyinClient()
+    monkeypatch.setattr(client, "_ensure_cookies", lambda: True)
+    monkeypatch.setattr(client, "_generate_a_bogus", lambda _params: {})
+    client.session.get = lambda *_a, **_kw: FakeResponse(payload={
+        "status_code": 0, "user": {"sec_uid": "synthetic_user", "nickname": "示例主播",
+                                   "live_status": 1, "room_id": "200000001",
+                                   "web_rid": "100000001"},
+    })
+    try:
+        result = client.check_live_by_api("synthetic_user")
+        assert result["room_id"] == "200000001"
+        assert result["web_rid"] == "100000001"
+    finally:
+        client.close()
+
+
+def test_profile_link_distinguishes_web_and_internal_room_ids(monkeypatch):
+    client = DouyinClient()
+    page = '<a href="https://live.douyin.com/100000001">直播中</a>' \
+           '<a href="https://webcast.amemv.com/reflow/200000001">分享</a>' + "x" * 6000
+    client.session.get = lambda *_a, **_kw: FakeResponse(text=page, url="https://www.douyin.com/user/test")
+    try:
+        result = client.check_live_by_profile_live_link("test")
+        assert result["is_live"] is True
+        assert "web_rid" not in result  # An unbound page link is not anchor metadata.
+        assert result["room_id"] == "200000001"
+    finally:
+        client.close()
+
+
+def test_full_chain_does_not_use_internal_id_as_web_room(monkeypatch):
+    client = DouyinClient()
+    calls = []
+    _configure_detection_stubs(monkeypatch, client, calls)
+    monkeypatch.setattr(client, "check_live_by_api", lambda _uid: {
+        **_offline("api"), "room_id": "200000001",
+    })
+    room_check = Mock(return_value={"is_live": False})
+    monkeypatch.setattr(client, "check_live_by_room_page", room_check)
+    try:
+        result = client.check_live(sec_uid="test")
+        assert result["room_id"] == "200000001"
+        room_check.assert_not_called()
+    finally:
+        client.close()
+
+
+def test_room_page_uses_structured_status_and_internal_session_id(monkeypatch):
+    response = RoomResponse(text=live_room_page(room={"id_str": "200000001", "status": 2,
+                                                    "title": "示例直播"}))
+    client, _calls = room_client(monkeypatch, [response])
+    try:
+        result = client.check_live_by_room_page("100000001")
+        assert result["is_live"] is True
+        assert result["room_id"] == "200000001"
+        assert result["web_rid"] == "100000001"
+        assert response.closed
+    finally:
+        client.close()
+
+
+def test_room_page_recommendation_cannot_confirm_target_live(monkeypatch):
+    response = RoomResponse(text=live_room_page(web_rid="100000002", room={"status": 2}) + "正在直播")
+    client, _calls = room_client(monkeypatch, [response])
+    try:
+        result = client.check_live_by_room_page("100000001")
+        assert result["is_live"] is False
+        assert result["determined"] is False
+        assert response.closed
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("anchor_uid,expected_live", [
+    ("synthetic_user", True), ("another_user", False), ("", False),
+])
+def test_room_page_requires_requested_anchor_identity(monkeypatch, anchor_uid, expected_live):
+    response = RoomResponse(text=live_room_page(sec_uid=anchor_uid, room={"status": 2}))
+    client, _calls = room_client(monkeypatch, [response])
+    try:
+        result = client.check_live_by_room_page("100000001", expected_sec_uid="synthetic_user")
+        assert result["is_live"] is expected_live
+        assert result["determined"] is expected_live
+        if not expected_live:
+            assert result["nickname"] == result["room_id"] == ""
+    finally:
+        client.close()
+
+
+def test_full_chain_binds_room_page_to_requested_anchor(monkeypatch):
+    response = RoomResponse(text=live_room_page(sec_uid="another_user", room={"status": 2}))
+    client, _calls = room_client(monkeypatch, [response])
+    _configure_detection_stubs(monkeypatch, client, [])
+    monkeypatch.setattr(client, "check_live_by_api", lambda _uid: {
+        **_offline("api"), "determined": False, "web_rid": "100000001",
+    })
+    try:
+        result = client.check_live(sec_uid="synthetic_user")
+        assert result["is_live"] is False
+        assert result["indeterminate"] is True
+        assert result["nickname"] != "other"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("response,kind,cooldown", [
+    (RoomResponse(status_code=403), "restricted", 0),
+    (RoomResponse(status_code=429, headers={"Retry-After": "90"}), "rate_limited", 90),
+    (RoomResponse(status_code=500), "network", 0),
+])
+@pytest.mark.parametrize("confirmed_offline", [False, True])
+def test_full_chain_retains_room_access_classification_and_offline_evidence(
+    monkeypatch, response, kind, cooldown, confirmed_offline,
+):
+    client, _calls = room_client(monkeypatch, [response])
+    _configure_detection_stubs(monkeypatch, client, [])
+    monkeypatch.setattr(client, "check_live_by_api", lambda _uid: {
+        **_offline("api"), "determined": confirmed_offline, "web_rid": "100000001",
+    })
+    try:
+        result = client.check_live(sec_uid="synthetic_user")
+        assert result["is_live"] is False
+        assert result["error_kind"] == kind
+        assert result.get("cooldown", 0) == cooldown
+        assert response.closed
+        if confirmed_offline:
+            assert result["determined"] is True
+            assert not result.get("indeterminate")
+            assert not result.get("error")
+        else:
+            assert result["indeterminate"] is True
+            assert result.get("error")
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("format", ["render", "event", "payload"])
+def test_deep_room_json_is_retryable_parse_failure(monkeypatch, format):
+    deeply_nested = "[" * 5000 + "{}" + "]" * 5000
+    if format == "render":
+        page = '<script id="RENDER_DATA">' + deeply_nested + '</script>'
+    elif format == "event":
+        page = '<script>self.__pace_f.push(' + deeply_nested + ');</script>'
+    else:
+        page = '<script>self.__pace_f.push(' + json.dumps([1, 'd:' + deeply_nested]) + ');</script>'
+    client, _calls = room_client(monkeypatch, [RoomResponse(text=page)])
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.resolve_live_room_url("https://live.douyin.com/100000001")
+        assert getattr(caught.value, "error_kind", "") == "parse"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("final_url,internal_room", [
+    ("https://live.douyin.com/100000001?source=webcast&sec_uid=synthetic_user", ""),
+    ("https://webcast.amemv.com/reflow/200000001?sec_uid=synthetic_user", "200000001"),
+])
+def test_short_link_room_cache_contains_only_internal_reflow_id(monkeypatch, cached, final_url, internal_room):
+    client = DouyinClient()
+    source = "https://v.douyin.com/synthetic/"
+    if cached:
+        client._resolved_url_cache[source] = final_url
+    monkeypatch.setattr(client, "_validate_redirect_target", lambda url: url)
+    head = Mock(side_effect=[FakeResponse(status_code=302, headers={"Location": final_url}), FakeResponse()])
+    client.session.head = head
+    try:
+        assert client.resolve_short_link(source) == final_url
+        assert client._cached_room_id == internal_room
+        assert head.call_count == (0 if cached else 2)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("share_link,internal_room", [
+    ("", ""),
+    ('<a href="https://webcast.amemv.com/reflow/200000001">分享</a>', "200000001"),
+])
+def test_html_live_link_fallback_never_uses_web_number_as_session(monkeypatch, share_link, internal_room):
+    client = DouyinClient()
+    page = '<a href="https://live.douyin.com/100000001">直播中</a>' + share_link + "x" * 6000
+    client.session.get = lambda *_a, **_kw: FakeResponse(text=page, url="https://www.douyin.com/user/test")
+    try:
+        result = client.check_live_by_html("test")
+        assert result["is_live"] is True
+        assert result["room_id"] == internal_room
+        assert "web_rid" not in result
+    finally:
+        client.close()

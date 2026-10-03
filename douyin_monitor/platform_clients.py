@@ -170,16 +170,40 @@ class DouyinAdapter:
 
     def __init__(self, debug: bool = False):
         self.client = DouyinClient(debug=debug)
+        self._web_room: tuple[str, str] = ("", "")
 
     def resolve(self, url: str) -> dict[str, Any]:
         clean = validate_platform_url(url, self.platform)
-        final_url = self.client.resolve_short_link(clean)
+        final_url = clean if urlparse(clean).hostname == "live.douyin.com" else self.client.resolve_short_link(clean)
+        if urlparse(final_url).hostname == "live.douyin.com":
+            info = self.client.resolve_live_room_url(final_url)
+            sec_uid = info["sec_uid"]
+            self._web_room = (sec_uid, _numeric_id(info.get("web_rid")))
+            return {"platform": self.platform, "target_id": sec_uid,
+                    "nickname": info.get("nickname", ""), "url": info["url"]}
         sec_uid = self.client.extract_sec_uid(final_url)
         if not sec_uid:
             raise ProfileLinkError("无法从抖音链接解析主播账号，请使用主播主页或分享链接")
         info = self.client.get_user_info(sec_uid)
+        if self._web_room[0] != sec_uid:
+            self._web_room = (sec_uid, "")
         return {"platform": self.platform, "target_id": sec_uid,
                 "nickname": info.get("nickname", ""), "url": final_url}
+
+    @staticmethod
+    def _profile_sec_uid(url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.hostname not in _INPUT_HOSTS["douyin"]:
+            return ""
+        match = re.fullmatch(rf"/(?:share/)?user/({_IDENTIFIER})/?", parsed.path)
+        if match:
+            return match[1]
+        query = parse_qs(parsed.query)
+        for key in ("sec_uid", "sec_user_id"):
+            values = query.get(key, [])
+            if len(values) == 1 and re.fullmatch(_IDENTIFIER, values[0]):
+                return values[0]
+        return ""
 
     def check(self, target_url: str) -> dict[str, Any]:
         raw = self.client.check_live(target_url=target_url)
@@ -187,13 +211,21 @@ class DouyinAdapter:
             "live" if raw.get("is_live") else "offline"
         )
         room_id = str(raw.get("room_id") or "")
+        sec_uid = self._profile_sec_uid(target_url)
+        web_rid = _numeric_id(raw.get("web_rid")) if sec_uid else ""
+        if not web_rid and sec_uid == self._web_room[0]:
+            web_rid = self._web_room[1]
+        self._web_room = (sec_uid, web_rid)
+        profile_url = f"https://www.douyin.com/user/{sec_uid}" if sec_uid else ""
         return _result(self.platform, status, raw.get("method", "douyin"), **{
             **raw, "status": status, "platform": self.platform,
             "is_live": status == "live",
             "indeterminate": status == "unknown",
-            "live_url": f"https://live.douyin.com/{room_id}" if room_id else target_url,
+            "live_url": f"https://live.douyin.com/{web_rid}" if web_rid else profile_url,
             "session_id": room_id,
-            "error_kind": "network" if raw.get("error") else "parse" if status == "unknown" else "",
+            "error_kind": raw.get("error_kind") or (
+                "network" if raw.get("error") else "parse" if status == "unknown" else ""
+            ),
         })
 
     def close(self) -> None:
