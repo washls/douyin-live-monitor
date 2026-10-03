@@ -559,10 +559,11 @@ class KuaishouAdapter(_PublicClient):
         author = state["author"]
         stream = state.get("liveStream")
         live_stream = stream if isinstance(stream, dict) else {}
-        offline = any(source.get(field) is False for source in (state, author, live_stream)
-                      for field in ("living", "isLiving"))
+        room_flags = [source[field] for source in (state, live_stream)
+                      for field in ("living", "isLiving") if isinstance(source.get(field), bool)]
+        offline = False in room_flags
         live = self._has_play_urls(live_stream.get("playUrls"))
-        if live and offline:
+        if offline and (live or True in room_flags):
             raise PlatformAccessError("快手匿名页面直播状态存在冲突", "parse")
         if not live and not offline:
             raise PlatformAccessError("快手匿名页面暂未提供明确直播状态", "restricted")

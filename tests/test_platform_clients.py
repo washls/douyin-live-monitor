@@ -286,10 +286,44 @@ def test_kuaishou_structured_play_url_and_explicit_offline_placeholders(monkeypa
     assert adapter.check("https://live.kuaishou.com/u/synthetic_user")["status"] == "offline"
 
 
-def test_kuaishou_explicit_author_offline_without_stream(monkeypatch):
+def test_kuaishou_author_metadata_without_room_evidence_is_unknown(monkeypatch):
     state = {"room": {"author": {"id": "synthetic_user", "living": False}}}
     adapter, _session = build(monkeypatch, "kuaishou", [FakeResponse(text=kuaishou_page(state))])
-    assert adapter.check("https://live.kuaishou.com/u/synthetic_user")["status"] == "offline"
+    assert adapter.check("https://live.kuaishou.com/u/synthetic_user")["status"] == "unknown"
+
+
+def test_kuaishou_current_room_stream_overrides_author_metadata(monkeypatch):
+    state = {"liveroom": {
+        "author": {"principalId": "synthetic_user", "name": "示例主播", "living": False},
+        "isLiving": True,
+        "liveStream": {"id": "synthetic_session", "playUrls": {
+            "h264": {"adaptationSet": {"representation": [
+                {"url": "https://example.com/synthetic.flv"},
+            ]}},
+        }},
+    }}
+    adapter, _session = build(monkeypatch, "kuaishou", [FakeResponse(text=kuaishou_page(state))])
+    result = adapter.check("https://live.kuaishou.com/u/synthetic_user")
+    assert result["status"] == "live"
+    assert result["session_id"] == "synthetic_session"
+
+
+@pytest.mark.parametrize("room_flags,stream_flags,expected", [
+    ({"living": True, "isLiving": False}, {}, "unknown"),
+    ({"living": True}, {"isLiving": False}, "unknown"),
+    ({"living": False}, {"isLiving": True}, "unknown"),
+    ({}, {"living": False}, "offline"),
+    ({"living": True}, {}, "unknown"),
+    ({"living": 0}, {}, "unknown"),
+    ({"isLiving": "false"}, {}, "unknown"),
+])
+def test_kuaishou_room_flags_are_strict_and_conflicts_remain_unknown(
+    monkeypatch, room_flags, stream_flags, expected,
+):
+    state = {"room": {"author": {"id": "synthetic_user", "living": False},
+                       "liveStream": stream_flags, **room_flags}}
+    adapter, _session = build(monkeypatch, "kuaishou", [FakeResponse(text=kuaishou_page(state))])
+    assert adapter.check("https://live.kuaishou.com/u/synthetic_user")["status"] == expected
 
 
 def test_kuaishou_undefined_token_preserves_strings_and_is_unknown(monkeypatch):
