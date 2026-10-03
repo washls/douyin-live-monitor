@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence
+from urllib.parse import urlsplit
 
 import requests
 
@@ -23,6 +24,21 @@ SERVERCHAN_URL_TEMPLATE = "https://{uid}.push.ft07.com/send/{sendkey}.send"
 # Retry settings
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
+
+
+def _link_label(live_url: str, default: str) -> str:
+    """Describe confirmed Douyin profile fallbacks as profile links."""
+    try:
+        url = urlsplit(live_url)
+    except ValueError:
+        return default
+    if (
+        url.scheme == "https"
+        and url.hostname in {"douyin.com", "www.douyin.com", "iesdouyin.com", "www.iesdouyin.com"}
+        and re.fullmatch(r"/(?:share/)?user/[^/]+/?", url.path)
+    ):
+        return "主播主页"
+    return default
 
 
 class ServerChanNotifier:
@@ -169,7 +185,7 @@ class ServerChanNotifier:
         platform: str = "douyin", live_url: str = "",
     ) -> bool:
         action = "程序将继续自动重试" if retrying else "任务已暂停，请检查后重新开始监控"
-        link = f"\n\n[主播直播间]({live_url})" if live_url else ""
+        link = f"\n\n[{_link_label(live_url, '主播直播间')}]({live_url})" if live_url else ""
         return self.send(
             title=f"[异常] [{platform_name(platform)}] {nickname} 监控{'异常' if retrying else '已暂停'}",
             desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n**原因**: {reason}\n\n"
@@ -178,7 +194,7 @@ class ServerChanNotifier:
 
     def send_monitor_recovery(self, nickname: str, duration: int,
                               platform: str = "douyin", live_url: str = "") -> bool:
-        link = f"\n\n[主播直播间]({live_url})" if live_url else ""
+        link = f"\n\n[{_link_label(live_url, '主播直播间')}]({live_url})" if live_url else ""
         return self.send(
             title=f"[恢复] [{platform_name(platform)}] {nickname} 监控已恢复",
             desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n已重新确认直播状态，监控继续运行。\n\n"
@@ -200,8 +216,6 @@ class ServerChanNotifier:
         Returns:
             True if sent successfully
         """
-        live_url = live_url or (f"https://live.douyin.com/{room_id}" if platform == "douyin" and room_id else "")
-
         # Build Markdown message
         md_parts = [
             "📺 **开播提醒**",
@@ -214,7 +228,7 @@ class ServerChanNotifier:
         if room_id:
             md_parts.append(f"- **房间ID**: `{room_id}`")
         if live_url:
-            md_parts.append(f"- **链接**: [点击观看]({live_url})")
+            md_parts.append(f"- **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
 
         md_parts.extend([
             "",
@@ -258,7 +272,7 @@ class ServerChanNotifier:
         if duration:
             md_parts.append(f"- **直播时长**: {duration}")
         if live_url:
-            md_parts.append(f"- **链接**: [主播直播间]({live_url})")
+            md_parts.append(f"- **链接**: [{_link_label(live_url, '主播直播间')}]({live_url})")
 
         desp = "\n".join(md_parts)
 
@@ -293,8 +307,6 @@ class ServerChanNotifier:
         Returns:
             True if sent successfully
         """
-        live_url = live_url or (f"https://live.douyin.com/{room_id}" if platform == "douyin" and room_id else "")
-
         md_parts = [
             f"🔴 **仍在直播提醒 ({repeat_count}/{max_repeat})**",
             "",
@@ -306,7 +318,7 @@ class ServerChanNotifier:
         if room_id:
             md_parts.append(f"- **房间ID**: `{room_id}`")
         if live_url:
-            md_parts.append(f"- **链接**: [点击观看]({live_url})")
+            md_parts.append(f"- **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
         if duration:
             md_parts.append(f"- **已播时长**: {duration}")
 
@@ -349,7 +361,6 @@ class ServerChanNotifier:
         Returns:
             True if sent successfully
         """
-        live_url = live_url or (f"https://live.douyin.com/{room_id}" if room_id else "")
         remaining = 60 - minute  # minutes until midnight reset
 
         md_parts = [
@@ -373,7 +384,7 @@ class ServerChanNotifier:
         if room_id:
             md_parts.append(f"🏠 **房间ID**: `{room_id}`")
         if live_url:
-            md_parts.append(f"🔗 **链接**: [点击观看]({live_url})")
+            md_parts.append(f"🔗 **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
 
         md_parts.extend([
             "",
@@ -422,14 +433,13 @@ class ServerChanNotifier:
         ]
         for item in live_streamers:
             nickname = str(item.get("nickname") or "未知主播")
-            room_id = str(item.get("room_id") or "")
             title = str(item.get("title") or "")
-            live_url = str(item.get("live_url") or "") or (f"https://live.douyin.com/{room_id}" if room_id else "")
+            live_url = str(item.get("live_url") or "")
             line = f"- **{nickname}**"
             if title:
                 line += f"：{title}"
             if live_url:
-                line += f" [进入直播间]({live_url})"
+                line += f" [{_link_label(live_url, '进入直播间')}]({live_url})"
             md_parts.append(line)
         md_parts.extend(
             [

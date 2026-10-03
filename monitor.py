@@ -798,6 +798,7 @@ class DouyinLiveMonitor:
             minute=minute,
             room_id=room_id,
             title=title,
+            live_url=info.get("live_url", ""),
         )
         self.state._daily_reminder_minutes_sent.add(minute)
 

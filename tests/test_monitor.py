@@ -4,6 +4,7 @@ import requests
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import datetime
 
 from monitor import (
     DouyinLiveMonitor,
@@ -173,6 +174,23 @@ class NotifierTests(unittest.TestCase):
 
 
 class MonitorControlTests(unittest.TestCase):
+    def test_single_daily_reminder_preserves_valid_link_and_is_sent_once(self):
+        live_monitor = object.__new__(DouyinLiveMonitor)
+        live_monitor.config = {"enable_daily_intimacy_reminder": True}
+        live_monitor.daily_reminder_managed_externally = False
+        live_monitor.state = MonitorState()
+        live_monitor.state.status = MonitorState.LIVE
+        live_monitor.notifier = Mock()
+        info = {"nickname": "示例主播", "room_id": "200000001", "title": "示例直播",
+                "live_url": "https://www.douyin.com/user/synthetic_user"}
+        with patch("monitor.datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 3, 23, 57)
+            live_monitor._check_daily_intimacy_reminder(info)
+            live_monitor._check_daily_intimacy_reminder(info)
+        live_monitor.notifier.send_daily_intimacy_reminder.assert_called_once()
+        self.assertEqual(live_monitor.notifier.send_daily_intimacy_reminder.call_args.kwargs["live_url"],
+                         info["live_url"])
+
     def test_stop_during_check_prevents_late_notification(self):
         live_monitor = object.__new__(DouyinLiveMonitor)
         live_monitor.target_url = "https://www.douyin.com/user/stopping"
