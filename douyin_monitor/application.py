@@ -8,7 +8,8 @@ from typing import Any, Callable, Mapping, Optional
 
 from .douyin_client import DouyinClient
 from .monitor_service import EventCallback, MonitorService
-from .notifier import ServerChanNotifier
+from .notifier import MultiChannelNotifier, PushDispatcher, ServerChanNotifier
+from .push_config import selected_channels
 from .streamer_config import (
     migrate_legacy_streamer,
     normalize_app_config,
@@ -20,12 +21,13 @@ from .streamer_config import (
 logger = logging.getLogger(__name__)
 
 
-def create_notifier(config: Mapping[str, Any]) -> ServerChanNotifier:
+def create_notifier(
+    config: Mapping[str, Any], *, dispatcher=None, on_report=None, cancelled=None,
+) -> MultiChannelNotifier:
     """Create a notification client from normalized application config."""
-    return ServerChanNotifier(
-        sendkey=str(config.get("sendkey") or ""),
-        uid=str(config.get("push_uid") or "") or None,
-        push_url=str(config.get("push_url") or "") or None,
+    return MultiChannelNotifier(
+        selected_channels(config), dispatcher=dispatcher,
+        on_report=on_report, cancelled=cancelled,
     )
 
 
@@ -90,25 +92,47 @@ def create_monitor_service(
 ) -> MonitorService:
     """Assemble clients, notifiers, workers and the shared scheduler."""
     normalized = normalize_app_config(config)
+    dispatcher = PushDispatcher()
+    service = None
+
+    def report(streamer_id, delivery):
+        if service is not None:
+            service.record_delivery(streamer_id, delivery)
 
     def worker_factory(entry: Mapping[str, Any]):
-        return create_monitor_worker(
+        worker = create_monitor_worker(
             normalized,
             entry,
             debug=debug,
-            notifier=create_notifier(normalized),
+            notifier=create_notifier(
+                normalized, dispatcher=dispatcher,
+                on_report=lambda delivery: report(str(entry["id"]), delivery),
+            ),
         )
+        worker.notifier.cancelled = lambda: worker._stop_event.is_set() or (
+            service is not None and service._stop_event.is_set()
+        )
+        worker.notifier.streamer_id = str(entry["id"])
+        return worker
 
-    return MonitorService(
-        entries,
-        worker_factory=worker_factory,
-        check_interval=normalized["check_interval"],
-        max_concurrent_checks=normalized["max_concurrent_checks"],
-        startup_notify=normalized["startup_notify"],
-        on_event=on_event,
-        enable_daily_intimacy_reminder=normalized[
-            "enable_daily_intimacy_reminder"
-        ],
-        service_notifier=create_notifier(normalized),
-        enable_console_stop=enable_console_stop,
-    )
+    try:
+        service = MonitorService(
+            entries,
+            worker_factory=worker_factory,
+            check_interval=normalized["check_interval"],
+            max_concurrent_checks=normalized["max_concurrent_checks"],
+            startup_notify=normalized["startup_notify"],
+            on_event=on_event,
+            enable_daily_intimacy_reminder=normalized["enable_daily_intimacy_reminder"],
+            service_notifier=create_notifier(
+                normalized, dispatcher=dispatcher,
+                on_report=lambda delivery: report("", delivery),
+                cancelled=lambda: service is not None and service._stop_event.is_set(),
+            ),
+            enable_console_stop=enable_console_stop,
+            push_dispatcher=dispatcher,
+        )
+    except Exception:
+        dispatcher.close()
+        raise
+    return service

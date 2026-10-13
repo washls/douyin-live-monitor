@@ -7,6 +7,10 @@ dist/
 # Python
 __pycache__/
 .pytest_cache/
+.ruff_cache/
+.venv-release/
+tmp/
+cache/
 debug_dumps/
 *.py[cod]
 *.egg-info/
@@ -33,7 +37,7 @@ Thumbs.db
 # Config (contains user secrets, each user creates their own)
 # config.json is committed as config.example.json instead
 config.json
-*.pre-v1.8.0.bak
+*.pre-v*.bak
 .env
 .env.*
 *.pem

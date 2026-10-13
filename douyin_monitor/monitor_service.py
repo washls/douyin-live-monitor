@@ -19,6 +19,7 @@ from .monitor_types import (
 from .streamer_logging import run_with_streamer_context, streamer_log_context
 from .monitor_errors import ProfileLinkError, failure_reason, transient_network_error
 from .platform_clients import MIN_CHECK_INTERVALS, platform_name
+from .notifier import MultiChannelNotifier
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class MonitorService:
         enable_daily_intimacy_reminder: bool = True,
         service_notifier: Optional[Any] = None,
         enable_console_stop: bool = False,
+        push_dispatcher: Optional[Any] = None,
     ):
         self.streamers = [dict(entry) for entry in streamers]
         self.worker_factory = worker_factory
@@ -64,6 +66,7 @@ class MonitorService:
         )
         self.on_event = on_event
         self._service_notifier = service_notifier
+        self._push_dispatcher = push_dispatcher
         if not isinstance(enable_console_stop, bool):
             raise ValueError("enable_console_stop 必须是布尔值")
         self.enable_console_stop = enable_console_stop
@@ -413,19 +416,45 @@ class MonitorService:
             if key[0] == streamer_id:
                 self._pending_alerts.pop(key, None)
 
+    def record_delivery(self, streamer_id: str, report: Any) -> None:
+        """Publish a credential-free immutable delivery result to frontends."""
+        results = [
+            {
+                "channel_id": item.channel_id, "name": item.name, "type": item.type,
+                "status": getattr(item.status, "value", item.status),
+                "http_status": item.http_status, "error_code": item.error_code,
+                "elapsed_ms": item.elapsed_ms,
+            }
+            for item in report.results
+        ]
+        with self._lock:
+            if streamer_id in self._runtime:
+                self._runtime[streamer_id]["notification_status"] = report.summary
+        logger.info("推送结果: %s", report.summary)
+        self._emit(
+            "notification", streamer_id,
+            delivery_report={"event_id": report.event_id, "summary": report.summary, "results": results},
+        )
+
     def _send_alert(self, notifier: Any, event: Mapping[str, Any], streamer_id: str) -> tuple[bool, bool]:
+        if isinstance(notifier, MultiChannelNotifier):
+            notifier = notifier.clone()
+            notifier.streamer_id = streamer_id
+            notifier.cancelled = lambda: self._stop_event.is_set() or self._runtime[streamer_id]["stopped_by_user"]
+            notifier.on_report = lambda report: self.record_delivery(streamer_id, report)
         if self._stop_event.is_set() or self._runtime[streamer_id]["stopped_by_user"]:
             return False, False
-        if event["kind"] == "recovery":
-            success = notifier.send_monitor_recovery(
-                event["nickname"], event["duration"],
-                platform=event["platform"], live_url=event["live_url"],
-            )
-        else:
-            success = notifier.send_monitor_alert(
-                event["nickname"], event["reason"], event["duration"], event["kind"] != "suspended",
-                platform=event["platform"], live_url=event["live_url"],
-            )
+        with streamer_log_context(streamer_id):
+            if event["kind"] == "recovery":
+                success = notifier.send_monitor_recovery(
+                    event["nickname"], event["duration"],
+                    platform=event["platform"], live_url=event["live_url"],
+                )
+            else:
+                success = notifier.send_monitor_alert(
+                    event["nickname"], event["reason"], event["duration"], event["kind"] != "suspended",
+                    platform=event["platform"], live_url=event["live_url"],
+                )
         return success, bool(notifier.delivery_unknown)
 
     def _check_fault_notifications(self) -> None:
@@ -438,6 +467,8 @@ class MonitorService:
             message = "异常/恢复通知已发送" if success else (
                 "异常/恢复通知结果未知，不重发" if unknown else "异常/恢复通知发送失败，不重发"
             )
+            if isinstance(self._service_notifier, MultiChannelNotifier):
+                message = self._runtime[self._alert_streamer]["notification_status"] or message
             if future.cancelled() or (not success and not unknown and (
                 self._stop_event.is_set() or self._runtime[self._alert_streamer]["stopped_by_user"]
             )):
@@ -488,6 +519,7 @@ class MonitorService:
                 f"**检测间隔**: {self.check_interval}s\n"
                 f"**启动时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             ),
+            **({"event_type": "startup"} if isinstance(self._get_service_notifier(), MultiChannelNotifier) else {}),
         )
 
     def _get_service_notifier(self) -> Any:
@@ -530,7 +562,9 @@ class MonitorService:
             minute=minute,
         )
         delivery_unknown = bool(notifier.delivery_unknown)
-        if success:
+        if isinstance(notifier, MultiChannelNotifier):
+            logger.info("汇总亲密度提醒: %s (23:%s)", notifier.last_report.summary, minute)
+        elif success:
             logger.info("[OK] 汇总亲密度提醒已发送 (23:%s)", minute)
         else:
             logger.error("[FAIL] 汇总亲密度提醒发送失败 (23:%s)", minute)
@@ -971,6 +1005,8 @@ class MonitorService:
     def stop(self) -> None:
         """Wake the scheduler and request every worker to stop."""
         self.running = False
+        if self._push_dispatcher is not None:
+            self._push_dispatcher.stop()
         self._stop_event.set()
         self._wake_event.set()
         with self._lock:
@@ -1019,6 +1055,8 @@ class MonitorService:
             close = getattr(worker, "close", None)
             if callable(close):
                 run_with_streamer_context(streamer_id, close)
+        if self._push_dispatcher is not None:
+            self._push_dispatcher.close()
 
     def _start_stop_listener(self) -> None:
         stdin = getattr(sys, "stdin", None)

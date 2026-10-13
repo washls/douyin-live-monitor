@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from .platform_clients import infer_platform, validate_platform_url
+from .push_config import normalize_push_config
 
 
 STREAMERS_KEY = "streamers"
@@ -71,6 +72,9 @@ def normalize_app_config(mapping: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(close_action, str) or close_action not in CLOSE_ACTIONS:
         raise ValueError("close_action 必须是 exit 或 hide_to_tray")
     config["close_action"] = close_action
+    config.update(normalize_push_config(config))
+    for key in ("push_url", "sendkey", "push_uid"):
+        config.pop(key, None)
     normalize_streamers(config)
     return config
 
@@ -185,33 +189,44 @@ def migrate_legacy_streamer(
     return True
 
 
+def _backup_config_bytes(backup: Path, original: bytes) -> None:
+    """Install one complete private backup without replacing an earlier one."""
+    if backup.exists():
+        return
+    backup_temp = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(backup_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
+        ensure_private_config_permissions(backup_temp)
+        try:
+            os.link(backup_temp, backup)
+        except FileExistsError:
+            pass
+    finally:
+        backup_temp.unlink(missing_ok=True)
+
+
 def save_config_atomic(config_path: Path, config: Mapping[str, Any]) -> None:
     """Atomically replace a JSON config without leaving partial contents."""
     config_path = Path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if config_path.exists():
-        old = json.loads(config_path.read_text(encoding="utf-8"))
+        original = config_path.read_bytes()
+        old = json.loads(original.decode("utf-8"))
         old_entries = old.get(STREAMERS_KEY, [])
         if any(isinstance(item, str) or (
             isinstance(item, Mapping) and "platform" not in item
         ) for item in old_entries or []):
-            backup = config_path.with_name(f"{config_path.name}.pre-v1.8.0.bak")
-            if not backup.exists():
-                backup_temp = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
-                try:
-                    descriptor = os.open(backup_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(descriptor, "wb") as handle:
-                        handle.write(config_path.read_bytes())
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    ensure_private_config_permissions(backup_temp)
-                    # Install only a complete backup, without overwriting an earlier one.
-                    try:
-                        os.link(backup_temp, backup)
-                    except FileExistsError:
-                        pass
-                finally:
-                    backup_temp.unlink(missing_ok=True)
+            _backup_config_bytes(
+                config_path.with_name(f"{config_path.name}.pre-v1.8.0.bak"), original
+            )
+        if "channels" not in old and "channels" in config:
+            _backup_config_bytes(
+                config_path.with_name(f"{config_path.name}.pre-v1.9.0.bak"), original
+            )
     temp_path = config_path.with_name(f".{config_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         descriptor = os.open(

@@ -32,7 +32,8 @@ from douyin_monitor.monitor_service import (
 )
 from douyin_monitor.monitor_types import StreamerStatus, WorkerPreparation
 from douyin_monitor.monitor_errors import ProfileLinkError
-from douyin_monitor.notifier import ServerChanNotifier
+from douyin_monitor.notifier import MultiChannelNotifier, ServerChanNotifier
+from douyin_monitor.push_config import CHANNEL_TYPES, has_push_targets, normalize_push_config
 from douyin_monitor.streamer_config import (
     add_streamer,
     enabled_streamers,
@@ -315,21 +316,24 @@ class MonitorState:
 # ===== Configuration =====
 
 
-def load_config(config_path: Path) -> Dict[str, Any]:
+def load_config(config_path: Path, *, persist_migration: bool = True) -> Dict[str, Any]:
     """Load configuration from JSON file. Create default if not exists."""
     if not config_path.exists():
         logger.info(f"配置文件不存在，将创建默认配置: {config_path}")
         config = _default_config()
-        try:
-            save_config_atomic(config_path, config)
-        except OSError as e:
-            logger.warning(f"创建配置文件失败: {e}")
+        if persist_migration:
+            try:
+                save_config_atomic(config_path, config)
+            except OSError as e:
+                logger.warning(f"创建配置文件失败: {e}")
         return config
 
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
     normalized = normalize_app_config(config)
+    if not persist_migration:
+        return normalized
     if normalized != config:
         save_config_atomic(config_path, normalized)
     else:
@@ -340,9 +344,9 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 def _default_config() -> Dict[str, Any]:
     """Return default configuration values."""
     return {
-        "sendkey": "",
-        "push_uid": "",
-        "push_url": "",
+        "channels": [],
+        "push_mode": "all",
+        "selected_channel_ids": [],
         "check_interval": 30,
         "notify_on_stream_end": True,
         "repeat_notify_interval": 600,
@@ -640,6 +644,11 @@ class DouyinLiveMonitor:
         self.running = True
         self._stop_event = threading.Event()
         self._check_lock = threading.Lock()
+        if isinstance(self.notifier, MultiChannelNotifier):
+            previous_cancelled = self.notifier.cancelled
+            self.notifier.cancelled = lambda: self._stop_event.is_set() or (
+                previous_cancelled is not None and previous_cancelled()
+            )
 
     def _resolve_sec_uid(self) -> Optional[str]:
         """Resolve the target user's sec_uid."""
@@ -714,7 +723,9 @@ class DouyinLiveMonitor:
         )
         self.state.mark_first_notification_sent()
 
-        if success:
+        if isinstance(self.notifier, MultiChannelNotifier):
+            logger.info("开播推送: %s", self.notifier.last_report.summary)
+        elif success:
             logger.info("[OK] 开播通知已发送!")
         else:
             logger.error("[FAIL] 开播通知发送失败!")
@@ -745,7 +756,9 @@ class DouyinLiveMonitor:
             live_url=info.get("live_url", ""),
         )
 
-        if success:
+        if isinstance(self.notifier, MultiChannelNotifier):
+            logger.info("持续直播推送: %s", self.notifier.last_report.summary)
+        elif success:
             logger.info(f"[OK] 重复推送已发送 ({count}/{max_count})!")
         else:
             logger.error("[FAIL] 重复推送发送失败!")
@@ -915,6 +928,8 @@ class DouyinLiveMonitor:
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
+        if isinstance(self.notifier, MultiChannelNotifier):
+            self.notifier.close()
 
 # ===== CLI Entry Point =====
 
@@ -1051,14 +1066,16 @@ def main():
     from douyin_monitor.windows_integration import WindowsInstanceGuard
 
     parser = argparse.ArgumentParser(
-        description="抖音直播监听器 - 多平台开播监控与Server酱³推送通知",
+        description="抖音直播监听器 - 多平台开播监控与多渠道推送通知",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   python monitor.py                    # 持续监控 (使用 config.json)
   python monitor.py --once             # 单次检测
   python monitor.py --config my.json   # 使用自定义配置
-  python monitor.py --test             # 测试 Server酱³ 连接
+  python monitor.py --test             # 测试当前推送范围
+  python monitor.py --test-channel ID  # 测试指定推送渠道
+  python monitor.py --list-channels    # 查看推送渠道
   python monitor.py --list-streamers   # 查看主播列表
   python monitor.py --add-streamer URL # 添加主播
         """,
@@ -1083,8 +1100,10 @@ def main():
     operation.add_argument(
         "--test",
         action="store_true",
-        help="测试 Server酱³ 连接后退出",
+        help="测试当前推送范围后退出",
     )
+    operation.add_argument("--test-channel", metavar="ID", help="测试指定推送渠道后退出")
+    operation.add_argument("--list-channels", action="store_true", help="列出推送渠道和选用状态后退出")
     operation.add_argument(
         "--list-streamers",
         action="store_true",
@@ -1154,6 +1173,8 @@ def main():
     config_path = Path(args.config)
     non_monitor_operation = bool(
         args.test
+        or args.test_channel
+        or args.list_channels
         or args.list_streamers
         or args.add_streamer
         or args.remove_streamer
@@ -1172,6 +1193,32 @@ def main():
             sys.exit(3)
 
     try:
+        if args.test or args.test_channel or args.list_channels:
+            try:
+                config = load_config(config_path, persist_migration=False)
+                push = normalize_push_config(config)
+                if args.list_channels:
+                    selected = set(push["selected_channel_ids"])
+                    for channel in push["channels"]:
+                        active = push["push_mode"] == "all" or channel["id"] in selected
+                        print(f"{channel['id']}  {channel['name']}  {CHANNEL_TYPES[channel['type']]}  {'选用' if active else '未选用'}")
+                    return
+                if args.test_channel:
+                    if not any(item["id"] == args.test_channel for item in push["channels"]):
+                        raise ValueError("推送渠道 ID 不存在")
+                    push.update(push_mode="selected", selected_channel_ids=[args.test_channel])
+                notifier = create_notifier(push)
+                try:
+                    success = notifier.verify_connection()
+                    logger.info("%s", notifier.last_report.summary)
+                finally:
+                    notifier.close()
+                if not success:
+                    sys.exit(1)
+                return
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                logger.error("推送配置处理失败: %s", exc)
+                sys.exit(2)
         try:
             config = load_config(config_path)
             entries = load_streamer_entries(
@@ -1184,26 +1231,8 @@ def main():
             _pause_if_frozen()
             sys.exit(2)
 
-        if args.test:
-            if not is_serverchan_configured(config):
-                logger.error(
-                    "Server酱³ 尚未配置!\n"
-                    "请先运行 python monitor.py 进行配置，"
-                    "或在 config.json 中手动填入推送 URL。\n"
-                    "获取方式: 访问 https://sc3.ft07.com 微信扫码登录"
-                )
-                _pause_if_frozen()
-                sys.exit(1)
-            notifier = create_notifier(config)
-            logger.info("测试 Server酱³ 连接...")
-            if notifier.verify_connection():
-                logger.info("[OK] Server酱³ 连接测试成功!")
-            else:
-                logger.error("[FAIL] Server酱³ 连接测试失败!")
-            return
-
-        if not is_serverchan_configured(config):
-            config = prompt_serverchan_config(config_path, config)
+        if not has_push_targets(config):
+            logger.warning("当前不发送推送；可在 GUI 的推送设置页或配置文件中设置接收渠道")
 
         if not entries:
             target_url = prompt_target_url()
