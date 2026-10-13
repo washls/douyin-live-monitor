@@ -10,6 +10,8 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
+import uuid
+from copy import deepcopy
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -27,6 +29,14 @@ from .monitor_service import MonitorService
 from .notifier import ServerChanNotifier
 from .platform_clients import infer_platform, platform_name, validate_platform_url
 from .project_info import PROJECT_REPOSITORY_URL, PROJECT_SOURCE_NOTICE
+from .push_config import (
+    CHANNEL_FIELDS,
+    CHANNEL_TYPES,
+    has_push_targets,
+    normalize_channel,
+    normalize_push_config,
+    selected_channels,
+)
 from .streamer_config import (
     add_streamer,
     enabled_streamers,
@@ -300,6 +310,13 @@ class MonitorGui:
         self.exiting = False
         self.runtime_closed = False
         self.testing_push = False
+        self.push_test_thread: Optional[threading.Thread] = None
+        self.push_test_notifier: Any = None
+        self.push_test_cancel = threading.Event()
+        self.channel_editor: Optional[tk.Toplevel] = None
+        self.push_channels = deepcopy(self.config.get("channels", []))
+        self.push_selected_ids = list(self.config.get("selected_channel_ids", []))
+        self.push_results: Dict[str, str] = {}
         self.monitoring_ui_active = False
         self.selected_streamer_id = ""
         self.runtime_by_id: Dict[str, Dict[str, Any]] = {}
@@ -480,8 +497,9 @@ class MonitorGui:
         self.streamer_url_var = tk.StringVar()
         self.streamer_platform_var = tk.StringVar(value="输入链接后自动识别")
         self.streamer_enabled_var = tk.BooleanVar(value=True)
-        self.push_url_var = tk.StringVar()
-        self.reveal_push_url_var = tk.BooleanVar(value=False)
+        self.push_mode_var = tk.StringVar(value=self.config.get("push_mode", "all"))
+        self.push_count_var = tk.StringVar()
+        self.push_test_result_var = tk.StringVar()
         self.check_interval_var = tk.StringVar()
         self.repeat_interval_var = tk.StringVar()
         self.max_repeat_var = tk.StringVar()
@@ -730,14 +748,20 @@ class MonitorGui:
             self.notebook, style="Surface.TFrame", padding=self._px(16)
         )
         settings_tab = ttk.Frame(self.notebook, style="Surface.TFrame")
+        push_tab = ttk.Frame(self.notebook, style="Surface.TFrame")
         self.notebook.add(status_tab, text="运行状态")
         self.notebook.add(detail_tab, text="主播详情")
         self.notebook.add(settings_tab, text="监控设置")
+        self.notebook.add(push_tab, text="推送设置")
         self._build_status_tab(status_tab)
         self.detail_canvas = self._build_scrollable_form(
             detail_tab, self._build_detail_tab, padding=0
         )
         self._build_scrollable_settings_tab(settings_tab)
+        self.push_canvas = self._build_scrollable_form(
+            push_tab, self._build_push_tab, padding=self._px(16)
+        )
+        self._refresh_push_channels()
 
     def _build_status_tab(self, parent: ttk.Frame) -> None:
         parent.grid_rowconfigure(2, weight=1)
@@ -1037,44 +1061,13 @@ class MonitorGui:
             pady=(self._px(4), self._px(14)),
         )
 
-        push_frame = ttk.LabelFrame(
-            parent,
-            text="Server酱³ 推送",
-            style="Surface.TLabelframe",
-            padding=self._px(14),
-        )
-        push_frame.grid(row=2, column=0, sticky="ew")
-        push_frame.grid_columnconfigure(0, weight=1)
-        self.push_entry = ttk.Entry(
-            push_frame, textvariable=self.push_url_var, show="●"
-        )
-        self.push_entry.grid(
-            row=0, column=0, sticky="ew", padx=(0, self._px(10))
-        )
-        self.reveal_check = ttk.Checkbutton(
-            push_frame,
-            text="显示",
-            variable=self.reveal_push_url_var,
-            command=self._toggle_push_url_visibility,
-        )
-        self.reveal_check.grid(row=0, column=1)
-        self.test_push_button = ttk.Button(
-            push_frame,
-            text="测试推送",
-            style="Action.TButton",
-            command=self._test_push,
-        )
-        self.test_push_button.grid(
-            row=0, column=2, padx=(self._px(10), 0)
-        )
-
         timing = ttk.LabelFrame(
             parent,
             text="检测与提醒",
             style="Surface.TLabelframe",
             padding=self._px(14),
         )
-        timing.grid(row=3, column=0, sticky="ew", pady=(self._px(14), 0))
+        timing.grid(row=2, column=0, sticky="ew")
         timing.grid_columnconfigure(1, weight=1)
         if not self.compact_layout:
             timing.grid_columnconfigure(3, weight=1)
@@ -1199,8 +1192,332 @@ class MonitorGui:
             row=6, column=0, sticky="e", pady=(self._px(16), 0)
         )
 
+    def _build_push_tab(self, parent: ttk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        ttk.Label(parent, text="推送设置", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            parent,
+            text="管理接收通知的渠道，推送范围在下次启动监控时生效。",
+            style="Muted.TLabel",
+            wraplength=self._px(560),
+        ).grid(row=1, column=0, sticky="w", pady=(self._px(4), self._px(14)))
+        modes = ttk.Frame(parent, style="Surface.TFrame")
+        modes.grid(row=2, column=0, sticky="ew")
+        self.push_mode_buttons = []
+        for column, (value, label) in enumerate(
+            (("all", "全部渠道"), ("selected", "自选渠道"))
+        ):
+            button = ttk.Radiobutton(
+                modes, text=label, variable=self.push_mode_var, value=value,
+                command=self._refresh_push_channels,
+            )
+            button.grid(row=0, column=column, sticky="w", padx=(0, self._px(18)))
+            self.push_mode_buttons.append(button)
+        ttk.Label(
+            parent, textvariable=self.push_count_var, style="Muted.TLabel",
+        ).grid(row=3, column=0, sticky="w", pady=self._px(8))
+        table = ttk.Frame(parent, style="Surface.TFrame")
+        table.grid(row=4, column=0, sticky="nsew")
+        table.grid_columnconfigure(0, weight=1)
+        self.push_tree = ttk.Treeview(
+            table, columns=("included", "name", "type", "result"),
+            show="headings", selectmode="browse", height=6,
+        )
+        for column, label, width in (
+            ("included", "发送", 54), ("name", "渠道名称", 155),
+            ("type", "渠道类型", 110), ("result", "最近结果", 180),
+        ):
+            self.push_tree.heading(column, text=label, anchor=tk.CENTER)
+            self.push_tree.column(
+                column, width=self._px(width), minwidth=self._px(width),
+                stretch=column in {"name", "result"}, anchor=tk.CENTER,
+            )
+        self.push_tree.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(table, orient=tk.VERTICAL, command=self.push_tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(table, orient=tk.HORIZONTAL, command=self.push_tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.push_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.push_tree.bind("<Button-1>", self._on_push_click)
+        self.push_tree.bind("<space>", self._toggle_push_selection)
+        self.push_tree.bind("<<TreeviewSelect>>", self._refresh_push_controls)
+        self.push_tree.bind("<Double-1>", lambda _event: self._edit_push_channel())
+        ttk.Label(
+            parent,
+            text="自选模式下点击发送列或按空格勾选；全部模式自动发送到所有渠道。",
+            style="Muted.TLabel", wraplength=self._px(560),
+        ).grid(row=5, column=0, sticky="w", pady=self._px(8))
+        actions = ttk.Frame(parent, style="Surface.TFrame")
+        actions.grid(row=6, column=0, sticky="ew")
+        self.add_push_button = ttk.Button(actions, text="新增渠道", command=self._new_push_channel)
+        self.edit_push_button = ttk.Button(actions, text="编辑渠道", command=self._edit_push_channel)
+        self.delete_push_button = ttk.Button(actions, text="删除渠道", command=self._delete_push_channel)
+        for column, button in enumerate(
+            (self.add_push_button, self.edit_push_button, self.delete_push_button)
+        ):
+            button.grid(row=0, column=column, padx=(0, self._px(8)), pady=self._px(4))
+        tests = ttk.Frame(parent, style="Surface.TFrame")
+        tests.grid(row=7, column=0, sticky="ew", pady=(self._px(10), 0))
+        self.test_selected_push_button = ttk.Button(
+            tests, text="测试所选渠道", command=lambda: self._test_push(single=True)
+        )
+        self.test_push_button = ttk.Button(
+            tests, text="测试当前范围", command=self._test_push,
+        )
+        self.test_selected_push_button.grid(row=0, column=0, padx=(0, self._px(8)))
+        self.test_push_button.grid(row=0, column=1)
+        ttk.Label(
+            parent, textvariable=self.push_test_result_var, style="Muted.TLabel",
+            wraplength=self._px(560), justify=tk.LEFT,
+        ).grid(row=8, column=0, sticky="ew", pady=self._px(10))
+        self.save_push_button = ttk.Button(
+            parent, text="保存推送设置", style="Primary.TButton",
+            command=self._save_push_settings,
+        )
+        self.save_push_button.grid(row=9, column=0, sticky="e", pady=self._px(6))
+
+    def _push_values(self) -> Dict[str, Any]:
+        return {
+            "channels": deepcopy(self.push_channels),
+            "push_mode": self.push_mode_var.get(),
+            "selected_channel_ids": list(self.push_selected_ids),
+        }
+
+    def _push_busy(self) -> bool:
+        return bool(
+            self.monitoring_ui_active or self.testing_push
+            or self.exiting or self.runtime_closed
+        )
+
+    def _highlighted_channel_id(self) -> str:
+        selection = self.push_tree.selection()
+        return str(selection[0]) if selection else ""
+
+    def _refresh_push_controls(self, _event: Any = None) -> None:
+        busy = self._push_busy()
+        selected = bool(self._highlighted_channel_id())
+        for button in (*self.push_mode_buttons, self.add_push_button, self.save_push_button):
+            button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        for button in (self.edit_push_button, self.delete_push_button, self.test_selected_push_button):
+            button.configure(state=tk.NORMAL if selected and not busy else tk.DISABLED)
+        count = len(self.push_channels) if self.push_mode_var.get() == "all" else sum(
+            channel["id"] in self.push_selected_ids for channel in self.push_channels
+        )
+        self.test_push_button.configure(state=tk.NORMAL if count and not busy else tk.DISABLED)
+
+    def _refresh_push_channels(self) -> None:
+        current_id = self._highlighted_channel_id()
+        self.push_tree.delete(*self.push_tree.get_children())
+        use_all = self.push_mode_var.get() == "all"
+        for channel in self.push_channels:
+            included = use_all or channel["id"] in self.push_selected_ids
+            self.push_tree.insert(
+                "", tk.END, iid=channel["id"], values=(
+                    "☑" if included else "☐", channel["name"],
+                    CHANNEL_TYPES[channel["type"]], self.push_results.get(channel["id"], "尚未测试"),
+                ),
+            )
+        if current_id and self.push_tree.exists(current_id):
+            self.push_tree.selection_set(current_id)
+            self.push_tree.focus(current_id)
+        count = len(self.push_channels) if use_all else sum(
+            channel["id"] in self.push_selected_ids for channel in self.push_channels
+        )
+        detail = "全部渠道" if use_all else "自选渠道"
+        suffix = "；当前不发送通知" if not count else ""
+        self.push_count_var.set(f"{detail}：{count} / {len(self.push_channels)} 个渠道{suffix}")
+        self._refresh_push_controls()
+
+    def _on_push_click(self, event: tk.Event) -> Optional[str]:
+        channel_id = self.push_tree.identify_row(event.y)
+        if channel_id and self.push_tree.identify_column(event.x) == "#1":
+            self.push_tree.selection_set(channel_id)
+            self.push_tree.focus(channel_id)
+            self._toggle_push_selection()
+            return "break"
+        return None
+
+    def _toggle_push_selection(self, _event: Any = None) -> str:
+        channel_id = self._highlighted_channel_id()
+        if channel_id and not self._push_busy() and self.push_mode_var.get() == "selected":
+            if channel_id in self.push_selected_ids:
+                self.push_selected_ids.remove(channel_id)
+            else:
+                self.push_selected_ids.append(channel_id)
+            self._refresh_push_channels()
+        return "break"
+
+    def _new_push_channel(self) -> None:
+        self._open_channel_editor()
+
+    def _edit_push_channel(self) -> None:
+        channel_id = self._highlighted_channel_id()
+        channel = next((item for item in self.push_channels if item["id"] == channel_id), None)
+        if channel:
+            self._open_channel_editor(channel)
+
+    def _open_channel_editor(self, channel: Optional[Mapping[str, Any]] = None) -> None:
+        if self._push_busy():
+            return
+        if self.channel_editor is not None:
+            self.channel_editor.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self.channel_editor = window
+        window.title("编辑渠道" if channel else "新增渠道")
+        window.transient(self.root)
+        window.configure(background=COLORS["surface"])
+        window.geometry(f"{self._px(600)}x{min(self._px(520), get_work_area(self.root)[3])}")
+        variables: Dict[str, tk.StringVar] = {}
+        fields: Dict[str, Mapping[str, Any]] = {}
+        entries: Dict[str, ttk.Entry] = {}
+        type_var = tk.StringVar(value=CHANNEL_TYPES[channel["type"]] if channel else CHANNEL_TYPES["serverchan"])
+        name_var = tk.StringVar(value=channel["name"] if channel else "")
+        reveal_var = tk.BooleanVar(value=False)
+
+        def close() -> None:
+            self.channel_editor = None
+            window.destroy()
+
+        def build(form: ttk.Frame) -> None:
+            form.grid_columnconfigure(1, weight=1)
+            ttk.Label(form, text="渠道类型").grid(row=0, column=0, sticky="w", pady=self._px(7))
+            type_combo = ttk.Combobox(form, values=tuple(CHANNEL_TYPES.values()), textvariable=type_var, state="readonly")
+            type_combo.grid(row=0, column=1, sticky="ew", padx=self._px(10))
+            ttk.Label(form, text="渠道名称").grid(row=1, column=0, sticky="w", pady=self._px(7))
+            ttk.Entry(form, textvariable=name_var).grid(row=1, column=1, sticky="ew", padx=self._px(10))
+            dynamic = ttk.Frame(form, style="Surface.TFrame")
+            dynamic.grid(row=2, column=0, columnspan=2, sticky="ew")
+            dynamic.grid_columnconfigure(1, weight=1)
+
+            def render_fields(_event: Any = None) -> None:
+                for child in dynamic.winfo_children():
+                    child.destroy()
+                variables.clear()
+                fields.clear()
+                entries.clear()
+                provider = next(key for key, label in CHANNEL_TYPES.items() if label == type_var.get())
+                config = channel["config"] if channel and channel["type"] == provider else {}
+                for row, field in enumerate(CHANNEL_FIELDS[provider]):
+                    key = field["key"]
+                    value = config.get(key, field["default"])
+                    if field.get("kind") == "json":
+                        value = json.dumps(value, ensure_ascii=False)
+                    variable = tk.StringVar(value=str(value))
+                    variables[key] = variable
+                    fields[key] = field
+                    ttk.Label(dynamic, text=field["label"]).grid(row=row, column=0, sticky="w", pady=self._px(7))
+                    entry = ttk.Entry(dynamic, textvariable=variable, show="●" if field["secret"] and not reveal_var.get() else "")
+                    entry.grid(row=row, column=1, sticky="ew", padx=self._px(10), pady=self._px(7))
+                    entries[key] = entry
+
+            def reveal() -> None:
+                for key, entry in entries.items():
+                    entry.configure(show="●" if fields[key]["secret"] and not reveal_var.get() else "")
+
+            def save() -> None:
+                try:
+                    provider = next(key for key, label in CHANNEL_TYPES.items() if label == type_var.get())
+                    config = {key: value.get() for key, value in variables.items()}
+                    for key, field in fields.items():
+                        if field.get("kind") == "json":
+                            try:
+                                config[key] = json.loads(config[key])
+                            except (ValueError, TypeError):
+                                raise ValueError("自定义请求头必须是 JSON 对象") from None
+                    self._upsert_push_channel({
+                        "id": channel["id"] if channel else uuid.uuid4().hex,
+                        "name": name_var.get(), "type": provider, "config": config,
+                    })
+                except ValueError as exc:
+                    messagebox.showerror("无法保存渠道", str(exc), parent=window)
+                    return
+                close()
+
+            type_combo.bind("<<ComboboxSelected>>", render_fields)
+            render_fields()
+            ttk.Checkbutton(form, text="显示凭据", variable=reveal_var, command=reveal).grid(row=3, column=1, sticky="w", pady=self._px(8))
+            buttons = ttk.Frame(form, style="Surface.TFrame")
+            buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=self._px(10))
+            ttk.Button(buttons, text="取消", command=close).grid(row=0, column=0, padx=self._px(8))
+            ttk.Button(buttons, text="确定", style="Primary.TButton", command=save).grid(row=0, column=1)
+
+        self._build_scrollable_form(window, build, padding=self._px(16))
+        window.protocol("WM_DELETE_WINDOW", close)
+        window.bind("<Escape>", lambda _event: close())
+        window.grab_set()
+        window.focus_set()
+
+    def _upsert_push_channel(self, values: Mapping[str, Any]) -> None:
+        if self._push_busy():
+            return
+        channel = normalize_channel(values)
+        channels = deepcopy(self.push_channels)
+        for index, existing in enumerate(channels):
+            if existing["id"] == channel["id"]:
+                channels[index] = channel
+                break
+        else:
+            channels.append(channel)
+        candidate = self._push_values()
+        candidate["channels"] = channels
+        self.push_channels = normalize_push_config(candidate)["channels"]
+        self.push_results.pop(channel["id"], None)
+        self._refresh_push_channels()
+        self.push_tree.selection_set(channel["id"])
+        self._refresh_push_controls()
+
+    def _delete_push_channel(self) -> None:
+        if self._push_busy():
+            return
+        channel_id = self._highlighted_channel_id()
+        channel = next((item for item in self.push_channels if item["id"] == channel_id), None)
+        if not channel or not messagebox.askyesno(
+            "删除渠道", f"确定删除“{channel['name']}”吗？", parent=self.root
+        ):
+            return
+        self.push_channels = [item for item in self.push_channels if item["id"] != channel_id]
+        self.push_selected_ids = [item for item in self.push_selected_ids if item != channel_id]
+        self.push_results.pop(channel_id, None)
+        self._refresh_push_channels()
+
+    def _save_push_settings(self) -> bool:
+        if self._push_busy():
+            return False
+        try:
+            candidate = deepcopy(self.config)
+            candidate.update(normalize_push_config(self._push_values()))
+            save_config_atomic(self.config_path, candidate)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法保存推送设置", str(exc), parent=self.root)
+            return False
+        self.config.clear()
+        self.config.update(candidate)
+        self.push_test_result_var.set("推送设置已保存。")
+        return True
+
+    def _save_startup_drafts(self) -> bool:
+        try:
+            values = self._settings_values()
+            values["close_action"] = self.config.get("close_action", "exit")
+            settings = validate_gui_settings(values)
+            for key in ("push_url", "sendkey", "push_uid"):
+                settings.pop(key, None)
+            push = normalize_push_config(self._push_values())
+            candidate = deepcopy(self.config)
+            candidate.update(settings)
+            candidate.update(push)
+            save_config_atomic(self.config_path, candidate)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法开始监控", str(exc), parent=self.root)
+            return False
+        self.config.clear()
+        self.config.update(candidate)
+        return True
+
     def _load_settings_into_form(self) -> None:
-        self.push_url_var.set(self.config.get("push_url", ""))
         self.check_interval_var.set(str(self.config.get("check_interval", 30)))
         self.repeat_interval_var.set(
             str(self.config.get("repeat_notify_interval", 600))
@@ -1226,9 +1543,6 @@ class MonitorGui:
 
     def _settings_values(self) -> Dict[str, Any]:
         return {
-            "push_url": self.push_url_var.get(),
-            "sendkey": self.config.get("sendkey", ""),
-            "push_uid": self.config.get("push_uid", ""),
             "check_interval": self.check_interval_var.get(),
             "repeat_notify_interval": self.repeat_interval_var.get(),
             "max_repeat_notifications": self.max_repeat_var.get(),
@@ -1244,6 +1558,8 @@ class MonitorGui:
     def _save_settings(
         self, show_success: bool = True, include_system: bool = True
     ) -> bool:
+        if getattr(self, "testing_push", False):
+            return False
         previous_config = dict(self.config)
         previous_autostart = None
         registry_touched = False
@@ -1253,6 +1569,8 @@ class MonitorGui:
             if not apply_system_settings:
                 values["close_action"] = self.config.get("close_action", "exit")
             normalized = validate_gui_settings(values)
+            for key in ("push_url", "sendkey", "push_uid"):
+                normalized.pop(key, None)
             if (
                 apply_system_settings
                 and normalized["close_action"] == "hide_to_tray"
@@ -1296,9 +1614,6 @@ class MonitorGui:
             else:
                 self._set_global_status("stopped", "设置已保存")
         return True
-
-    def _toggle_push_url_visibility(self) -> None:
-        self.push_entry.configure(show="" if self.reveal_push_url_var.get() else "●")
 
     def _refresh_streamer_views(self) -> None:
         current_id = self.selected_streamer_id
@@ -1698,10 +2013,15 @@ class MonitorGui:
         self._set_global_status("stopped", "主播已删除")
 
     def _start_monitoring(self, silent: bool = False) -> bool:
+        if getattr(self, "testing_push", False):
+            return False
+        if getattr(self, "channel_editor", None) is not None:
+            self.channel_editor.lift()
+            return False
         if self.service_thread and self.service_thread.is_alive():
             self._stop_monitoring()
             return False
-        if not self._save_settings(show_success=False, include_system=False):
+        if not self._save_startup_drafts():
             return False
         self.entries = list(self.config.get("streamers", []))
         active_entries = enabled_streamers(self.entries)
@@ -1714,18 +2034,18 @@ class MonitorGui:
                     "无法开始监控", "请至少添加并启用一个主播。", parent=self.root
                 )
             return False
-        if not monitor.is_serverchan_configured(self.config):
+        if not has_push_targets(self.config):
             if not silent:
                 self._restore_window()
                 proceed = messagebox.askyesno(
                     "尚未配置推送",
-                    "当前没有有效的 Server酱³ 推送地址。\n"
+                    "当前推送范围没有接收渠道。\n"
                     "可以继续检测，但不会收到手机通知。\n\n仍然开始监控吗？",
                     parent=self.root,
                 )
                 if not proceed:
-                    self.notebook.select(2)
-                    self.push_entry.focus_set()
+                    self.notebook.select(3)
+                    self.add_push_button.focus_set()
                     return False
 
         try:
@@ -1772,9 +2092,9 @@ class MonitorGui:
         self.start_button.configure(
             text="停止全部" if running else "开始监控",
             command=self._stop_monitoring if running else self._start_monitoring,
-            state=tk.NORMAL,
+            state=tk.DISABLED if self.testing_push else tk.NORMAL,
         )
-        edit_state = tk.DISABLED if running else tk.NORMAL
+        edit_state = tk.DISABLED if running or self.testing_push else tk.NORMAL
         for widget in (
             self.new_button,
             self.remove_button,
@@ -1782,9 +2102,6 @@ class MonitorGui:
             self.url_entry,
             self.enabled_check,
             self.save_streamer_button,
-            self.push_entry,
-            self.reveal_check,
-            self.test_push_button,
             self.notify_end_check,
             self.startup_check,
             self.daily_check,
@@ -1792,6 +2109,7 @@ class MonitorGui:
         ):
             widget.configure(state=edit_state)
         self._update_stop_selected_button()
+        self._refresh_push_controls()
         self._sync_tray_state()
 
     def _set_global_status(self, state: str, detail: str) -> None:
@@ -1805,29 +2123,87 @@ class MonitorGui:
         }.get(state, COLORS["muted"])
         self.status_dot.configure(fg=color)
 
-    def _test_push(self) -> None:
-        if self.testing_push or not self._save_settings(
-            show_success=False, include_system=False
-        ):
+    def _test_push(self, single: bool = False) -> None:
+        if self._push_busy() or self.channel_editor is not None:
             return
-        if not monitor.is_serverchan_configured(self.config):
-            messagebox.showwarning(
-                "无法测试推送", "请先填写有效的 Server酱³ 推送地址。", parent=self.root
-            )
+        try:
+            candidate = normalize_push_config(self._push_values())
+            if single:
+                channel_id = self._highlighted_channel_id()
+                candidate["push_mode"] = "selected"
+                candidate["selected_channel_ids"] = [channel_id] if channel_id else []
+            if not selected_channels(candidate):
+                messagebox.showwarning(
+                    "无法测试推送", "请选择至少一个接收渠道。", parent=self.root
+                )
+                return
+            self.push_test_cancel = threading.Event()
+            notifier = create_notifier(candidate, cancelled=self.push_test_cancel.is_set)
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror("无法测试推送", str(exc), parent=self.root)
             return
+        self.push_test_notifier = notifier
         self.testing_push = True
-        self.test_push_button.configure(state=tk.DISABLED, text="正在测试")
+        self._set_running_ui(False)
+        self.save_settings_button.configure(state=tk.DISABLED)
+        self.push_test_result_var.set("正在测试所选渠道…" if single else "正在测试当前范围…")
 
         def verify() -> None:
+            result: Dict[str, Any] = {"type": "push_test", "success": False}
             try:
-                success = create_notifier(self.config).verify_connection()
-                self.event_queue.put({"type": "push_test", "success": success})
-            except Exception as exc:
-                self.event_queue.put(
-                    {"type": "push_test", "success": False, "error": str(exc)}
-                )
+                result["success"] = notifier.verify_connection()
+                result["report"] = notifier.last_report
+            except Exception:
+                result["error"] = "推送测试未完成，请检查渠道配置和网络连接。"
+            finally:
+                try:
+                    notifier.close()
+                except Exception:
+                    result["error"] = "推送连接关闭时发生异常。"
+                finally:
+                    self.event_queue.put(result)
 
-        threading.Thread(target=verify, name="monitor-push-test", daemon=True).start()
+        self.push_test_thread = threading.Thread(
+            target=verify, name="monitor-push-test", daemon=True
+        )
+        self.push_test_thread.start()
+
+    def _display_push_report(self, report: Any) -> str:
+        if isinstance(report, Mapping):
+            summary = str(report.get("summary", ""))
+            results = report.get("results", [])
+        else:
+            summary = str(getattr(report, "summary", ""))
+            results = getattr(report, "results", [])
+        labels = {"accepted": "服务已接收", "rejected": "发送失败", "unknown": "结果未知", "cancelled": "已取消"}
+        for result in results:
+            channel_id = result.get("channel_id") if isinstance(result, Mapping) else getattr(result, "channel_id", "")
+            status = result.get("status") if isinstance(result, Mapping) else getattr(result, "status", "")
+            status = getattr(status, "value", status)
+            if channel_id:
+                text = labels.get(str(status), "发送失败")
+                self.push_results[str(channel_id)] = text
+                if self.push_tree.exists(str(channel_id)):
+                    self.push_tree.set(str(channel_id), "result", text)
+        self.push_test_result_var.set(summary)
+        return summary
+
+    def _cancel_push_test(self) -> None:
+        cancel = getattr(self, "push_test_cancel", None)
+        if cancel is not None:
+            cancel.set()
+        notifier = getattr(self, "push_test_notifier", None)
+        dispatcher = getattr(notifier, "dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.stop()
+
+    def _join_push_test(self) -> None:
+        self._cancel_push_test()
+        thread = getattr(self, "push_test_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self.push_test_thread = None
+        self.push_test_notifier = None
 
     def _drain_events(self) -> None:
         if self.instance_guard is not None:
@@ -1852,7 +2228,9 @@ class MonitorGui:
                 break
             self._handle_event(event)
         if self.pending_close:
-            if not self.service_thread or not self.service_thread.is_alive():
+            service_alive = bool(self.service_thread and self.service_thread.is_alive())
+            test_thread = getattr(self, "push_test_thread", None)
+            if not service_alive and not (test_thread and test_thread.is_alive()):
                 self._finish_exit()
                 return
         delay = 200 if (
@@ -1915,6 +2293,8 @@ class MonitorGui:
         }:
             if not self.monitoring_ui_active:
                 return
+            if event_type == "notification" and event.get("delivery_report"):
+                self._display_push_report(event["delivery_report"])
             if self.service is not None:
                 self.runtime_by_id = {
                     item["id"]: item for item in self.service.snapshot()
@@ -1957,19 +2337,19 @@ class MonitorGui:
             self.service = None
             self.service_thread = None
         elif event_type == "push_test":
+            self._join_push_test()
             self.testing_push = False
-            monitor_running = bool(
-                self.service_thread and self.service_thread.is_alive()
-            )
-            self.test_push_button.configure(
-                state=tk.DISABLED if monitor_running else tk.NORMAL,
-                text="测试推送",
-            )
+            if self.exiting:
+                return
+            self._set_running_ui(False)
+            self.save_settings_button.configure(state=tk.NORMAL)
+            summary = self._display_push_report(event["report"]) if event.get("report") is not None else ""
             if event.get("success"):
-                messagebox.showinfo("测试推送", "测试消息已发送。", parent=self.root)
+                messagebox.showinfo("测试推送", summary or "测试消息已被服务接收。", parent=self.root)
             else:
-                detail = event.get("error") or "请检查推送地址和网络连接。"
-                messagebox.showerror("测试推送失败", str(detail), parent=self.root)
+                detail = summary or event.get("error") or "请检查渠道配置和网络连接。"
+                self.push_test_result_var.set(str(detail))
+                messagebox.showwarning("测试推送结果", str(detail), parent=self.root)
         elif event_type == "streamer_stop_failed":
             self._update_stop_selected_button()
             messagebox.showinfo(
@@ -1992,9 +2372,15 @@ class MonitorGui:
             ):
                 return
         self.exiting = True
+        self._cancel_push_test()
+        test_thread = getattr(self, "push_test_thread", None)
+        test_running = bool(test_thread and test_thread.is_alive())
         if service_running:
             self.pending_close = True
             self._stop_monitoring()
+            return
+        if test_running:
+            self.pending_close = True
             return
         self._finish_exit()
 
@@ -2002,6 +2388,7 @@ class MonitorGui:
         if self.runtime_closed:
             return
         self.runtime_closed = True
+        self._join_push_test()
         self._detach_streamer_log_handler()
         if self.tray_controller is not None:
             self.tray_controller.stop()
@@ -2012,6 +2399,7 @@ class MonitorGui:
         if self.runtime_closed:
             return
         self.runtime_closed = True
+        self._join_push_test()
         self._detach_streamer_log_handler()
         if self.service is not None:
             self.service.stop()
