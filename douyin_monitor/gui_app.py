@@ -438,7 +438,7 @@ class MonitorGui:
 
     def _create_app_icon(self) -> tk.PhotoImage:
         """Load the shared application artwork for Tk windows and taskbar."""
-        return tk.PhotoImage(file=str(get_app_icon_path()))
+        return tk.PhotoImage(master=self.root, file=str(get_app_icon_path()))
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -490,25 +490,25 @@ class MonitorGui:
         )
 
     def _create_variables(self) -> None:
-        self.global_status_var = tk.StringVar()
-        self.global_detail_var = tk.StringVar()
-        self.streamer_id_var = tk.StringVar()
-        self.streamer_label_var = tk.StringVar()
-        self.streamer_url_var = tk.StringVar()
-        self.streamer_platform_var = tk.StringVar(value="输入链接后自动识别")
-        self.streamer_enabled_var = tk.BooleanVar(value=True)
-        self.push_mode_var = tk.StringVar(value=self.config.get("push_mode", "all"))
-        self.push_count_var = tk.StringVar()
-        self.push_test_result_var = tk.StringVar()
-        self.check_interval_var = tk.StringVar()
-        self.repeat_interval_var = tk.StringVar()
-        self.max_repeat_var = tk.StringVar()
-        self.max_concurrent_var = tk.StringVar()
-        self.notify_end_var = tk.BooleanVar()
-        self.startup_notify_var = tk.BooleanVar()
-        self.daily_reminder_var = tk.BooleanVar()
-        self.close_action_var = tk.StringVar()
-        self.autostart_var = tk.BooleanVar(value=False)
+        self.global_status_var = tk.StringVar(master=self.root)
+        self.global_detail_var = tk.StringVar(master=self.root)
+        self.streamer_id_var = tk.StringVar(master=self.root)
+        self.streamer_label_var = tk.StringVar(master=self.root)
+        self.streamer_url_var = tk.StringVar(master=self.root)
+        self.streamer_platform_var = tk.StringVar(master=self.root, value="输入链接后自动识别")
+        self.streamer_enabled_var = tk.BooleanVar(master=self.root, value=True)
+        self.push_mode_var = tk.StringVar(master=self.root, value=self.config.get("push_mode", "all"))
+        self.push_count_var = tk.StringVar(master=self.root)
+        self.push_test_result_var = tk.StringVar(master=self.root)
+        self.check_interval_var = tk.StringVar(master=self.root)
+        self.repeat_interval_var = tk.StringVar(master=self.root)
+        self.max_repeat_var = tk.StringVar(master=self.root)
+        self.max_concurrent_var = tk.StringVar(master=self.root)
+        self.notify_end_var = tk.BooleanVar(master=self.root)
+        self.startup_notify_var = tk.BooleanVar(master=self.root)
+        self.daily_reminder_var = tk.BooleanVar(master=self.root)
+        self.close_action_var = tk.StringVar(master=self.root)
+        self.autostart_var = tk.BooleanVar(master=self.root, value=False)
 
     def _build_layout(self) -> None:
         self.root.grid_rowconfigure(1, weight=1)
@@ -1373,9 +1373,9 @@ class MonitorGui:
         variables: Dict[str, tk.StringVar] = {}
         fields: Dict[str, Mapping[str, Any]] = {}
         entries: Dict[str, ttk.Entry] = {}
-        type_var = tk.StringVar(value=CHANNEL_TYPES[channel["type"]] if channel else CHANNEL_TYPES["serverchan"])
-        name_var = tk.StringVar(value=channel["name"] if channel else "")
-        reveal_var = tk.BooleanVar(value=False)
+        type_var = tk.StringVar(master=self.root, value=CHANNEL_TYPES[channel["type"]] if channel else CHANNEL_TYPES["serverchan"])
+        name_var = tk.StringVar(master=self.root, value=channel["name"] if channel else "")
+        reveal_var = tk.BooleanVar(master=self.root, value=False)
 
         def close() -> None:
             self.channel_editor = None
@@ -1405,7 +1405,7 @@ class MonitorGui:
                     value = config.get(key, field["default"])
                     if field.get("kind") == "json":
                         value = json.dumps(value, ensure_ascii=False)
-                    variable = tk.StringVar(value=str(value))
+                    variable = tk.StringVar(master=self.root, value=str(value))
                     variables[key] = variable
                     fields[key] = field
                     ttk.Label(dynamic, text=field["label"]).grid(row=row, column=0, sticky="w", pady=self._px(7))

@@ -23,6 +23,29 @@ def channel(channel_id, token=None):
     }
 
 
+def test_icon_uses_the_supplied_tk_interpreter(tk_runtime, monkeypatch):
+    other = Mock()
+    other.tk.call.side_effect = AssertionError("global interpreter must not be used")
+    monkeypatch.setattr(tk, "_default_root", other)
+    instance = MonitorGui.__new__(MonitorGui)
+    instance.root = tk_runtime
+    image = instance._create_app_icon()
+    assert image.tk is tk_runtime.tk
+    other.tk.call.assert_not_called()
+
+
+def test_form_variables_use_the_supplied_tk_interpreter(tk_runtime, monkeypatch):
+    other = Mock()
+    monkeypatch.setattr(tk, "_default_root", other)
+    instance = MonitorGui.__new__(MonitorGui)
+    instance.root = tk_runtime
+    instance.config = {}
+    instance._create_variables()
+    variables = [value for value in vars(instance).values() if isinstance(value, tk.Variable)]
+    assert len(variables) >= 19
+    assert all(value._tk is tk_runtime.tk for value in variables)
+
+
 @pytest.fixture
 def app(tmp_path, monkeypatch, tk_runtime, request):
     root = tk.Toplevel(tk_runtime)
