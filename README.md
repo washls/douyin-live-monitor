@@ -6,12 +6,12 @@
   <h1>多平台直播监控与开播提醒工具</h1>
 
 <p>
-  <strong>多平台直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.8.1 · PolyForm NC 1.0.0
+  <strong>多平台直播监听器</strong> · Python 3.9+ · Windows / Linux / macOS · v1.9.0 · PolyForm NC 1.0.0
 </p>
 
 <p>
   在一个程序中监控抖音、哔哩哔哩、虎牙和斗鱼的公开主播，实验支持快手。无需登录直播平台，添加主播链接即可查看开播状态。<br>
-  通过 Server 酱³ 接收开播、持续直播、下播和故障恢复提醒，通知附带对应平台的观看链接。<br>
+  通过 Server 酱³、PushPlus、Bark、飞书、钉钉、ntfy 或 Webhook 接收开播、持续直播、下播和故障恢复提醒，通知附带对应平台的观看链接。<br>
   支持 Windows 免安装图形界面、托盘驻留、开机自启和命令行模式，适合多主播常驻监控。
 </p>
 
@@ -27,15 +27,41 @@
 
 ## 下载与快速开始
 
-Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.8.1.exe`，不需要安装 Python。
+Windows 用户可以直接从 [最新版下载页](https://github.com/washls/douyin-live-monitor/releases/latest) 下载 `douyin-monitor-v1.9.0.exe`，不需要安装 Python。
 
 1. 双击 EXE 打开图形界面。任务栏只保留图形界面，不会创建终端窗口。
-2. 打开“监控设置”，填写 Server 酱³ 推送 URL 并保存。
+2. 打开“推送设置”，添加接收渠道，选择“全部推送”或“指定渠道”并保存。
 3. 点击“新增主播”，填写支持的平台主播链接和便于识别的名称，程序会自动识别平台。
 4. 点击“开始监控”。任务状态表会持续显示每个主播的检测结果。
 5. 如需后台常驻，可在“监控设置”中把关闭窗口行为改为“隐藏到任务栏托盘”。
 
-Server 酱³ 推送 URL 可以在 [sc3.ft07.com](https://sc3.ft07.com) 登录后获取。配置只保存在程序所在目录，不会由本程序上传到其他位置。
+推送凭据只保存在本地配置中；通知内容发送到用户配置的接收服务。可先使用“测试所选渠道”或“测试当前推送范围”检查接入。
+
+## v1.9.0 多渠道推送
+
+新增独立“推送设置”选项卡，支持 Server 酱³、PushPlus、Bark、飞书、钉钉、ntfy 和通用 Webhook。同类型可添加多个接收目标。选择“全部推送”时，每条通知发往全部已配置目标；选择“指定渠道”时，只发往勾选目标。切换模式会保留自选名单，指定模式中新添加的目标默认未选。零选择时继续检测并明确显示“不发送推送”。
+
+各目标独立提交一次请求，界面分别显示服务已受理、失败、结果未知或取消。某个目标失败不会阻止其他目标发送，同一事件不会在下一轮自动补发。服务已受理表示接口接受请求，实际送达还受接收服务和客户端状态影响。
+
+推送设置与监控设置分别保存，停止监控后修改，下次启动生效。推送测试使用当前表单的独立快照，不自动保存设置。启动监控时会先校验并一起保存两页参数；窗口和登录自启仍需明确保存系统设置。
+
+v1.8.1 配置自动转换为一个 Server 酱³目标。首次保存新版格式时，在原配置旁保留 `*.pre-v1.9.0.bak`，备份含推送凭据，请与原配置同样保护。回退时退出新版，恢复备份为原配置，再运行 [v1.8.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.8.1)。登录自启使用新版 EXE 时需要重新保存设置。
+
+### 配置接收渠道
+
+| 渠道 | 必填内容 | 可选内容 |
+|------|----------|----------|
+| [Server 酱³](https://sc3.ft07.com) | 完整推送 URL | 兼容旧 SendKey、UID |
+| [PushPlus](https://www.pushplus.plus/doc/guide/api.html) | Token | 群组编码 |
+| [Bark](https://bark.day.app) | Device Key | 服务地址、分组；支持自建服务 |
+| [飞书](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot?lang=zh-CN) | 群机器人 Webhook | 签名密钥、机器人要求的关键词 |
+| [钉钉](https://open.dingtalk.com/document/robots/customize-robot-security-settings) | 已有群机器人 Webhook | 签名密钥、机器人要求的关键词 |
+| [ntfy](https://docs.ntfy.sh/publish/) | Topic | 服务地址、Bearer Token；支持自建服务 |
+| Webhook | 接收 URL | JSON 对象格式的认证或业务请求头 |
+
+飞书、钉钉填写关键词后，关键词会加入对应通知正文。钉钉官方已提示群自定义机器人即将下线，已有机器人不受影响，新建能力以官方当前状态为准。自建服务支持显式 HTTP 地址，表单会提示传输方式；HTTPS 保持证书校验。
+
+通用 Webhook 接收固定 JSON 字段：`event_type`、`title`、`body`（纯文本）、`live_url`。汇总通知没有单一观看链接时 `live_url` 为空。事件类型为 `live`、`repeat_live`、`stream_end`、`startup`、`daily_intimacy`、`monitor_alert`、`monitor_recovery`、`test`、`generic`。HTTP 2xx 表示接收端受理。
 
 ## v1.8.1
 
@@ -125,7 +151,7 @@ Windows 版启动后会显示任务栏托盘图标。托盘菜单固定提供“
 | 链接无效或安全校验失败 | 暂停该主播并通知一次 |
 | 单个主播连续异常 | 连续 10 次明确检测异常后暂停该主播并通知一次，其他任务继续运行 |
 
-异常与恢复通知默认启用，复用现有推送地址。同一事件只发送一次，即使失败或结果未知也不自动重发；断网时手机通知可能无法送达，请查看任务表和日志。故障记录仅保留在本次运行内，重启后重新计时。备用检测接口失败但整体检测成功、主动停止和重复主播跳过均不发送故障通知。
+异常与恢复通知默认启用，使用当前推送范围。同一事件对每个接收目标只提交一次，即使失败或结果未知也不自动重发；断网时手机通知可能无法送达，请查看任务表和日志。故障记录仅保留在本次运行内，重启后重新计时。备用检测接口失败但整体检测成功、主动停止和重复主播跳过均不发送故障通知。
 
 `--once` 只执行一轮，任一启用主播未取得结果时返回非零退出码，不进入持续重试。
 
@@ -137,9 +163,9 @@ Windows 版启动后会显示任务栏托盘图标。托盘菜单固定提供“
 
 ```json
 {
-  "push_url": "",
-  "sendkey": "",
-  "push_uid": "",
+  "channels": [],
+  "push_mode": "all",
+  "selected_channel_ids": [],
   "check_interval": 30,
   "notify_on_stream_end": true,
   "repeat_notify_interval": 600,
@@ -162,7 +188,9 @@ Windows 版启动后会显示任务栏托盘图标。托盘菜单固定提供“
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `push_url` | Server 酱³ 完整推送 URL | 空 |
+| `channels` | 接收目标列表，每项含 `id`、`type`、`name`、`config` | 空列表 |
+| `push_mode` | 全部目标 `all` 或自选目标 `selected` | `all` |
+| `selected_channel_ids` | 自选目标 ID；全部模式保留该名单 | 空列表 |
 | `check_interval` | 每个主播的检测间隔，单位为秒 | `30` |
 | `notify_on_stream_end` | 是否发送下播通知 | `true` |
 | `repeat_notify_interval` | 持续直播提醒间隔，单位为秒 | `600` |
@@ -200,8 +228,12 @@ python monitor.py
 # 检测一次后退出
 python monitor.py --once
 
-# 测试 Server 酱³ 推送
+# 测试当前推送范围
 python monitor.py --test
+
+# 查看接收目标或测试指定目标
+python monitor.py --list-channels
+python monitor.py --test-channel CHANNEL_ID
 
 # 查看主播列表
 python monitor.py --list-streamers

@@ -36,9 +36,9 @@ echo   安装完成!
 echo.
 echo   下一步:
 echo   1. 运行: python gui_entry.py
-echo      打开图形界面，添加主播并配置 Server酱³ 推送
+echo      打开图形界面，添加主播并配置推送渠道
 echo   2. (可选) 运行: python monitor.py --test
-echo      测试 Server酱³ 连接是否正常
+echo      测试当前推送范围是否正常
 echo   3. (可选) 运行: python monitor.py --once
 echo      执行一次检测，确认目标博主信息正确
 echo   4. 运行: python gui_entry.py
