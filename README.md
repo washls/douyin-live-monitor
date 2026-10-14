@@ -45,7 +45,7 @@ Windows 用户可以直接从 [最新版下载页](https://github.com/washls/dou
 
 推送设置与监控设置分别保存，停止监控后修改，下次启动生效。推送测试使用当前表单的独立快照，不自动保存设置。启动监控时会先校验并一起保存两页参数；窗口和登录自启仍需明确保存系统设置。
 
-v1.8.1 配置自动转换为一个 Server 酱³目标。首次保存新版格式时，在原配置旁保留 `*.pre-v1.9.0.bak`，备份含推送凭据，请与原配置同样保护。回退时退出新版，恢复备份为原配置，再运行 [v1.8.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.8.1)。登录自启使用新版 EXE 时需要重新保存设置。
+已填写推送 URL 或 SendKey 的 v1.8.1 配置自动转换为一个 Server 酱³目标；未配置推送的旧配置保留为空目标。首次保存新版格式时，在原配置旁保留 `*.pre-v1.9.0.bak`，备份含推送凭据，请与原配置同样保护。回退时退出新版，恢复备份为原配置，再运行 [v1.8.1](https://github.com/washls/douyin-live-monitor/releases/tag/v1.8.1)。登录自启使用新版 EXE 时需要重新保存设置。
 
 ### 配置接收渠道
 
@@ -260,8 +260,8 @@ python monitor.py --version
 给 EXE 传入上述命令行参数时会进入命令行模式。例如：
 
 ```powershell
-Start-Process -FilePath .\douyin-monitor-v1.8.0.exe -ArgumentList '--once' -NoNewWindow -Wait
-Start-Process -FilePath .\douyin-monitor-v1.8.0.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.9.0.exe -ArgumentList '--once' -NoNewWindow -Wait
+Start-Process -FilePath .\douyin-monitor-v1.9.0.exe -ArgumentList '--list-streamers' -NoNewWindow -Wait
 ```
 
 正式 EXE 使用 Windows GUI 子系统，PowerShell 直接执行时不会自动等待。使用上面的 `Start-Process` 写法可以让命令行输出留在当前终端，并等待任务结束后再返回提示符。
@@ -291,7 +291,9 @@ Start-Process -FilePath .\douyin-monitor-v1.8.0.exe -ArgumentList '--list-stream
 
 #### 推送测试失败
 
-重新从 [Server 酱³](https://sc3.ft07.com) 复制完整推送 URL，确认网络可访问该服务。推送 URL 的格式应类似 `https://用户标识.push.ft07.com/send/发送密钥.send`。
+在“推送设置”中高亮对应渠道，点击“测试所选渠道”，按逐渠道结果检查地址、凭据和网络。飞书、钉钉采用关键词或签名安全模式时，还需填写相应关键词或密钥；自建服务需确认接收地址和认证头。Server 酱³请从 [服务页面](https://sc3.ft07.com) 复制完整推送 URL，格式类似 `https://用户标识.push.ft07.com/send/发送密钥.send`。
+
+“结果未知”表示接口是否受理尚无法确认，程序不会自动补投同一事件。“服务已受理”表示接口接受了请求，客户端实际收到消息仍需在对应服务或设备中检查。
 
 #### 主播明明开播却显示未开播
 
