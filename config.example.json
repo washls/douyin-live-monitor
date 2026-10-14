@@ -1,7 +1,7 @@
 {
-    "channels": [],
-    "push_mode": "all",
-    "selected_channel_ids": [],
+    "sendkey": "",
+    "push_uid": "",
+    "push_url": "",
     "check_interval": 30,
     "notify_on_stream_end": true,
     "repeat_notify_interval": 600,

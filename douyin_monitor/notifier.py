@@ -14,9 +14,6 @@ from urllib.parse import urlsplit
 import requests
 
 from .platform_clients import platform_name
-from .push_channels import (
-    DeliveryReport, PushDispatcher, PushMessage, create_push_channel, markdown_to_text,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -44,311 +41,7 @@ def _link_label(live_url: str, default: str) -> str:
     return default
 
 
-class NotificationFormatter:
-    """Shared event content for legacy and multi-channel notification clients."""
-
-    def send_monitor_alert(
-        self, nickname: str, reason: str, duration: int, retrying: bool,
-        platform: str = "douyin", live_url: str = "",
-    ) -> bool:
-        action = "程序将继续自动重试" if retrying else "任务已暂停，请检查后重新开始监控"
-        link = f"\n\n[{_link_label(live_url, '主播直播间')}]({live_url})" if live_url else ""
-        return self.send(
-            event_type="monitor_alert", live_url=live_url,
-            title=f"[异常] [{platform_name(platform)}] {nickname} 监控{'异常' if retrying else '已暂停'}",
-            desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n**原因**: {reason}\n\n"
-                 f"**持续时间**: {duration} 秒\n\n{action}{link}",
-        )
-
-    def send_monitor_recovery(self, nickname: str, duration: int,
-                              platform: str = "douyin", live_url: str = "") -> bool:
-        link = f"\n\n[{_link_label(live_url, '主播直播间')}]({live_url})" if live_url else ""
-        return self.send(
-            event_type="monitor_recovery", live_url=live_url,
-            title=f"[恢复] [{platform_name(platform)}] {nickname} 监控已恢复",
-            desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n已重新确认直播状态，监控继续运行。\n\n"
-                 f"**故障持续时间**: {duration} 秒{link}",
-        )
-
-    def send_live_notification(
-        self, nickname: str, room_id: str, title: str = "",
-        platform: str = "douyin", live_url: str = "",
-    ) -> bool:
-        """
-        Send a formatted "streamer went live" notification.
-
-        Args:
-            nickname: Streamer nickname
-            room_id: Live room ID
-            title: Live stream title (optional)
-
-        Returns:
-            True if sent successfully
-        """
-        # Build Markdown message
-        md_parts = [
-            "📺 **开播提醒**",
-            "",
-            f"- **博主**: {nickname}",
-            f"- **平台**: {platform_name(platform)}",
-        ]
-        if title:
-            md_parts.append(f"- **标题**: {title}")
-        if room_id:
-            md_parts.append(f"- **房间ID**: `{room_id}`")
-        if live_url:
-            md_parts.append(f"- **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
-
-        md_parts.extend([
-            "",
-            f"⏰ 检测时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        ])
-
-        desp = "\n".join(md_parts)
-
-        notify_title = f"🔴 [{platform_name(platform)}] {nickname} 正在直播!"
-        if title:
-            notify_title += f" - {title[:30]}"
-
-        return self.send(
-            event_type="live", live_url=live_url,
-            title=notify_title,
-            desp=desp,
-            tags=f"{platform_name(platform)}直播|开播提醒",
-            short=f"{nickname} 开播了",
-        )
-
-    def send_stream_end_notification(
-        self, nickname: str, duration: str = "",
-        platform: str = "douyin", live_url: str = "",
-    ) -> bool:
-        """
-        Send a "stream ended" notification.
-
-        Args:
-            nickname: Streamer nickname
-            duration: Stream duration (optional)
-
-        Returns:
-            True if sent successfully
-        """
-        md_parts = [
-            "⏹️ **下播提醒**",
-            "",
-            f"- **博主**: {nickname}",
-            f"- **平台**: {platform_name(platform)}",
-            f"- **时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        ]
-        if duration:
-            md_parts.append(f"- **直播时长**: {duration}")
-        if live_url:
-            md_parts.append(f"- **链接**: [{_link_label(live_url, '主播直播间')}]({live_url})")
-
-        desp = "\n".join(md_parts)
-
-        return self.send(
-            event_type="stream_end", live_url=live_url,
-            title=f"⏹️ [{platform_name(platform)}] {nickname} 已下播",
-            desp=desp,
-            tags=f"{platform_name(platform)}直播|下播提醒",
-            short=f"{nickname} 已下播",
-        )
-
-    def send_repeat_live_notification(
-        self,
-        nickname: str,
-        room_id: str = "",
-        title: str = "",
-        repeat_count: int = 1,
-        max_repeat: int = 3,
-        duration: str = "",
-        platform: str = "douyin", live_url: str = "",
-    ) -> bool:
-        """
-        Send a periodic "still live" reminder notification.
-
-        Args:
-            nickname: Streamer nickname
-            room_id: Live room ID
-            title: Live stream title
-            repeat_count: Current repeat number (1-based)
-            max_repeat: Maximum repeat notifications
-            duration: How long they've been live
-
-        Returns:
-            True if sent successfully
-        """
-        md_parts = [
-            f"🔴 **仍在直播提醒 ({repeat_count}/{max_repeat})**",
-            "",
-            f"- **博主**: {nickname}",
-            f"- **平台**: {platform_name(platform)}",
-        ]
-        if title:
-            md_parts.append(f"- **标题**: {title}")
-        if room_id:
-            md_parts.append(f"- **房间ID**: `{room_id}`")
-        if live_url:
-            md_parts.append(f"- **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
-        if duration:
-            md_parts.append(f"- **已播时长**: {duration}")
-
-        md_parts.extend([
-            "",
-            f"⏰ 检测时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"📢 这是第 {repeat_count}/{max_repeat} 次重复提醒",
-        ])
-
-        desp = "\n".join(md_parts)
-
-        notify_title = f"🔴 [{platform_name(platform)}] {nickname} 仍在直播 ({repeat_count}/{max_repeat})"
-        if title:
-            notify_title += f" - {title[:20]}"
-
-        return self.send(
-            event_type="repeat_live", live_url=live_url,
-            title=notify_title,
-            desp=desp,
-            tags=f"{platform_name(platform)}直播|持续提醒",
-            short=f"{nickname} 仍在直播 ({repeat_count}/{max_repeat})",
-        )
-
-    def send_daily_intimacy_reminder(
-        self,
-        nickname: str,
-        minute: int,
-        room_id: str = "",
-        title: str = "",
-        live_url: str = "",
-    ) -> bool:
-        """
-        Send a daily intimacy refresh reminder at 23:57 / 23:58 / 23:59.
-
-        Args:
-            nickname: Streamer nickname
-            minute: Which minute slot (57, 58, or 59)
-            room_id: Live room ID
-            title: Live stream title
-
-        Returns:
-            True if sent successfully
-        """
-        remaining = 60 - minute  # minutes until midnight reset
-
-        md_parts = [
-            "⏰ **每日亲密度刷新提醒**",
-            "",
-            f"🔥 **{nickname}** 正在直播中！",
-            "",
-            "---",
-            "",
-            f"⏳ 距离今日亲密度刷新还剩 **{remaining} 分钟**",
-            "",
-            "> 每天 00:00 亲密度会重置，",
-            "> 今天的亲密度额度还未用满的话，",
-            "> 抓紧最后几分钟送送礼、点点赞吧 ~ 💝",
-            "",
-            "---",
-            "",
-        ]
-        if title:
-            md_parts.append(f"📺 **直播标题**: {title}")
-        if room_id:
-            md_parts.append(f"🏠 **房间ID**: `{room_id}`")
-        if live_url:
-            md_parts.append(f"🔗 **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
-
-        md_parts.extend([
-            "",
-            f"🕐 提醒时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-            "💡 亲密度小贴士: 观看、点赞、送礼、分享直播间都可以增加亲密度哦~",
-        ])
-
-        desp = "\n".join(md_parts)
-
-        notify_title = f"⏰ {nickname} 还在直播! 亲密度还剩{remaining}分钟刷新"
-        minute_label = f"23:{minute}"
-
-        return self.send(
-            event_type="daily_intimacy", live_url=live_url,
-            title=notify_title,
-            desp=desp,
-            tags="抖音直播|亲密度提醒",
-            short=f"⏰{minute_label} 亲密度即将刷新 - {nickname} 直播中",
-        )
-
-    def send_daily_intimacy_reminder_for_streamers(
-        self,
-        streamers: Sequence[Mapping[str, Any]],
-        minute: int,
-    ) -> bool:
-        """Send one daily reminder covering all currently live streamers."""
-        live_streamers = [item for item in streamers if item.get("platform", "douyin") == "douyin"]
-        if not live_streamers:
-            return False
-        if len(live_streamers) == 1:
-            item = live_streamers[0]
-            return self.send_daily_intimacy_reminder(
-                nickname=str(item.get("nickname") or "未知主播"),
-                minute=minute,
-                room_id=str(item.get("room_id") or ""),
-                title=str(item.get("title") or ""),
-                live_url=str(item.get("live_url") or ""),
-            )
-
-        remaining = 60 - minute
-        md_parts = [
-            "⏰ **每日亲密度刷新提醒**",
-            "",
-            f"当前有 **{len(live_streamers)} 位主播** 正在直播：",
-            "",
-        ]
-        for item in live_streamers:
-            nickname = str(item.get("nickname") or "未知主播")
-            title = str(item.get("title") or "")
-            live_url = str(item.get("live_url") or "")
-            line = f"- **{nickname}**"
-            if title:
-                line += f"：{title}"
-            if live_url:
-                line += f" [{_link_label(live_url, '进入直播间')}]({live_url})"
-            md_parts.append(line)
-        md_parts.extend(
-            [
-                "",
-                f"距离今日亲密度刷新还剩 **{remaining} 分钟**。",
-                "",
-                f"提醒时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
-            ]
-        )
-        return self.send(
-            event_type="daily_intimacy", live_url="",
-            title=f"⏰ {len(live_streamers)} 位主播正在直播，亲密度即将刷新",
-            desp="\n".join(md_parts),
-            tags="抖音直播|亲密度提醒",
-            short=f"23:{minute} 亲密度即将刷新，{len(live_streamers)} 位主播直播中",
-        )
-
-    def verify_connection(self) -> bool:
-        """
-        Verify the Server酱³ connection by sending a test message.
-
-        Returns:
-            True if the test was successful
-        """
-        return self.send(
-            event_type="test", live_url="",
-            title="🧪 抖音直播监听器 - 连接测试",
-            desp=(
-                "**抖音直播监听器** 已成功连接到 Server酱³!\n\n"
-                f"- 测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"- 状态: ✅ 连接正常\n"
-            ),
-            tags="系统测试",
-        )
-
-class ServerChanNotifier(NotificationFormatter):
+class ServerChanNotifier:
     """Server酱³ notification client."""
 
     def __init__(
@@ -423,7 +116,8 @@ class ServerChanNotifier(NotificationFormatter):
     def set_api_url(self, url: str) -> None:
         """Override the API URL without exposing credentials in logs."""
         self.api_url = url
-        logger.info("API URL 已设置为: <redacted>")
+        safe_url = re.sub(r"(/send/)[^/?]+", r"\1<redacted>", url)
+        logger.info(f"API URL 已设置为: {safe_url}")
 
     def clone(self) -> "ServerChanNotifier":
         """Create an independent notifier with the same destination."""
@@ -437,8 +131,7 @@ class ServerChanNotifier(NotificationFormatter):
         return cloned
 
     def send(self, title: str, desp: str = "", tags: Optional[str] = None,
-             short: Optional[str] = None, *, event_type: str = "generic",
-             live_url: str = "") -> bool:
+             short: Optional[str] = None) -> bool:
         """Send one notification; never replay an ambiguous POST."""
         self.delivery_unknown = False
         payload: Dict[str, str] = {"title": title}
@@ -449,7 +142,6 @@ class ServerChanNotifier(NotificationFormatter):
         if short:
             payload["short"] = short
 
-        resp = None
         try:
             logger.info(f"发送通知 (单次尝试): title='{title[:50]}'")
             # Use a one-shot request for notifications. A shared keep-alive
@@ -459,7 +151,7 @@ class ServerChanNotifier(NotificationFormatter):
                 self.api_url,
                 json=payload,
                 headers={"Content-Type": "application/json;charset=utf-8"},
-                timeout=15, allow_redirects=False,
+                timeout=15,
             )
             resp.raise_for_status()
             try:
@@ -468,13 +160,14 @@ class ServerChanNotifier(NotificationFormatter):
                 logger.error("ServerChan 返回了非 JSON 响应，不重试")
                 return False
             if result.get("code", -1) == 0:
-                logger.info("通知服务已受理消息")
+                logger.info(f"通知发送成功: {result.get('message', 'N/A')}")
                 return True
-            logger.warning("ServerChan 明确拒绝消息，不重试")
+            logger.warning(
+                f"ServerChan 返回错误: code={result.get('code', -1)}, "
+                f"message={result.get('message', 'Unknown error')}"
+            )
             return False
         except requests.HTTPError as e:
-            if resp is None:
-                resp = e.response
             status_code = e.response.status_code if e.response is not None else 0
             if status_code >= 500:
                 self.delivery_unknown = True
@@ -485,74 +178,297 @@ class ServerChanNotifier(NotificationFormatter):
         except Exception as e:
             self.delivery_unknown = True
             logger.warning("通知发送异常，不重试 (%s)", type(e).__name__)
-        finally:
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception as e:
-                    logger.warning("通知响应关闭异常 (%s)", type(e).__name__)
         return False
 
-class MultiChannelNotifier(NotificationFormatter):
-    """Reuse notification formatting while broadcasting to selected targets."""
-
-    def __init__(self, channels: Sequence[Mapping[str, Any]], *, dispatcher=None,
-                 on_report=None, cancelled=None):
-        from copy import deepcopy
-
-        self._channel_configs = deepcopy(tuple(channels))
-        self.channels = tuple(create_push_channel(channel) for channel in self._channel_configs)
-        self.dispatcher = dispatcher if dispatcher is not None else PushDispatcher()
-        self.owns_dispatcher = dispatcher is None
-        self.on_report = on_report
-        self.cancelled = cancelled
-        self.streamer_id = ""
-        self.last_report = DeliveryReport("", ())
-
-    @property
-    def delivery_unknown(self) -> bool:
-        return self.last_report.delivery_unknown
-
-    def clone(self) -> "MultiChannelNotifier":
-        cloned = MultiChannelNotifier(
-            self._channel_configs, dispatcher=self.dispatcher,
-            on_report=self.on_report, cancelled=self.cancelled,
+    def send_monitor_alert(
+        self, nickname: str, reason: str, duration: int, retrying: bool,
+        platform: str = "douyin", live_url: str = "",
+    ) -> bool:
+        action = "程序将继续自动重试" if retrying else "任务已暂停，请检查后重新开始监控"
+        link = f"\n\n[{_link_label(live_url, '主播直播间')}]({live_url})" if live_url else ""
+        return self.send(
+            title=f"[异常] [{platform_name(platform)}] {nickname} 监控{'异常' if retrying else '已暂停'}",
+            desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n**原因**: {reason}\n\n"
+                 f"**持续时间**: {duration} 秒\n\n{action}{link}",
         )
-        cloned.streamer_id = self.streamer_id
-        return cloned
 
-    def send(self, title: str, desp: str = "", tags: Optional[str] = None,
-             short: Optional[str] = None, *, event_type: str = "generic",
-             live_url: str = "") -> bool:
-        message = PushMessage(
-            event_type=event_type, title=title, markdown=desp,
-            text=markdown_to_text(desp), live_url=live_url,
-            streamer_id=self.streamer_id, tags=tags or "", short=short or "",
+    def send_monitor_recovery(self, nickname: str, duration: int,
+                              platform: str = "douyin", live_url: str = "") -> bool:
+        link = f"\n\n[{_link_label(live_url, '主播直播间')}]({live_url})" if live_url else ""
+        return self.send(
+            title=f"[恢复] [{platform_name(platform)}] {nickname} 监控已恢复",
+            desp=f"**平台**: {platform_name(platform)}\n\n**主播**: {nickname}\n\n已重新确认直播状态，监控继续运行。\n\n"
+                 f"**故障持续时间**: {duration} 秒{link}",
         )
-        report = self.dispatcher.send(message, self.channels, cancelled=self.cancelled)
-        self.last_report = report
-        if self.on_report is not None:
-            try:
-                self.on_report(report)
-            except Exception as exc:
-                logger.warning("推送结果回调异常 (%s)", type(exc).__name__)
-        logger.info("推送结果: %s", report.summary)
-        return report.accepted_count > 0
+
+    def send_live_notification(
+        self, nickname: str, room_id: str, title: str = "",
+        platform: str = "douyin", live_url: str = "",
+    ) -> bool:
+        """
+        Send a formatted "streamer went live" notification.
+
+        Args:
+            nickname: Streamer nickname
+            room_id: Live room ID
+            title: Live stream title (optional)
+
+        Returns:
+            True if sent successfully
+        """
+        # Build Markdown message
+        md_parts = [
+            "📺 **开播提醒**",
+            "",
+            f"- **博主**: {nickname}",
+            f"- **平台**: {platform_name(platform)}",
+        ]
+        if title:
+            md_parts.append(f"- **标题**: {title}")
+        if room_id:
+            md_parts.append(f"- **房间ID**: `{room_id}`")
+        if live_url:
+            md_parts.append(f"- **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
+
+        md_parts.extend([
+            "",
+            f"⏰ 检测时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        ])
+
+        desp = "\n".join(md_parts)
+
+        notify_title = f"🔴 [{platform_name(platform)}] {nickname} 正在直播!"
+        if title:
+            notify_title += f" - {title[:30]}"
+
+        return self.send(
+            title=notify_title,
+            desp=desp,
+            tags=f"{platform_name(platform)}直播|开播提醒",
+            short=f"{nickname} 开播了",
+        )
+
+    def send_stream_end_notification(
+        self, nickname: str, duration: str = "",
+        platform: str = "douyin", live_url: str = "",
+    ) -> bool:
+        """
+        Send a "stream ended" notification.
+
+        Args:
+            nickname: Streamer nickname
+            duration: Stream duration (optional)
+
+        Returns:
+            True if sent successfully
+        """
+        md_parts = [
+            "⏹️ **下播提醒**",
+            "",
+            f"- **博主**: {nickname}",
+            f"- **平台**: {platform_name(platform)}",
+            f"- **时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+        if duration:
+            md_parts.append(f"- **直播时长**: {duration}")
+        if live_url:
+            md_parts.append(f"- **链接**: [{_link_label(live_url, '主播直播间')}]({live_url})")
+
+        desp = "\n".join(md_parts)
+
+        return self.send(
+            title=f"⏹️ [{platform_name(platform)}] {nickname} 已下播",
+            desp=desp,
+            tags=f"{platform_name(platform)}直播|下播提醒",
+            short=f"{nickname} 已下播",
+        )
+
+    def send_repeat_live_notification(
+        self,
+        nickname: str,
+        room_id: str = "",
+        title: str = "",
+        repeat_count: int = 1,
+        max_repeat: int = 3,
+        duration: str = "",
+        platform: str = "douyin", live_url: str = "",
+    ) -> bool:
+        """
+        Send a periodic "still live" reminder notification.
+
+        Args:
+            nickname: Streamer nickname
+            room_id: Live room ID
+            title: Live stream title
+            repeat_count: Current repeat number (1-based)
+            max_repeat: Maximum repeat notifications
+            duration: How long they've been live
+
+        Returns:
+            True if sent successfully
+        """
+        md_parts = [
+            f"🔴 **仍在直播提醒 ({repeat_count}/{max_repeat})**",
+            "",
+            f"- **博主**: {nickname}",
+            f"- **平台**: {platform_name(platform)}",
+        ]
+        if title:
+            md_parts.append(f"- **标题**: {title}")
+        if room_id:
+            md_parts.append(f"- **房间ID**: `{room_id}`")
+        if live_url:
+            md_parts.append(f"- **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
+        if duration:
+            md_parts.append(f"- **已播时长**: {duration}")
+
+        md_parts.extend([
+            "",
+            f"⏰ 检测时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"📢 这是第 {repeat_count}/{max_repeat} 次重复提醒",
+        ])
+
+        desp = "\n".join(md_parts)
+
+        notify_title = f"🔴 [{platform_name(platform)}] {nickname} 仍在直播 ({repeat_count}/{max_repeat})"
+        if title:
+            notify_title += f" - {title[:20]}"
+
+        return self.send(
+            title=notify_title,
+            desp=desp,
+            tags=f"{platform_name(platform)}直播|持续提醒",
+            short=f"{nickname} 仍在直播 ({repeat_count}/{max_repeat})",
+        )
+
+    def send_daily_intimacy_reminder(
+        self,
+        nickname: str,
+        minute: int,
+        room_id: str = "",
+        title: str = "",
+        live_url: str = "",
+    ) -> bool:
+        """
+        Send a daily intimacy refresh reminder at 23:57 / 23:58 / 23:59.
+
+        Args:
+            nickname: Streamer nickname
+            minute: Which minute slot (57, 58, or 59)
+            room_id: Live room ID
+            title: Live stream title
+
+        Returns:
+            True if sent successfully
+        """
+        remaining = 60 - minute  # minutes until midnight reset
+
+        md_parts = [
+            "⏰ **每日亲密度刷新提醒**",
+            "",
+            f"🔥 **{nickname}** 正在直播中！",
+            "",
+            "---",
+            "",
+            f"⏳ 距离今日亲密度刷新还剩 **{remaining} 分钟**",
+            "",
+            "> 每天 00:00 亲密度会重置，",
+            "> 今天的亲密度额度还未用满的话，",
+            "> 抓紧最后几分钟送送礼、点点赞吧 ~ 💝",
+            "",
+            "---",
+            "",
+        ]
+        if title:
+            md_parts.append(f"📺 **直播标题**: {title}")
+        if room_id:
+            md_parts.append(f"🏠 **房间ID**: `{room_id}`")
+        if live_url:
+            md_parts.append(f"🔗 **链接**: [{_link_label(live_url, '点击观看')}]({live_url})")
+
+        md_parts.extend([
+            "",
+            f"🕐 提醒时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "💡 亲密度小贴士: 观看、点赞、送礼、分享直播间都可以增加亲密度哦~",
+        ])
+
+        desp = "\n".join(md_parts)
+
+        notify_title = f"⏰ {nickname} 还在直播! 亲密度还剩{remaining}分钟刷新"
+        minute_label = f"23:{minute}"
+
+        return self.send(
+            title=notify_title,
+            desp=desp,
+            tags="抖音直播|亲密度提醒",
+            short=f"⏰{minute_label} 亲密度即将刷新 - {nickname} 直播中",
+        )
+
+    def send_daily_intimacy_reminder_for_streamers(
+        self,
+        streamers: Sequence[Mapping[str, Any]],
+        minute: int,
+    ) -> bool:
+        """Send one daily reminder covering all currently live streamers."""
+        live_streamers = [item for item in streamers if item.get("platform", "douyin") == "douyin"]
+        if not live_streamers:
+            return False
+        if len(live_streamers) == 1:
+            item = live_streamers[0]
+            return self.send_daily_intimacy_reminder(
+                nickname=str(item.get("nickname") or "未知主播"),
+                minute=minute,
+                room_id=str(item.get("room_id") or ""),
+                title=str(item.get("title") or ""),
+                live_url=str(item.get("live_url") or ""),
+            )
+
+        remaining = 60 - minute
+        md_parts = [
+            "⏰ **每日亲密度刷新提醒**",
+            "",
+            f"当前有 **{len(live_streamers)} 位主播** 正在直播：",
+            "",
+        ]
+        for item in live_streamers:
+            nickname = str(item.get("nickname") or "未知主播")
+            title = str(item.get("title") or "")
+            live_url = str(item.get("live_url") or "")
+            line = f"- **{nickname}**"
+            if title:
+                line += f"：{title}"
+            if live_url:
+                line += f" [{_link_label(live_url, '进入直播间')}]({live_url})"
+            md_parts.append(line)
+        md_parts.extend(
+            [
+                "",
+                f"距离今日亲密度刷新还剩 **{remaining} 分钟**。",
+                "",
+                f"提醒时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            ]
+        )
+        return self.send(
+            title=f"⏰ {len(live_streamers)} 位主播正在直播，亲密度即将刷新",
+            desp="\n".join(md_parts),
+            tags="抖音直播|亲密度提醒",
+            short=f"23:{minute} 亲密度即将刷新，{len(live_streamers)} 位主播直播中",
+        )
 
     def verify_connection(self) -> bool:
-        self.send(
-            title="🧪 多平台直播监听器 - 连接测试",
-            desp=f"推送渠道连接测试。\n\n测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            tags="系统测试", event_type="test",
+        """
+        Verify the Server酱³ connection by sending a test message.
+
+        Returns:
+            True if the test was successful
+        """
+        return self.send(
+            title="🧪 抖音直播监听器 - 连接测试",
+            desp=(
+                "**抖音直播监听器** 已成功连接到 Server酱³!\n\n"
+                f"- 测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"- 状态: ✅ 连接正常\n"
+            ),
+            tags="系统测试",
         )
-        return self.last_report.all_accepted
-
-    def close(self) -> None:
-        if self.owns_dispatcher:
-            self.dispatcher.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        self.close()

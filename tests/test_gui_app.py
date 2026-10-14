@@ -553,14 +553,16 @@ def test_silent_start_with_no_enabled_streamers_does_not_show_dialog(monkeypatch
     app.service_thread = None
     app.config = {"streamers": []}
     app.entries = []
-    app._save_startup_drafts = Mock(return_value=True)
+    app._save_settings = Mock(return_value=True)
     app._set_global_status = Mock()
     warning = Mock()
     monkeypatch.setattr(gui_app.messagebox, "showwarning", warning)
 
     assert app._start_monitoring(silent=True) is False
 
-    app._save_startup_drafts.assert_called_once_with()
+    app._save_settings.assert_called_once_with(
+        show_success=False, include_system=False
+    )
     app._set_global_status.assert_called_once_with("stopped", "没有已启用的主播")
     warning.assert_not_called()
 
